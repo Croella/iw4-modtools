@@ -1,0 +1,38 @@
+#pragma once
+#include <string>
+#include <vector>
+#include "math3d.h"
+
+// Texture projection as stored in a map face: size in world units, shift, rotation.
+struct TexDef {
+    double w = 256, h = 256, sx = 0, sy = 0, rot = 0;
+};
+
+struct Face {
+    Vec3 p[3];             // plane points, clockwise when viewed from outside
+    std::string material;
+    TexDef tex;
+    std::string tail;      // everything after the texdef (lightmap fields), kept verbatim
+    Vec3 normal;
+    double dist = 0;
+    std::vector<Vec3> winding;
+};
+
+// A convex solid defined by the intersection of its face planes.
+struct Brush {
+    std::vector<std::string> attrs;  // non-face lines such as "contents detail;", kept verbatim
+    std::vector<Face> faces;
+    AABB bounds;
+
+    bool rebuild();  // recomputes planes and windings; false if the solid is degenerate
+    void translate(const Vec3& d);
+    // Moves every face pointing along +/- axis by amount. Returns false, leaving the
+    // brush unchanged, if that would collapse it.
+    bool moveFaces(int axis, int sign, double amount);
+    void setMaterial(const std::string& name);
+};
+
+Brush makeBox(const Vec3& mins, const Vec3& maxs, const std::string& material);
+bool rayBrush(const Brush& b, const Vec3& origin, const Vec3& dir, double& tOut, int& faceOut);
+// Texture coordinates for a point on a face.
+void faceUV(const Face& f, const Vec3& p, float& u, float& v);
