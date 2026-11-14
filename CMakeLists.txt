@@ -51,6 +51,12 @@ add_library(iw4r_core STATIC
   src/light/lightbake.cpp
   src/zone/skysource.cpp
   src/zone/matdefs.cpp
+  src/zone/modelbuild.cpp
+  src/zone/animbuild.cpp
+  src/zone/weapondef.cpp
+  src/model/xanimexport.cpp
+  src/model/imageio.cpp
+  src/model/xmodelexport.cpp
   src/live/process.cpp
   src/live/liveimport.cpp)
 target_include_directories(iw4r_core PUBLIC src)
@@ -69,8 +75,9 @@ target_link_libraries(iw4r_zone PRIVATE iw4r_core)
 
 # Injectable loader so the editor's compiled maps can be devmap'd (redirects *.ff opens to the
 # deploy folder). x64 only; built next to the editor so Compile & Run can inject it.
-add_library(iw4r_mapload SHARED src/dll/mapload_dll.cpp)
-target_link_libraries(iw4r_mapload PRIVATE psapi)
+add_library(iw4r_mapload SHARED src/dll/mapload_dll.cpp src/dll/volumetric.cpp)
+target_include_directories(iw4r_mapload PRIVATE src)
+target_link_libraries(iw4r_mapload PRIVATE psapi d3d9 dxguid)
 if(MSVC)
   target_compile_definitions(iw4r_mapload PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 endif()
@@ -94,3 +101,7 @@ if(MSVC)
   target_compile_options(iw4r_structcheck PRIVATE /W0 /wd4324)
 endif()
 add_test(NAME structcheck COMMAND iw4r_structcheck)
+
+# Offline check of the loader DLL's volumetric pass (fake game: redirected zone, floatz, camera).
+add_executable(iw4r_voltest tests/voltest.cpp)
+target_link_libraries(iw4r_voltest PRIVATE d3d9)

@@ -32,11 +32,22 @@ public:
     const void* find(uint32_t type) const;
     size_t count(uint32_t type, bool references) const;
 
+    // Memory a back-reference (((block << 28) | offset) + 1) points at, or nullptr if it's out of
+    // range or past what was loaded.
+    const uint8_t* resolve(uint64_t ref) const;
+
     struct Owned;  // implementation-owned memory (blocks + DB_Add pool)
     std::shared_ptr<Owned> memory;
+    uint8_t* blockBase[8] = {};
 };
 
 bool simulateLoad(const std::vector<uint8_t>& zoneImage, SimulatedZone& out, std::string& error);
+
+// Loads a zone's assets in order until the first one this port can't walk (stock map zones start
+// with technique sets, materials, images...). loadedAssets = how many loaded completely. Used to
+// resolve back-references into that prefix (e.g. a later technique's shared literal constant).
+bool simulatePrefix(const std::vector<uint8_t>& zoneImage, SimulatedZone& out, size_t& loadedAssets,
+                    std::string& stoppedAt);
 
 // Partial loads, for zones whose other asset types this port can't walk (stock map zones): each
 // asset is loaded from its struct's file offset as if it were the next Load_XAsset (header -1).

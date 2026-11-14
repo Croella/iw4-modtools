@@ -166,6 +166,26 @@ bool rayBrush(const Brush& b, const Vec3& origin, const Vec3& dir, double& tOut,
     return true;
 }
 
+bool Brush::twoSided() const {
+    for (const std::string& a : attrs)
+        if (a == kTwoSidedAttr) return true;
+    return false;
+}
+
+void Brush::setTwoSided(bool on) {
+    attrs.erase(std::remove(attrs.begin(), attrs.end(), std::string(kTwoSidedAttr)), attrs.end());
+    if (on) attrs.push_back(kTwoSidedAttr);
+}
+
+Face mirroredFace(const Face& f) {
+    Face m = f;
+    std::reverse(m.winding.begin(), m.winding.end());
+    m.normal = -f.normal;
+    m.dist = -f.dist;
+    std::swap(m.p[0], m.p[2]);
+    return m;
+}
+
 void faceUV(const Face& f, const Vec3& p, float& u, float& v) {
     Vec3 ua, va;
     baseAxes(f.normal, ua, va);

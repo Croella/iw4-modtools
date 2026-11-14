@@ -220,6 +220,26 @@ void encodeLightmaps(const light::Bake& b, Image& primary, Image& secondary) {
 
 }  // namespace
 
+void sortSurfaces(GfxWorldData& gw, const std::vector<uint8_t>& sortKeys) {
+    auto key = [&](const Surface& s) { return s.material < sortKeys.size() ? sortKeys[s.material] : uint8_t{1}; };
+    std::vector<uint32_t> order(gw.surfaces.size());
+    for (uint32_t i = 0; i < order.size(); i++) order[i] = i;
+    std::stable_sort(order.begin(), order.end(),
+                     [&](uint32_t a, uint32_t b) { return key(gw.surfaces[a]) < key(gw.surfaces[b]); });
+    std::vector<Surface> sorted;
+    std::vector<uint32_t> newIndex(order.size());
+    sorted.reserve(order.size());
+    for (uint32_t i = 0; i < order.size(); i++) {
+        newIndex[order[i]] = i;
+        sorted.push_back(gw.surfaces[order[i]]);
+    }
+    gw.surfaces = std::move(sorted);
+    for (uint32_t& s : gw.skySurfaces) s = newIndex[s];
+    gw.opaqueSurfaceCount = 0;
+    while (gw.opaqueSurfaceCount < gw.surfaces.size() && key(gw.surfaces[gw.opaqueSurfaceCount]) <= kLastOpaqueSortKey)
+        gw.opaqueSurfaceCount++;
+}
+
 uint32_t packUnitVec(const Vec3& v) {
     auto enc = [](double c) {
         long q = std::lround(c * 127.0 + 127.0);
@@ -242,7 +262,7 @@ bool isToolMaterial(const std::string& raw) {
 }
 
 bool buildGfxWorldData(const Document& doc, GfxWorldData& out, std::string& error, const light::Bake* bake,
-                       bool includeSky) {
+                       bool includeSky, const std::set<std::string>* unlitMaterials) {
     out = GfxWorldData{};
     if (doc.ents.empty()) {
         error = "map has no worldspawn";
@@ -257,6 +277,12 @@ bool buildGfxWorldData(const Document& doc, GfxWorldData& out, std::string& erro
         Brush b = src;
         if (!b.rebuild()) continue;
         world.add(b.bounds);
+        // Two-sided brushes also emit every face mirrored (seen from inside the brush).
+        Brush back;
+        if (b.twoSided()) {
+            back = b;
+            for (Face& f : back.faces) f = mirroredFace(f);
+        }
         for (size_t i = 0; i < b.faces.size(); i++) {
             const Face& f = b.faces[i];
             if (f.winding.size() < 3) continue;
@@ -264,10 +290,12 @@ bool buildGfxWorldData(const Document& doc, GfxWorldData& out, std::string& erro
                 if (!includeSky) continue;
                 if (skySource.empty() || lower(skySource) == "sky") skySource = f.material;
                 byMaterial[kSkyMaterial].push_back({b, i});
+                if (!back.faces.empty()) byMaterial[kSkyMaterial].push_back({back, i});
                 continue;
             }
             if (isToolMaterial(f.material)) continue;
             byMaterial[f.material].push_back({b, i});
+            if (!back.faces.empty()) byMaterial[f.material].push_back({back, i});
         }
     }
     if (includeSky && byMaterial.count(kSkyMaterial)) {
@@ -281,6 +309,7 @@ bool buildGfxWorldData(const Document& doc, GfxWorldData& out, std::string& erro
         uint32_t matIndex = static_cast<uint32_t>(out.materials.size());
         out.materials.push_back(material);
         const bool skyGroup = material == kSkyMaterial;
+        const bool unlitGroup = unlitMaterials && light::inMaterialSet(*unlitMaterials, material);
         if (skyGroup) out.skyMaterial = static_cast<int>(matIndex);
         Surface* s = nullptr;
         for (auto& [brush, fi] : faces) {
@@ -293,6 +322,7 @@ bool buildGfxWorldData(const Document& doc, GfxWorldData& out, std::string& erro
                 s->baseIndex = static_cast<uint32_t>(out.indices.size());
                 s->material = matIndex;
                 s->sky = skyGroup;
+                s->unlit = unlitGroup;
                 if (skyGroup) out.skySurfaces.push_back(static_cast<uint32_t>(out.surfaces.size() - 1));
                 for (int k = 0; k < 3; k++) {
                     s->mins[k] = 1e30f;
@@ -301,8 +331,8 @@ bool buildGfxWorldData(const Document& doc, GfxWorldData& out, std::string& erro
             }
             Vec3 t = texGradient(f, false), bt = texGradient(f, true);
             float sign = dot(cross(f.normal, t), bt) < 0 ? -1.0f : 1.0f;
-            const light::FaceMap* lm = (bake && !skyGroup) ? bake->find(f) : nullptr;
-            if (bake && bake->env.hasSun && !skyGroup) s->primaryLight = 1;
+            const light::FaceMap* lm = (bake && !skyGroup && !unlitGroup) ? bake->find(f) : nullptr;
+            if (bake && bake->env.hasSun && !skyGroup && !unlitGroup) s->primaryLight = 1;
             uint16_t base = s->vertexCount;
             for (const Vec3& p : f.winding) {
                 Vertex v{};

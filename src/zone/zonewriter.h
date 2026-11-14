@@ -79,6 +79,7 @@ public:
 
     int block() const { return cur_; }
     uint32_t pos() const { return pos_[cur_]; }
+    uint32_t posIn(int b) const { return pos_[b]; }  // a block's position without switching to it
     // Back-reference to the current position (call after align, before writing the data).
     uint64_t here() const { return offsetPointer(cur_, pos_[cur_]); }
     uint32_t blockSize(int b) const { return high_[b]; }

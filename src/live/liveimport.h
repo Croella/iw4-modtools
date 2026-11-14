@@ -75,4 +75,9 @@ bool probeProcess(std::string& report, std::string& error, const char* exeName =
 // `iw4r_zone liveworld` to check what a compiled map turned into in-game.
 bool inspectWorld(std::string& report, std::string& error, const char* exeName = nullptr);
 
+// Diagnostic: the running game's weapons (WeaponCompleteDef pool, type 0x1C). With a name, every
+// field of that weapon decoded through weapondef's field table (validates the layout against stock
+// weapons); without, the list of loaded weapon names. Used by `iw4r_zone liveweapon [name]`.
+bool dumpWeapons(const std::string& name, std::string& report, std::string& error, const char* exeName = nullptr);
+
 }  // namespace live

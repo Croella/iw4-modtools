@@ -404,6 +404,84 @@ Environment readEnvironment(const Document& doc) {
     return env;
 }
 
+Volumetric readVolumetric(const Document& doc) {
+    Volumetric v;
+    const Environment env = readEnvironment(doc);
+    const Entity* ws = doc.ents.empty() ? nullptr : &doc.ents[0];
+    // worldspawn number: volumetric_<name> (older bare spelling still read), else the default.
+    auto num = [&](const char* name, double def) {
+        double x = def;
+        if (ws && !readNum(*ws, (std::string("volumetric_") + name).c_str(), x)) readNum(*ws, name, x);
+        return x;
+    };
+    Vec3 sunTint{1, 0.96, 0.88};
+    if (ws) readVec(*ws, "suncolor", sunTint);
+    v.color = sunTint;
+    if (ws) readVec(*ws, "volumetric_color", v.color);
+    double on = 1;
+    if (ws) readNum(*ws, "volumetric", on);
+    v.hasSun = env.hasSun;
+    v.sunDir = env.sunDir;
+    v.fog = num("fog", 0) != 0;
+    v.enabled = on != 0 && (env.hasSun || v.fog);
+    v.shafts = env.hasSun && num("shafts", 1) != 0;
+    v.intensity = num("intensity", v.intensity);
+    v.density = num("density", v.density);
+    v.decay = num("decay", v.decay);
+    v.threshold = num("threshold", v.threshold);
+    v.glow = num("glow", v.glow);
+    v.glowRadius = num("glowradius", v.glowRadius);
+    v.skyMode = static_cast<int>(num("skymode", v.skyMode));
+    v.skyDepth = num("skydepth", v.skyDepth);
+    v.debug = static_cast<int>(num("debug", v.debug));
+    v.fogDensity = num("fog_density", v.fogDensity);
+    v.fogFalloff = num("fog_falloff", v.fogFalloff);
+    v.fogHeight = num("fog_height", v.fogHeight);
+    v.fogSun = env.hasSun ? num("fog_sun", v.fogSun) : 0;
+    v.fogG = num("fog_anisotropy", v.fogG);
+    v.fogStart = num("fog_start", v.fogStart);
+    v.fogMax = num("fog_max", v.fogMax);
+    v.fogSky = num("fog_sky", v.fogSky);
+    v.fogSkyDist = num("fog_skydist", v.fogSkyDist);
+    if (ws && !readVec(*ws, "volumetric_fog_color", v.fogColor)) readVec(*ws, "fog_color", v.fogColor);
+    return v;
+}
+
+std::string volumetricConfig(const Document& doc) {
+    const Volumetric v = readVolumetric(doc);
+    char buf[512];
+    std::string out = "// iw4-radiant volumetric light (sun shafts, height fog); edit live while the game runs\n";
+    std::snprintf(buf, sizeof buf, "enabled %d\nsun %.6f %.6f %.6f\ncolor %.4f %.4f %.4f\n", v.enabled ? 1 : 0, v.sunDir.x, v.sunDir.y,
+                  v.sunDir.z, v.color.x, v.color.y, v.color.z);
+    out += buf;
+    std::snprintf(buf, sizeof buf,
+                  "intensity %g\ndensity %g\ndecay %g\nthreshold %g\nglow %g\nglowradius %g\nskymode %d\nskydepth %g\ndebug %d\nshafts %d\n",
+                  v.intensity, v.density, v.decay, v.threshold, v.glow, v.glowRadius, v.skyMode, v.skyDepth, v.debug, v.shafts ? 1 : 0);
+    out += buf;
+    std::snprintf(buf, sizeof buf,
+                  "// height fog\nfog %d\nfogdensity %g\nfogfalloff %g\nfogheight %g\nfogsun %g\nfogg %g\nfogstart %g\nfogmax %g\n"
+                  "fogsky %g\nfogskydist %g\nfogcolor %.4f %.4f %.4f\n",
+                  v.fog ? 1 : 0, v.fogDensity, v.fogFalloff, v.fogHeight, v.fogSun, v.fogG, v.fogStart, v.fogMax, v.fogSky, v.fogSkyDist,
+                  v.fogColor.x, v.fogColor.y, v.fogColor.z);
+    out += buf;
+    // full_clip brushes stop the sun's shafts (the game doesn't draw them, so the DLL draws these
+    // triangles into its sky mask).
+    size_t tris = 0;
+    for (const Entity& e : doc.ents)
+        for (const Brush& br : e.brushes)
+            for (const Face& f : br.faces) {
+                if (f.winding.size() < 3 || !blocksVolumetricSun(f.material)) continue;
+                if (!tris) out += "// sun occluders (full_clip faces): world-space triangles\n";
+                for (size_t i = 1; i + 1 < f.winding.size(); i++, tris++) {
+                    const Vec3 &a = f.winding[0], &b = f.winding[i], &c = f.winding[i + 1];
+                    std::snprintf(buf, sizeof buf, "occluder %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f\n", a.x, a.y, a.z, b.x, b.y, b.z,
+                                  c.x, c.y, c.z);
+                    out += buf;
+                }
+            }
+    return out;
+}
+
 std::vector<PointLight> readLights(const Document& doc) {
     std::vector<PointLight> out;
     for (size_t i = 1; i < doc.ents.size(); i++) {
@@ -429,10 +507,23 @@ bool isSkyMaterial(const std::string& raw) {
     return n.rfind("sky", 0) == 0;
 }
 
+bool blocksVolumetricSun(const std::string& raw) {
+    std::string n = lower(raw);
+    if (n.rfind("wc/", 0) == 0) n = n.substr(3);
+    return n.find("clip") != std::string::npos && n.find("full") != std::string::npos;  // clip_full / full_clip
+}
+
 bool blocksLight(const std::string& raw) {
     if (isSkyMaterial(raw)) return true;
     if (lower(raw).find("caulk") != std::string::npos) return true;
     return !gfx::isToolMaterial(raw);
+}
+
+bool inMaterialSet(const std::set<std::string>& set, const std::string& name) {
+    if (set.empty()) return false;
+    std::string n = lower(name);
+    if (n.rfind("wc/", 0) == 0) n = n.substr(3);
+    return set.count(n) > 0;
 }
 
 uint64_t faceKey(const Face& f) {
@@ -501,7 +592,8 @@ bool bake(const Document& doc, const Settings& settings, Bake& out, std::string&
         Brush b = src;
         if (!b.rebuild()) continue;
         for (const Face& f : b.faces) {
-            if (f.winding.size() < 3 || !blocksLight(f.material)) continue;
+            if (f.winding.size() < 3 || !blocksLight(f.material) || inMaterialSet(settings.unlitMaterials, f.material))
+                continue;
             int litIndex = -1;
             const bool sky = isSkyMaterial(f.material);
             if (!sky && !gfx::isToolMaterial(f.material)) {

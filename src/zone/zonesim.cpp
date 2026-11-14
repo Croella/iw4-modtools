@@ -83,9 +83,52 @@ public:
             for (int i = 0; i < list.assetCount; i++) loadXAsset(arr[i]);
         }
         pop();
+        for (int b = 0; b < BLOCK_COUNT; b++) z_.blockBase[b] = base_[b];
         if (!stack_.empty()) throw Fail("stream stack not empty at end");
         if (rpos_ != img_.size())
             throw Fail("unconsumed file bytes: read " + std::to_string(rpos_) + " of " + std::to_string(img_.size()));
+        for (int b = 0; b < BLOCK_COUNT; b++) z_.blockUsed[b] = high_[b];
+    }
+
+    // Like run(), but stops (without failing) at the first asset it can't load.
+    void runPrefix(size_t& loaded, std::string& stoppedAt) {
+        loaded = 0;
+        if (img_.size() < sizeof(iw4::XFile) + sizeof(iw4::XAssetList)) throw Fail("zone image too small");
+        iw4::XFile xf;
+        std::memcpy(&xf, img_.data(), sizeof(xf));
+        rpos_ = sizeof(xf);
+        z_.memory = std::make_shared<SimulatedZone::Owned>();
+        for (int b = 0; b < BLOCK_COUNT; b++) {
+            z_.blockSize[b] = xf.blockSize[b];
+            z_.memory->chunks.emplace_back(xf.blockSize[b]);
+            base_[b] = static_cast<uint8_t*>(z_.memory->chunks.back().p);
+            z_.blockBase[b] = base_[b];
+        }
+        iw4::XAssetList list;
+        readFile(&list, sizeof(list));
+        push(BLOCK_VIRTUAL);  // script strings, as in run()
+        if (list.stringList.strings) {
+            auto* arr = static_cast<uint64_t*>(stream(alloc(kAlign4), 8ull * list.stringList.count));
+            for (int i = 0; i < list.stringList.count; i++) {
+                if (arr[i] == kFollow) arr[i] = reinterpret_cast<uint64_t>(xstringData());
+                else if (arr[i]) arr[i] = 0;  // back-references aren't resolved in prefix mode
+                z_.scriptStrings.push_back(arr[i] ? reinterpret_cast<const char*>(arr[i]) : "");
+            }
+        }
+        pop();
+        push(BLOCK_VIRTUAL);
+        if (list.assets) {
+            auto* arr = static_cast<iw4::XAsset*>(stream(alloc(kAlign4), 16ull * list.assetCount));
+            for (int i = 0; i < list.assetCount; i++) {
+                try {
+                    loadXAsset(arr[i]);
+                } catch (const Fail& e) {
+                    stoppedAt = "asset " + std::to_string(i) + " (type " + std::to_string(arr[i].type) + "): " + e.what();
+                    break;
+                }
+                loaded++;
+            }
+        }
         for (int b = 0; b < BLOCK_COUNT; b++) z_.blockUsed[b] = high_[b];
     }
 
@@ -272,6 +315,20 @@ private:
             case 14:
             case 15: assetPtr(a.header.clipMap, a.type, [&](iw4::clipMap_t& c) { clipMap(c); }); break;
             case 36: assetPtr(a.header.rawfile, a.type, [&](iw4::RawFile& r) { rawFile(r); }); break;
+            case 5: materialPtr(a.header.material); break;
+            case 0: physPresetPtr(a.header.physPreset); break;
+            case 3: xmodelSurfsPtr(a.header.modelSurfs, 0); break;
+            case 4: xmodelPtr(a.header.model); break;
+            case 2: xanimPartsPtr(a.header.parts); break;
+            case 28: {
+                auto* w = reinterpret_cast<WeaponCompleteRaw*>(a.header.data);
+                weaponPtr(w);
+                a.header.data = w;
+                break;
+            }
+            case 42: assetPtr(a.header.addonMapEnts, a.type, [&](iw4::AddonMapEnts& m) { addonMapEnts(m); }); break;
+            case 9: techsetPtr(reinterpret_cast<uint8_t*>(&a.header.techniqueSet)); break;
+            case 10: imagePtr(a.header.image); break;
             default: throw Fail("zonesim: unsupported asset type " + std::to_string(a.type));
         }
     }
@@ -636,6 +693,299 @@ private:
             for (unsigned i = 0; i < stages; i++) rawXString(st + 24 * i);
         pop();
     }
+    // Load_XAnimPartsPtr (0x122d30) -> Load_XAnimParts (0x1229e0): struct 136 (VIRTUAL): name;
+    // names (u16 script strings x boneCount[9], align 2); notify (8 each, align 4); deltaPart
+    // (24, align 4: trans / quat2 / quat tracks, 0x1223f0); dataByte (a1); dataShort (a2);
+    // dataInt (a4); randomDataShort (a2); randomDataByte (a1); randomDataInt (a4); indices
+    // (u16 a2 when numframes >= 256, else u8 a1; 0x1228b0).
+    void xanimPartsPtr(iw4::XAnimParts*& slot) {
+        assetPtr(slot, 2, [&](iw4::XAnimParts& a) {
+            uint8_t* s = reinterpret_cast<uint8_t*>(&a);
+            const bool wide = a.numframes >= 256;
+            push(BLOCK_VIRTUAL);
+            xstring(a.name);
+            rawArray(s + 56, 2ull * a.boneCount[9], kAlign2);
+            rawArray(s + 120, 8ull * a.notifyCount, kAlign4);
+            if (rd64(s + 128)) {
+                uint8_t* dp = static_cast<uint8_t*>(stream(alloc(kAlign4), 24));
+                wr64(s + 128, dp);
+                auto indexList = [&](uint16_t size) { stream(alloc(kAlign1), wide ? 2ull * size + 2 : size + 1ull); };
+                if (rd64(dp)) {  // XAnimPartTrans (0x122950)
+                    uint8_t* t = static_cast<uint8_t*>(stream(alloc(kAlign4), 8));
+                    wr64(dp, t);
+                    uint16_t size;
+                    std::memcpy(&size, t, 2);
+                    if (size) {
+                        stream(t + 8, 32);  // mins, size, frames ptr
+                        indexList(size);
+                        if (rd64(t + 32)) {
+                            const bool small = t[2] != 0;
+                            void* f = stream(alloc(small ? kAlign1 : kAlign4), (small ? 3ull : 6ull) * (size + 1));
+                            wr64(t + 32, f);
+                        }
+                    } else {
+                        stream(t + 8, 12);  // frame0
+                    }
+                }
+                for (int q = 0; q < 2; q++) {  // quat2 (0x122530), quat (0x1225d0)
+                    if (!rd64(dp + 8 + 8 * q)) continue;
+                    uint8_t* h = static_cast<uint8_t*>(stream(alloc(kAlign4), 8));
+                    wr64(dp + 8 + 8 * q, h);
+                    uint16_t size;
+                    std::memcpy(&size, h, 2);
+                    const size_t key = q ? 8 : 4;
+                    if (size) {
+                        stream(h + 8, 8);  // frames ptr
+                        indexList(size);
+                        if (rd64(h + 8)) wr64(h + 8, stream(alloc(kAlign4), key * (size + 1)));
+                    } else {
+                        stream(h + 8, key);  // frame0
+                    }
+                }
+            }
+            rawArray(s + 64, a.dataByteCount, kAlign1);
+            rawArray(s + 72, 2ull * a.dataShortCount, kAlign2);
+            rawArray(s + 80, 4ull * a.dataIntCount, kAlign4);
+            rawArray(s + 88, 2ull * a.randomDataShortCount, kAlign2);
+            rawArray(s + 96, a.randomDataByteCount, kAlign1);
+            rawArray(s + 104, 4ull * a.randomDataIntCount, kAlign4);
+            rawArray(s + 112, (wide ? 2ull : 1ull) * a.indexCount, wide ? kAlign2 : kAlign1);
+            pop();
+        });
+    }
+    // ---- weapons (Load_WeaponCompleteDefPtr 0x120b70) ----
+    struct WeaponCompleteRaw { uint8_t b[160]; };
+    struct WeaponDefRaw { uint8_t b[2192]; };
+    struct FxRaw { uint8_t b[40]; };
+    static uint64_t rd(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); return v; }
+    static void wr(uint8_t* p, const void* v) { std::memcpy(p, &v, 8); }
+    void xstringAt(uint8_t* field) {
+        const char* f = reinterpret_cast<const char*>(rd(field));
+        xstring(f);
+        wr(field, f);
+    }
+    // Load_FxEffectDefHandle (0x119000) -> 0x118f30: 40 bytes, VIRTUAL, name, elemDefs.
+    void fxPtrAt(uint8_t* field) {
+        FxRaw* slot = reinterpret_cast<FxRaw*>(rd(field));
+        assetPtr(slot, 30, [&](FxRaw& fx) {
+            push(BLOCK_VIRTUAL);
+            xstringAt(fx.b);
+            requireNull(reinterpret_cast<void*>(rd(fx.b + 32)), "FxEffectDef.elemDefs (only references)");
+            pop();
+        });
+        wr(field, slot);
+    }
+    void xmodelPtrAt(uint8_t* field) {
+        iw4::XModel* m = reinterpret_cast<iw4::XModel*>(rd(field));
+        xmodelPtr(m);
+        wr(field, m);
+    }
+    void materialPtrAt(uint8_t* field) {
+        iw4::Material* m = reinterpret_cast<iw4::Material*>(rd(field));
+        materialPtr(m);
+        wr(field, m);
+    }
+    // weapon sound (0x280b30 -> 0x123b50 -> 0x123a40): -1 -> align 4, 8-byte name slot, name.
+    void soundAt(uint8_t* field) {
+        uint64_t v = rd(field);
+        if (!v) return;
+        if (v != kFollow) {
+            offsetToPointer(v);
+            return;
+        }
+        uint8_t* slot = static_cast<uint8_t*>(stream(alloc(kAlign4), 8));
+        wr(field, slot);
+        xstringAt(slot);
+    }
+    void stringArrayAt(uint8_t* field, int n) {
+        if (!rd(field)) return;
+        if (rd(field) != kFollow) throw Fail("zonesim: weapon string array back-reference");
+        uint8_t* a = static_cast<uint8_t*>(stream(alloc(kAlign4), 8ull * n));
+        wr(field, a);
+        for (int i = 0; i < n; i++) xstringAt(a + 8 * i);
+    }
+    void xmodelArrayAt(uint8_t* field, int n) {
+        if (!rd(field)) return;
+        uint8_t* a = static_cast<uint8_t*>(stream(alloc(kAlign4), 8ull * n));
+        wr(field, a);
+        for (int i = 0; i < n; i++) xmodelPtrAt(a + 8 * i);
+    }
+    void scriptStringsAt(uint8_t* field, int n) {
+        if (!rd(field)) return;
+        uint8_t* a = static_cast<uint8_t*>(stream(alloc(kAlign2), 2ull * n));
+        wr(field, a);
+        for (int i = 0; i < n; i++) {
+            uint16_t idx;
+            std::memcpy(&idx, a + 2 * i, 2);
+            if (idx && idx > z_.scriptStrings.size()) throw Fail("zonesim: weapon script string out of range");
+        }
+    }
+    void weaponDef(uint8_t* d) {  // 0x120c30 (no push of its own)
+        xstringAt(d + 0);
+        xmodelArrayAt(d + 8, 16);
+        xmodelPtrAt(d + 16);
+        stringArrayAt(d + 24, 37);
+        stringArrayAt(d + 32, 37);
+        xstringAt(d + 40);
+        for (int k = 0; k < 4; k++) scriptStringsAt(d + 48 + 8 * k, 16);
+        fxPtrAt(d + 112);
+        fxPtrAt(d + 120);
+        for (int off = 128; off < 504; off += 8) soundAt(d + off);
+        if (rd(d + 504)) {
+            uint8_t* a = static_cast<uint8_t*>(stream(alloc(kAlign4), 248));
+            wr(d + 504, a);
+            for (int i = 0; i < 31; i++) soundAt(a + 8 * i);
+        }
+        for (int off : {512, 520, 528, 536}) fxPtrAt(d + off);
+        materialPtrAt(d + 544);
+        materialPtrAt(d + 552);
+        xmodelArrayAt(d + 736, 16);
+        for (int off : {744, 752, 760, 768}) xmodelPtrAt(d + off);
+        for (int off : {776, 792, 808}) materialPtrAt(d + off);
+        for (int off : {832, 848, 872}) xstringAt(d + off);
+        for (int off : {1104, 1112, 1120, 1128}) materialPtrAt(d + off);
+        requireNull(reinterpret_cast<void*>(rd(d + 1312)), "WeaponDef.physCollmap");
+        xmodelPtrAt(d + 1408);
+        fxPtrAt(d + 1424);
+        fxPtrAt(d + 1432);
+        soundAt(d + 1440);
+        soundAt(d + 1448);
+        rawArray(d + 1472, 124, kAlign4);
+        rawArray(d + 1480, 124, kAlign4);
+        fxPtrAt(d + 1488);
+        fxPtrAt(d + 1496);
+        fxPtrAt(d + 1528);
+        soundAt(d + 1536);
+        xstringAt(d + 1696);
+        requireNull(reinterpret_cast<void*>(rd(d + 1712)), "WeaponDef accuracy graph knots");
+        xstringAt(d + 1704);
+        requireNull(reinterpret_cast<void*>(rd(d + 1720)), "WeaponDef accuracy graph knots");
+        for (int off : {1808, 1816, 1856}) xstringAt(d + off);
+        rawArray(d + 1904, 80, kAlign4);
+        xstringAt(d + 1912);
+        xstringAt(d + 1920);
+        requireNull(reinterpret_cast<void*>(rd(d + 1928)), "WeaponDef.tracerType");
+        soundAt(d + 1960);
+        fxPtrAt(d + 1968);
+        xstringAt(d + 1976);
+        soundAt(d + 2000);
+        for (int k = 0; k < 4; k++) soundAt(d + 2008 + 8 * k);
+        for (int k = 0; k < 4; k++) soundAt(d + 2040 + 8 * k);
+        soundAt(d + 2072);
+        soundAt(d + 2080);
+    }
+    void weaponPtr(WeaponCompleteRaw*& slot) {
+        assetPtr(slot, 28, [&](WeaponCompleteRaw& w) {
+            uint8_t* c = w.b;
+            push(BLOCK_VIRTUAL);
+            xstringAt(c + 0);
+            if (rd(c + 8)) {
+                if (rd(c + 8) != kFollow) throw Fail("zonesim: WeaponDef back-reference");
+                uint8_t* d = static_cast<uint8_t*>(stream(alloc(kAlign4), 2192));
+                wr(c + 8, d);
+                weaponDef(d);
+            }
+            xstringAt(c + 16);
+            scriptStringsAt(c + 24, 32);
+            stringArrayAt(c + 32, 37);
+            xstringAt(c + 80);
+            materialPtrAt(c + 96);
+            materialPtrAt(c + 104);
+            requireNull(reinterpret_cast<void*>(rd(c + 136)), "WeaponCompleteDef accuracy graph knots");
+            requireNull(reinterpret_cast<void*>(rd(c + 144)), "WeaponCompleteDef accuracy graph knots");
+            pop();
+        });
+    }
+    // Load_PhysPresetPtr (0x11e670) -> Load_PhysPreset (0x11e580): struct 56; push VIRTUAL; name;
+    // sndAliasPrefix (+32); pop.
+    void physPresetPtr(iw4::PhysPreset*& slot) {
+        assetPtr(slot, 0, [&](iw4::PhysPreset& p) {
+            uint8_t* s = reinterpret_cast<uint8_t*>(&p);
+            push(BLOCK_VIRTUAL);
+            rawXString(s);
+            rawXString(s + 32);
+            pop();
+        });
+    }
+    // Load_XModelPtr (0x123700) -> Load_XModel (0x123260), in its exact order (struct 408, VIRTUAL):
+    // name; boneNames (u16 script strings, align 2); parentList (numBones - numRootBones, align 1);
+    // quats (8 each, align 2); trans (12 each, align 4); partClassification (numBones);
+    // baseMat (32 each, align 4); materialHandles (align 4, Load_MaterialHandle each); lodInfo[4]
+    // inline, each modelSurfs -> Load_XModelSurfsPtr with the lod's numsurfs; collSurfs (48 each,
+    // + collTris 48 each); boneInfo (28 each); physPreset; physCollmap.
+    void xmodelPtr(iw4::XModel*& slot) {
+        assetPtr(slot, 4, [&](iw4::XModel& m) {
+            push(BLOCK_VIRTUAL);
+            xstring(m.name);
+            const size_t nb = m.numBones, nr = m.numRootBones, nonRoot = nb >= nr ? nb - nr : 0;
+            inlineOrRef(m.boneNames, nb, kAlign2);
+            inlineOrRef(m.parentList, nonRoot, kAlign1);
+            inlineOrRef(m.quats, 4 * nonRoot, kAlign2);
+            inlineOrRef(m.trans, 3 * nonRoot, kAlign4);
+            inlineOrRef(m.partClassification, nb, kAlign1);
+            inlineOrRef(m.baseMat, nb, kAlign4);
+            if (m.materialHandles) {
+                m.materialHandles = static_cast<iw4::Material**>(stream(alloc(kAlign4), 8ull * m.numsurfs));
+                for (int i = 0; i < m.numsurfs; i++) materialPtr(m.materialHandles[i]);
+            }
+            for (int l = 0; l < 4; l++) xmodelSurfsPtr(m.lodInfo[l].modelSurfs, m.lodInfo[l].numsurfs);
+            if (auto* cs = array(m.collSurfs, static_cast<size_t>(std::max(0, m.numCollSurfs)), kAlign4))
+                for (int i = 0; i < m.numCollSurfs; i++)
+                    array(cs[i].collTris, static_cast<size_t>(std::max(0, cs[i].numCollTris)), kAlign4);
+            array(m.boneInfo, nb, kAlign4);
+            physPresetPtr(m.physPreset);
+            requireNull(m.physCollmap, "XModel.physCollmap");
+            pop();
+        });
+    }
+    // Load_XModelSurfsPtr (0x123980) -> Load_XModelSurfs (0x1238c0): struct 48 (VIRTUAL); name;
+    // surfs (88 each, align 4; count = the referencing lod's numsurfs) -> Load_XSurface each
+    // (0x123bb0): vertInfo.vertsBlend (align 2), verts0 in VERTEX (align 16), vertList (16 each)
+    // with each collisionTree (56; nodes 16 each align 16, leafs 2 each align 2), triIndices in
+    // INDEX (align 16).
+    void xmodelSurfsPtr(iw4::XModelSurfs*& slot, size_t lodSurfs) {
+        assetPtr(slot, 3, [&](iw4::XModelSurfs& ms) {
+            push(BLOCK_VIRTUAL);
+            xstring(ms.name);
+            if (ms.surfs) {
+                ms.surfs = static_cast<iw4::XSurface*>(stream(alloc(kAlign4), 88ull * lodSurfs));
+                for (size_t i = 0; i < lodSurfs; i++) {
+                    iw4::XSurface& s = ms.surfs[i];
+                    const auto& vc = s.vertInfo.vertCount;
+                    inlineOrRef(s.vertInfo.vertsBlend,
+                                static_cast<size_t>(vc[0] + 3 * vc[1] + 5 * vc[2] + 7 * vc[3]), kAlign2);
+                    push(BLOCK_VERTEX);
+                    inlineOrRef(s.verts0, s.vertCount, kAlign16);
+                    pop();
+                    if (auto* vl = inlineOrRef(s.vertList, s.vertListCount, kAlign4))
+                        for (unsigned v = 0; v < s.vertListCount; v++)
+                            if (auto* ct = inlineOrRef(vl[v].collisionTree, 1, kAlign4)) {
+                                array(ct->nodes, ct->nodeCount, kAlign16);
+                                array(ct->leafs, ct->leafCount, kAlign2);
+                            }
+                    push(BLOCK_INDEX);
+                    inlineOrRef(s.triIndices, 3ull * s.triCount, kAlign16);
+                    pop();
+                }
+            }
+            pop();
+        });
+    }
+    void addonMapEnts(iw4::AddonMapEnts& m) {  // MapEnts without stages
+        push(BLOCK_VIRTUAL);
+        xstring(m.name);
+        if (m.entityString)
+            m.entityString = static_cast<char*>(stream(alloc(kAlign1), static_cast<size_t>(m.numEntityChars)));
+        uint8_t* t = reinterpret_cast<uint8_t*>(&m.trigger);
+        uint32_t models, hulls, slabs;
+        std::memcpy(&models, t + 0, 4);
+        std::memcpy(&hulls, t + 16, 4);
+        std::memcpy(&slabs, t + 32, 4);
+        rawArray(t + 8, 8ull * models, kAlign4);
+        rawArray(t + 24, 32ull * hulls, kAlign4);
+        rawArray(t + 40, 20ull * slabs, kAlign4);
+        pop();
+    }
     void rawFile(iw4::RawFile& r) {  // 0x11e730
         push(BLOCK_VIRTUAL);
         xstring(r.name);
@@ -747,6 +1097,28 @@ private:
 };
 
 }  // namespace
+
+const uint8_t* SimulatedZone::resolve(uint64_t ref) const {
+    if (!ref) return nullptr;
+    uint64_t v = ref - 1, block = v >> 28, off = v & 0x0FFFFFFF;
+    if (block >= 8 || !blockBase[block] || off >= blockUsed[block]) return nullptr;
+    return blockBase[block] + off;
+}
+
+bool simulatePrefix(const std::vector<uint8_t>& zoneImage, SimulatedZone& out, size_t& loadedAssets,
+                    std::string& stoppedAt) {
+    out = SimulatedZone{};
+    try {
+        Loader(zoneImage, out).runPrefix(loadedAssets, stoppedAt);
+        return true;
+    } catch (const Fail& e) {
+        stoppedAt = e.what();
+        return false;
+    } catch (const std::bad_alloc&) {
+        stoppedAt = "zonesim: out of memory";
+        return false;
+    }
+}
 
 bool simulateLoad(const std::vector<uint8_t>& zoneImage, SimulatedZone& out, std::string& error) {
     out = SimulatedZone{};

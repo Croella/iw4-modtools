@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include <set>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -50,6 +51,7 @@ struct Surface {
     uint32_t material = 0;  // into GfxWorldData::materials
     uint8_t primaryLight = 0;  // laf.primaryLightIndex: 1 = lit by the sun primary light
     bool sky = false;          // drawn with the embedded sky material (no lightmap)
+    bool unlit = false;        // unlit effect material (no lightmap, no sun)
     float mins[3], maxs[3];
 };
 
@@ -100,15 +102,30 @@ struct GfxWorldData {
     int skyMaterial = -1;
     std::vector<uint32_t> skySurfaces;
     std::string skyImage;
+    // A custom sky from zone_source/skies/<sky>.png|.tga (equirectangular panorama) embedded inline
+    // as a cube instead (pixels empty = use the stock image above).
+    Image customSky;
+    // Surfaces [0, opaqueSurfaceCount) are dpvs "lit opaque", the rest "lit trans" (see
+    // sortSurfaces). Default: everything opaque.
+    uint32_t opaqueSurfaceCount = UINT32_MAX;
 };
+
+// Orders surfaces like stock GfxWorlds: ascending material sort key (sortKeys[material]); keys
+// up to kLastOpaqueSortKey are the lit-opaque range, the rest (decals, translucent and additive
+// effects) the lit-trans range. Stock trainer: opaque <= 2 (sky last at 2), trans 6..29,
+// shadowcaster 34. Remaps skySurfaces.
+constexpr uint8_t kLastOpaqueSortKey = 5;
+void sortSurfaces(GfxWorldData& gw, const std::vector<uint8_t>& sortKeys);
 
 // True for tool materials that are never drawn (caulk, clip, triggers, hint, sky...).
 bool isToolMaterial(const std::string& name);
 
 // bake: baked lighting for the doc (light::bake), or nullptr for the old uniform lighting.
 // includeSky: emit sky faces as sky surfaces (needs the embedded sky material at write time).
+// unlitMaterials: lower-case editor names drawn without lightmap/sun (additive effects).
 bool buildGfxWorldData(const Document& doc, GfxWorldData& out, std::string& error,
-                       const light::Bake* bake = nullptr, bool includeSky = false);
+                       const light::Bake* bake = nullptr, bool includeSky = false,
+                       const std::set<std::string>* unlitMaterials = nullptr);
 // The material name GfxWorld uses for the embedded sky.
 constexpr const char* kSkyMaterial = "wc/iw4r_sky";
 

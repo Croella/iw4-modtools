@@ -1,4 +1,6 @@
 #include "mapimport.h"
+#include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -484,6 +486,23 @@ bool importFastfile(const std::string& ffPath, Document& doc, ImportStats& st, s
     for (const zone::PartialResult& r : res)
         if (!r.stopped.empty()) st.notes += "stopped at " + r.stopped + " (not needed for geometry); ";
     if (!g) st.notes += gfxAt ? "" : "no GfxWorld found; ";
+    if (g && std::getenv("IW4R_DUMP_DPVS")) {  // debug: how a stock map orders/ranges its surfaces
+        const iw4::GfxWorldDpvsStatic& v = g->dpvs;
+        std::printf("dpvs: surfaces %u static %u noDecal %u litOpaque [%u,%u) litTrans [%u,%u) shadowCaster [%u,%u) "
+                    "emissive [%u,%u) skies %d\n",
+                    g->surfaceCount, v.staticSurfaceCount, v.staticSurfaceCountNoDecal, v.litOpaqueSurfsBegin,
+                    v.litOpaqueSurfsEnd, v.litTransSurfsBegin, v.litTransSurfsEnd, v.shadowCasterSurfsBegin,
+                    v.shadowCasterSurfsEnd, v.emissiveSurfsBegin, v.emissiveSurfsEnd, g->skyCount);
+        std::string last;
+        for (unsigned i = 0; i < g->surfaceCount; i++) {
+            const iw4::GfxSurface& s = v.surfaces[i];
+            const char* mn = s.material && s.material->info.name ? s.material->info.name : "?";
+            std::string tag = std::string(mn) + " lmap " + std::to_string(s.laf.fields.lightmapIndex) + " sortKey " +
+                              std::to_string(s.material ? s.material->info.sortKey : -1);
+            if (tag != last) std::printf("  sorted %5u: %s\n", i, tag.c_str());
+            last = tag;
+        }
+    }
     std::shared_ptr<RefMesh> mesh = g ? convertGfxWorld(*g, st) : nullptr;
     fillDocument(doc, me, cm, mesh, st, error);
     error.clear();

@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <commdlg.h>
 #include <shlobj.h>
+#include <tlhelp32.h>
 #include "app.h"
 #include <imgui_internal.h>
 #include <algorithm>
@@ -10,10 +11,12 @@
 #include <shellapi.h>
 #include <filesystem>
 #include <fstream>
+#include <thread>
 #include "fastfile.h"
 #include "mapio.h"
 #include "zone/mapimport.h"
 #include "zone/zonebuild.h"
+#include "light/lightbake.h"
 #include "live/liveimport.h"
 #include "zone/zonedump.h"
 #include "zone/zonesim.h"
@@ -87,6 +90,20 @@ bool injectDll(HANDLE proc, const std::string& dllPath, std::string& err) {
     return ok;
 }
 
+// Pid of a running process named exeName other than `skip` (0 if none).
+DWORD findProcess(const std::string& exeName, DWORD skip) {
+    DWORD found = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    const std::wstring want(exeName.begin(), exeName.end());
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof pe;
+    for (BOOL ok = Process32FirstW(snap, &pe); ok && !found; ok = Process32NextW(snap, &pe))
+        if (pe.th32ProcessID != skip && _wcsicmp(pe.szExeFile, want.c_str()) == 0) found = pe.th32ProcessID;
+    CloseHandle(snap);
+    return found;
+}
+
 // Classic folder picker (no COM init needed); returns "" if cancelled.
 std::string folderDialog(HWND owner, const char* title) {
     char path[MAX_PATH] = "";
@@ -135,6 +152,7 @@ void App::startBake() {
     bakeFinished = false;
     bakeOut = std::make_shared<light::Bake>();
     bakeStarted = std::chrono::steady_clock::now();
+    refreshUnlitMaterials();
     log("Baking lighting ...");
     bakeThread = std::thread([this, snapshot, s = lightSettings, out = bakeOut] {
         std::string err;
@@ -161,6 +179,93 @@ void App::pollBake() {
                   bakeResult->faces.size(), bakeResult->width, bakeResult->height, bakeResult->luxelSize,
                   bakeResult->env.hasSun ? "" : " (no sun)");
     log(line);
+}
+
+// Effect materials (additive falloff sheets) in the map: the baker lets light through them.
+void App::refreshUnlitMaterials() {
+    lightSettings.unlitMaterials.clear();
+    for (const Brush& b : doc.ents.empty() ? std::vector<Brush>{} : doc.ents[0].brushes)
+        for (const Face& f : b.faces) {
+            matdef::Def def;
+            if (assets.materialDef(f.material, def) && matdef::shadingFor(def) == matdef::Shading::FalloffAdd) {
+                std::string n = matdef::key(f.material);
+                lightSettings.unlitMaterials.insert(n.rfind("wc/", 0) == 0 ? n.substr(3) : n);
+            }
+        }
+}
+
+// File > Edit Map Script: the map's own GSC lives next to the .map as <name>.gsc and replaces
+// the generated maps/[mp/]<name>.gsc when compiling. Creates it from the generated script (for
+// the last compile target) if missing, then opens it in the system's editor for .gsc (Notepad if
+// none is associated).
+void App::editMapScript() {
+    if (doc.path.empty()) {
+        save(true);
+        if (doc.path.empty()) return;
+    }
+    const std::string path = mapScriptPath(doc.path);
+    if (!std::filesystem::exists(path)) {
+        const std::string name = std::filesystem::path(doc.path).stem().string();
+        std::ofstream f(path, std::ios::binary);
+        std::string src = mapScriptSource(name, compileTarget);
+        if (compileTarget == MapTarget::SP)
+            src += "\n// Add your level logic below _load::main(), e.g.\n"
+                   "// level.player thread my_intro();\n";
+        else
+            src += "\n// Add your level logic after maps\\mp\\_load::main(), e.g. thread functions.\n";
+        f << src;
+        if (!f) {
+            MessageBoxA(hwnd, ("Couldn't create " + path).c_str(), "Edit Map Script", MB_OK | MB_ICONERROR);
+            return;
+        }
+        log("Created map script " + path + " (" + (compileTarget == MapTarget::SP ? "singleplayer" : "multiplayer") +
+            " template)");
+    }
+    if (reinterpret_cast<INT_PTR>(ShellExecuteA(hwnd, "open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) <= 32)
+        ShellExecuteA(hwnd, "open", "notepad.exe", ("\"" + path + "\"").c_str(), nullptr, SW_SHOWNORMAL);
+    log("Editing " + path + ": it's packed into the map as its script on the next compile (F5/F7).");
+}
+
+// Weapon pack (worldspawn "weaponpack", SP): copies the stock add-on zone next to the map's zone
+// as so_w_<map>.ff. Returns the level name to devmap, or "" if the map has no pack.
+std::string App::deployPackFor(const std::string& mapName, MapTarget target, const std::string& folder) {
+    const std::string* pack = doc.ents.empty() ? nullptr : doc.ents[0].find("weaponpack");
+    if (!pack || pack->empty() || target != MapTarget::SP) return "";
+    std::string err;
+    if (!deployWeaponPack(gameInput, folder, *pack, mapName, err)) {
+        log("  weapon pack: " + err);
+        return "";
+    }
+    const std::string level = weaponPackLevel(mapName);
+    log("  weapon pack " + *pack + " deployed as " + level + ".ff: play with  devmap " + level);
+    return level;
+}
+
+void App::drawWeaponsMenu() {
+    if (!ImGui::BeginMenu("Weapons")) return;
+    const std::string* cur = doc.ents.empty() ? nullptr : doc.ents[0].find("weaponpack");
+    const std::string current = cur ? *cur : "";
+    ImGui::TextDisabled("Singleplayer: guns come from a stock Special Ops add-on zone");
+    ImGui::TextDisabled("loaded with the map. Play with  devmap so_w_<map>.");
+    ImGui::Separator();
+    auto setPack = [&](const std::string& v) {
+        doc.pushUndo();
+        if (v.empty()) {
+            auto& kv = doc.ents[0].kv;
+            kv.erase(std::remove_if(kv.begin(), kv.end(), [](const KeyValue& k) { return k.key == "weaponpack"; }), kv.end());
+        } else {
+            doc.ents[0].set("weaponpack", v);
+        }
+        doc.touch();
+        log(v.empty() ? "Weapon pack removed" : "Weapon pack: " + v + " (compile for Singleplayer, then devmap " +
+                                                    weaponPackLevel(doc.path.empty() ? "<map>" : std::filesystem::path(doc.path).stem().string()) + ")");
+    };
+    if (ImGui::MenuItem("None (grenades, c4 only)", nullptr, current.empty())) setPack("");
+    for (const WeaponPack& p : weaponPacks()) {
+        if (ImGui::MenuItem(p.zone, nullptr, current == p.zone)) setPack(p.zone);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", p.weapons);
+    }
+    ImGui::EndMenu();
 }
 
 void App::bakeLightingNow() {
@@ -228,6 +333,58 @@ void App::newMap() {
     log("New map");
 }
 
+// zone_source models (zone_source/xmodels/*.xmodel_export next to the map) into the model preview
+// library, so script_model / misc_model entities using them draw in the 3D view.
+void App::loadZoneSourcePreview() {
+    if (doc.path.empty()) return;
+    const std::string dir = zoneSourcePath(doc.path);
+    if (!std::filesystem::is_directory(std::filesystem::path(dir) / "xmodels")) return;
+    std::vector<std::string> warnings;
+    std::vector<modelbuild::Model> models = loadZoneSourceModels(dir, warnings);
+    for (const std::string& w : warnings) log("  zone_source: " + w);
+    for (const modelbuild::Model& md : models) {
+        auto lm = std::make_shared<live::LiveModel>();
+        lm->name = md.name;
+        for (const modelbuild::Surface& s : md.surfaces) {
+            live::LiveModelSurf ls;
+            const modelbuild::Material& mm = md.materials[s.material];
+            ls.material = "mc/" + md.name + "_" + mm.name;
+            std::string stem = std::filesystem::path(mm.texture).stem().string();
+            for (const std::string& cand : {std::filesystem::path(mm.texture).filename().string(), stem + ".png", stem + ".tga"}) {
+                std::filesystem::path p = std::filesystem::path(dir) / "images" / cand;
+                if (!cand.empty() && std::filesystem::exists(p)) {
+                    renderer.setTextureFile(ls.material, p.string());
+                    break;
+                }
+            }
+            for (const modelbuild::PackedVertex& v : s.verts) {
+                ls.pos.insert(ls.pos.end(), v.xyz, v.xyz + 3);
+                Vec3 n = gfx::unpackUnitVec(v.normal);
+                ls.nrm.push_back(static_cast<float>(n.x));
+                ls.nrm.push_back(static_cast<float>(n.y));
+                ls.nrm.push_back(static_cast<float>(n.z));
+                auto half = [](uint16_t h) {
+                    uint32_t sign = (h >> 15) & 1, e = (h >> 10) & 0x1F, m = h & 0x3FF, bits;
+                    if (e == 0) bits = sign << 31;
+                    else bits = (sign << 31) | ((e - 15 + 127) << 23) | (m << 13);
+                    float f;
+                    std::memcpy(&f, &bits, 4);
+                    return f;
+                };
+                ls.uv.push_back(half(static_cast<uint16_t>(v.texCoord & 0xFFFF)));
+                ls.uv.push_back(half(static_cast<uint16_t>(v.texCoord >> 16)));
+                lm->bounds.add(Vec3{v.xyz[0], v.xyz[1], v.xyz[2]});
+            }
+            // The game's winding is clockwise from the front; the preview draws both sides anyway.
+            ls.idx = s.tris;
+            lm->surfs.push_back(std::move(ls));
+        }
+        liveModels[live::modelKey(md.name)] = lm;
+    }
+    meshRevision = 0;
+    if (!models.empty()) log("Loaded " + std::to_string(models.size()) + " zone_source model(s) for preview from " + dir);
+}
+
 bool App::openMap(const std::string& path) {
     std::string err;
     if (!loadMap(path, doc, err)) {
@@ -242,6 +399,7 @@ bool App::openMap(const std::string& path) {
     }
     log("Opened " + path + ": " + std::to_string(doc.ents.size()) + " entities, " + std::to_string(brushes) + " brushes" +
         (raw ? ", " + std::to_string(raw) + " raw blocks kept but not shown" : ""));
+    loadZoneSourcePreview();
     return true;
 }
 
@@ -321,6 +479,29 @@ static bool confirmMapName(HWND hwnd, const std::string& mapName, MapTarget targ
     return true;
 }
 
+// Copies a compiled zone (and its sun-shaft settings) into <game>/zone/english, where the game
+// finds it on its own. Skipped when `already` is that same file.
+void App::deployToGameZone(const std::string& mapName, const std::vector<uint8_t>& ff, const std::string& already) {
+    namespace fs = std::filesystem;
+    if (gameInput.empty()) return;
+    const fs::path dir = fs::path(gameInput) / "zone" / "english";
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) {
+        log("  zone/english not found in the game folder; not copied there (" + dir.string() + ")");
+        return;
+    }
+    const fs::path dest = dir / (mapName + ".ff");
+    if (!already.empty() && fs::equivalent(dest, already, ec)) return;
+    std::ofstream f(dest, std::ios::binary | std::ios::trunc);
+    if (!f.write(reinterpret_cast<const char*>(ff.data()), static_cast<std::streamsize>(ff.size()))) {
+        log("  can't write " + dest.string() + " (is the game running with the map loaded?)");
+        return;
+    }
+    f.close();
+    std::ofstream(dir / (mapName + ".volumetric"), std::ios::trunc) << light::volumetricConfig(doc);
+    log("  copied to " + dest.string());
+}
+
 void App::compileDialog(MapTarget target) {
     // Default: <map dir>/<map stem>.ff, or the last compile target.
     std::string initial = lastCompilePath;
@@ -356,10 +537,12 @@ void App::compileDialog(MapTarget target) {
     std::string details = zone::describeSimulatedZone(sim);
     const char* gameName = target == MapTarget::SP ? "singleplayer (iw4sp)" : "multiplayer (iw4mp)";
     log("Compiled " + path + " for " + gameName + " (" + std::to_string(ff.size()) + " bytes), loader check ok");
+    deployToGameZone(mapName, ff, path);
+    std::string packNote = deployPackFor(mapName, target, std::filesystem::path(path).parent_path().string());
     log(details);
     MessageBoxA(hwnd,
                 ("Wrote " + path + " for " + gameName + "\n\nLoader check passed.\n" + details +
-                 "\nLoad it in-game with:  devmap " + mapName +
+                 "\nLoad it in-game with:  devmap " + (packNote.empty() ? mapName : packNote) +
                  "\n\nNot compiled yet: brush entities, patches, models, real lighting.")
                     .c_str(),
                 "Compile to .ff", MB_OK | MB_ICONINFORMATION);
@@ -373,6 +556,7 @@ bool App::compileCurrentMap(const std::string& mapName, MapTarget target, std::v
     waitForBake();
     CompileOptions options;
     options.light = lightSettings;
+    refreshUnlitMaterials();
     if (!bakeUpToDate()) {
         log("Baking lighting for the compile ...");
         auto fresh = std::make_shared<light::Bake>();
@@ -392,6 +576,24 @@ bool App::compileCurrentMap(const std::string& mapName, MapTarget target, std::v
     options.prebaked = bakeResult.get();
     options.gameDir = gameInput;
     options.cacheDir = cacheDir;
+    if (const std::string* pack = doc.ents.empty() ? nullptr : doc.ents[0].find("weaponpack");
+        pack && !pack->empty()) {
+        if (target == MapTarget::SP) {
+            options.addonLevel = weaponPackLevel(mapName);
+            log("Weapon pack " + *pack + ": the map also builds level " + options.addonLevel);
+        } else {
+            log("  note: weaponpack is singleplayer-only (Special Ops add-on zones); ignored for MP");
+        }
+    }
+    if (!doc.path.empty()) {
+        options.zoneSourceDir = zoneSourcePath(doc.path);
+        if (std::filesystem::is_directory(options.zoneSourceDir)) log("Compiling custom assets from " + options.zoneSourceDir);
+    }
+    if (readMapScript(doc.path, options.mapScript))
+        log("Using map script " + mapScriptPath(doc.path));
+    else
+        log("No " + std::filesystem::path(mapScriptPath(doc.path.empty() ? "map.map" : doc.path)).filename().string() +
+            " next to the map: using the generated script (File > Edit Map Script to customise)");
     std::vector<std::string> warnings;
     options.warnings = &warnings;
     bool compiled = compileMapToFastfile(doc, mapName, ff, err, target, options);
@@ -453,6 +655,12 @@ void App::compileAndRun(MapTarget target) {
         }
     }
     log("Deployed " + dest + " (" + std::to_string(ff.size()) + " bytes)");
+    {  // sun-shaft settings for iw4r_mapload.dll (re-read live by the game while it runs)
+        const std::string vdest = (std::filesystem::path(deployDir) / (mapName + ".volumetric")).string();
+        std::ofstream(vdest, std::ios::trunc) << light::volumetricConfig(doc);
+    }
+    deployToGameZone(mapName, ff, dest);
+    const std::string packLevel = deployPackFor(mapName, target, deployDir);
 
     std::string exe = (std::filesystem::path(gameInput) / exeName).string();
     if (!std::filesystem::exists(exe)) {
@@ -488,8 +696,42 @@ void App::compileAndRun(MapTarget target) {
         log("  injected iw4r_mapload.dll (redirects " + mapName + ".ff from " + deployDir + ")");
     else
         log("  DLL injection failed: " + injErr);
-    CloseHandle(pi.hProcess);
-    log("  When the game is up, open the console (~) and run:  devmap " + mapName);
+    // Steam often closes the process we started and relaunches the game itself, which would leave
+    // the real game without the DLL. Follow the relaunch and inject into the new process too.
+    if (std::filesystem::exists(dll)) {
+        std::thread([this, proc = pi.hProcess, pid = pi.dwProcessId, exeName, dll] {
+            if (WaitForSingleObject(proc, 20000) == WAIT_TIMEOUT) {  // still running: it's the real game
+                CloseHandle(proc);
+                return;
+            }
+            CloseHandle(proc);
+            for (int i = 0; i < 3000; i++) {  // up to 60 s for Steam to start the new one
+                Sleep(20);
+                const DWORD np = findProcess(exeName, pid);
+                if (!np) continue;
+                // Inject right away: the DLL has to be in before the game creates its Direct3D device
+                // (its depth buffer is made then). The remote LoadLibrary waits for the process's
+                // own startup to finish by itself.
+                Sleep(30);
+                HANDLE h = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION |
+                                           PROCESS_VM_WRITE | PROCESS_VM_READ | SYNCHRONIZE, FALSE, np);
+                std::string e;
+                if (!h) {
+                    log("  Steam relaunched " + exeName + " but it can't be opened (error " + std::to_string(GetLastError()) + ")");
+                } else if (injectDll(h, dll, e)) {
+                    log("  Steam relaunched " + exeName + "; injected iw4r_mapload.dll into it (pid " + std::to_string(np) + ")");
+                } else {
+                    log("  Steam relaunched " + exeName + "; DLL injection failed: " + e);
+                }
+                if (h) CloseHandle(h);
+                return;
+            }
+            log("  " + exeName + " exited and no relaunch was seen; the DLL isn't in the game");
+        }).detach();
+    } else {
+        CloseHandle(pi.hProcess);
+    }
+    log("  When the game is up, open the console (~) and run:  devmap " + (packLevel.empty() ? mapName : packLevel));
 }
 
 bool App::importFastfileMap(const std::string& path) {
@@ -752,6 +994,10 @@ void App::handleShortcuts() {
     if (ImGui::IsKeyPressed(ImGuiKey_F7, false)) requestCompile(PendingCompile::ToFile);
     if (ImGui::IsKeyPressed(ImGuiKey_F5, false)) requestCompile(PendingCompile::AndRun);
     if (ImGui::IsKeyPressed(ImGuiKey_F9, false)) startBake();
+    if (ImGui::IsKeyPressed(ImGuiKey_F6, false)) {
+        renderer.cullBackFaces = !renderer.cullBackFaces;
+        meshRevision = 0;
+    }
     if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) frameAll();
     if (ImGui::IsKeyPressed(ImGuiKey_LeftBracket, true)) gridSize = std::max(1.0, gridSize / 2);
     if (ImGui::IsKeyPressed(ImGuiKey_RightBracket, true)) gridSize = std::min(512.0, gridSize * 2);
@@ -778,6 +1024,7 @@ void App::refreshMaterials() {
 void App::frame() {
     if (meshRevision != doc.revision) {
         renderer.rebuild(doc);
+        renderer.setVolumetric(light::readVolumetric(doc));  // worldspawn volumetric_* edits show right away
         meshRevision = doc.revision;
     }
     renderer.pumpTextures(8);
@@ -836,6 +1083,8 @@ void App::drawMenu() {
         if (ImGui::MenuItem("Load Entity Models from Running Game")) loadEntityModels();
         if (ImGui::MenuItem("Compile to .ff...", "F7")) requestCompile(PendingCompile::ToFile);
         if (ImGui::MenuItem("Compile & Run in Game", "F5")) requestCompile(PendingCompile::AndRun);
+        if (ImGui::MenuItem("Edit Map Script...")) editMapScript();
+        if (ImGui::MenuItem("Reload zone_source Models", nullptr, false, !doc.path.empty())) loadZoneSourcePreview();
         if (ImGui::MenuItem("Dump Fast File...")) dumpDialog();
         ImGui::Separator();
         if (ImGui::MenuItem("Exit")) PostMessageA(hwnd, WM_CLOSE, 0, 0);
@@ -867,6 +1116,7 @@ void App::drawMenu() {
         ImGui::MenuItem("Reference Mesh", nullptr, &renderer.showRefMesh, doc.refMesh != nullptr);
         if (ImGui::MenuItem("Brushes", nullptr, &renderer.showBrushes)) meshRevision = 0;
         if (ImGui::MenuItem("Tool Brushes (caulk, clip...)", nullptr, &renderer.showToolFaces)) meshRevision = 0;
+        if (ImGui::MenuItem("Back-Face Culling (as in game)", "F6", &renderer.cullBackFaces)) meshRevision = 0;
         if (ImGui::MenuItem("Frame All", "Home")) frameAll();
         ImGui::EndMenu();
     }
@@ -875,6 +1125,7 @@ void App::drawMenu() {
         if (ImGui::MenuItem("Bake Lighting", "F9", false, !running)) startBake();
         if (ImGui::MenuItem("Cancel Bake", nullptr, false, running)) bakeProgress.cancel = true;
         if (ImGui::MenuItem("Show Lighting", nullptr, &renderer.showLighting, renderer.hasLighting())) meshRevision = 0;
+        ImGui::MenuItem("Show Volumetrics (shafts, fog)", nullptr, &renderer.showVolumetrics, renderer.hasLighting());
         if (ImGui::MenuItem("Add Light at Camera")) addLightAtCamera();
         ImGui::Separator();
         float lux = static_cast<float>(lightSettings.luxelSize);
@@ -895,6 +1146,7 @@ void App::drawMenu() {
             ImGui::TextColored(ImVec4(1, 0.75f, 0.3f, 1), "Lighting changed: rebake (F9)");
         ImGui::EndMenu();
     }
+    drawWeaponsMenu();
     if (ImGui::BeginMenu("Grid")) {
         for (double g : {1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0}) {
             char label[16];
@@ -1396,6 +1648,18 @@ void App::drawInspector() {
         ImGui::Text("Size  %g x %g x %g", box.maxs.x - box.mins.x, box.maxs.y - box.mins.y, box.maxs.z - box.mins.z);
         ImGui::Text("Mins  %g %g %g", box.mins.x, box.mins.y, box.mins.z);
         ImGui::Text("Material  %s", first->faces[0].material.c_str());
+        // Per-brush cull toggle: two-sided brushes are visible from inside too (e.g. dust volumes).
+        bool twoSided = first->twoSided();
+        if (ImGui::Checkbox("Two-sided (visible from inside)", &twoSided)) {
+            doc.pushUndo();
+            for (const Sel& s : doc.sel)
+                if (s.brush >= 0) doc.ents[s.ent].brushes[s.brush].setTwoSided(twoSided);
+            doc.touch();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The game hides faces seen from behind. Two-sided brushes are compiled with a\n"
+                              "mirrored copy of every face, so they also show from inside the brush.\n"
+                              "Preview with View > Back-Face Culling (F6).");
         TexDef t = first->faces[0].tex;
         float vals[5] = {(float)t.w, (float)t.h, (float)t.sx, (float)t.sy, (float)t.rot};
         bool changed = false;

@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 #include <memory>
@@ -11,6 +12,8 @@
 #include "light/lightbake.h"
 #include "zone/skysource.h"
 #include "zone/matdefs.h"
+#include "zone/modelbuild.h"
+#include "zone/weapondef.h"
 
 // Builds an unsigned IW4 (x64) fastfile zone from map data. Scope so far: the three simple world
 // assets (ComWorld, GameWorldMp, FxWorld) and collision (clipMap_t, carrying the entity lump as
@@ -35,6 +38,10 @@ enum IW4AssetType : uint32_t {
     IW4_FXWORLD = 0x14,
     IW4_GFXWORLD = 0x15,
     IW4_RAWFILE = 0x24,
+    IW4_ADDON_MAP_ENTS = 0x2A,
+    IW4_XMODEL = 0x04,
+    IW4_XANIMPARTS = 0x02,
+    IW4_WEAPON = 0x1C,
 };
 
 struct ZoneAsset {
@@ -109,7 +116,54 @@ struct CompileOptions {
     // Stock world-material definitions to embed (see matdef). Null: loaded from
     // <cacheDir>/materialdefs.bin if there is one; materials not in it stay by-name references.
     std::shared_ptr<const matdef::Library> materials;
+    // Weapon pack (SP): a stock Special Ops add-on zone whose weapons, models, anims and sounds
+    // load with the map. The game loads add-on zones for levels named so_<mission>_<base>
+    // (world = <base>.ff, add-on = so_<mission>_<base>.ff; Com_GetBspFilename / iw4sp+0x25e650),
+    // so with addonLevel set (weaponPackLevel(mapName)), the zone also gets that level's script
+    // maps/<addonLevel>.gsc and an empty add-on entity lump maps/<addonLevel>.mapents; the stock
+    // pack is then deployed as <addonLevel>.ff (deployWeaponPack) and played with devmap <addonLevel>.
+    std::string addonLevel;
+    // Custom content: <map folder>/zone_source. zone_source/xmodels/*.xmodel_export compile into
+    // XModels (asset name = file stem), textures come from zone_source/images (png/tga, embedded)
+    // or, failing that, stream from the game's IWDs by name. Place them with script_model
+    // entities ("model" key); misc_model entities using them become script_models.
+    std::string zoneSourceDir;
+    // The map's own script (maps/[mp/]<map>.gsc source). Empty: the generated minimal one
+    // (mapScriptSource). Editor and CLI read it from <map>.gsc next to the .map (mapScriptPath).
+    std::string mapScript;
 };
+
+// Weapon packs: worldspawn key "weaponpack" names a stock SP Special Ops add-on zone.
+struct WeaponPack {
+    const char* zone;     // stock add-on zone (zone/english/<zone>.ff)
+    const char* weapons;  // what it carries (from a scan of the zone; informational)
+};
+const std::vector<WeaponPack>& weaponPacks();
+// The level name that loads <mapName>.ff plus the pack: "so_w_<mapName>".
+std::string weaponPackLevel(const std::string& mapName);
+// Copies <gameDir>/zone/english/<pack>.ff to <deployDir>/<weaponPackLevel(mapName)>.ff.
+bool deployWeaponPack(const std::string& gameDir, const std::string& deployDir, const std::string& pack,
+                      const std::string& mapName, std::string& error);
+
+// zone_source next to a .map.
+std::string zoneSourcePath(const std::string& mapPath);
+// Loads every zone_source/xmodels/*.xmodel_export (warnings for skipped ones).
+// hints: per-model build options by asset name (from loadZoneSourceWeapons).
+std::vector<modelbuild::Model> loadZoneSourceModels(const std::string& zoneSourceDir, std::vector<std::string>& warnings,
+                                                    const std::map<std::string, modelbuild::BuildOptions>* hints = nullptr);
+
+// zone_source/weapons/<name> (IW4 weapon files), with model/anim references resolved to
+// zone_source assets, and the build options their models need (hidden tags, zero trans).
+struct ZoneSourceWeapons {
+    std::vector<weapondef::Weapon> weapons;
+    std::map<std::string, modelbuild::BuildOptions> hints;
+};
+ZoneSourceWeapons loadZoneSourceWeapons(const std::string& zoneSourceDir, std::vector<std::string>& warnings);
+
+// The custom map script that goes with a .map: same folder and name, ".gsc" extension.
+std::string mapScriptPath(const std::string& mapPath);
+// Reads mapScriptPath(mapPath) into out; false (out empty) if there is no such file.
+bool readMapScript(const std::string& mapPath, std::string& out);
 bool compileMapToFastfile(const Document& doc, const std::string& mapName,
                           std::vector<uint8_t>& fastfileOut, std::string& error,
                           MapTarget target = MapTarget::MP, const CompileOptions& options = {});

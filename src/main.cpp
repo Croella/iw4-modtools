@@ -97,10 +97,15 @@ bool writeScreenshot(const std::string& path) {
 //   --ui-test <report>     runs scripted input through the real UI and writes pass/fail
 //   --import <map.ff>      imports a compiled map (File > Import Map from .ff)
 //   --bake                 bakes lighting (F9) before showing / screenshotting
+//   --cull                 back-face culling on in the 3D view (View > Back-Face Culling)
+//   --hide-tools           tool brushes (caulk, clip...) hidden in the 3D view
+//   --camera x y z yaw pitch   starts the 3D camera there (degrees)
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     std::string mapPath, screenshot, uiTestReport, importPath, game = kDefaultGame;
-    bool demo = false, selectAll = false, bakeLight = false;
+    bool demo = false, selectAll = false, bakeLight = false, cull = false, hideTools = false;
     int frames = 240;
+    bool setCam = false;
+    double cam[5] = {};
     for (int i = 1; i < __argc; i++) {
         std::string a = __argv[i];
         bool hasNext = i + 1 < __argc;
@@ -112,6 +117,12 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
         else if (a == "--demo") demo = true;
         else if (a == "--select-all") selectAll = true;
         else if (a == "--bake") bakeLight = true;
+        else if (a == "--cull") cull = true;
+        else if (a == "--hide-tools") hideTools = true;
+        else if (a == "--camera" && i + 5 < __argc) {
+            for (double& c : cam) c = std::atof(__argv[++i]);
+            setCam = true;
+        }
         else mapPath = a;
     }
 
@@ -163,6 +174,13 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     else if (demo) app.buildDemo();
     if (selectAll) app.selectAll();
     if (bakeLight) app.bakeLightingNow();
+    app.renderer.cullBackFaces = cull;
+    if (hideTools) app.renderer.showToolFaces = false;
+    if (setCam) {
+        app.camera.pos = {cam[0], cam[1], cam[2]};
+        app.camera.yaw = cam[3];
+        app.camera.pitch = cam[4];
+    }
 
     ShowWindow(hwnd, screenshot.empty() && uiTestReport.empty() ? SW_SHOWDEFAULT : SW_HIDE);
     UiTest uiTest(app, uiTestReport);

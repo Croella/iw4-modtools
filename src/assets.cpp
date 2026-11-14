@@ -232,6 +232,15 @@ void AssetDb::scanThread(std::vector<std::string> zones) {
     }
 }
 
+bool AssetDb::materialDef(const std::string& name, matdef::Def& out) {
+    std::string k = matdef::key(name.find('/') == std::string::npos ? "wc/" + name : name);
+    std::lock_guard lock(mutex);
+    auto it = defs.find(k);
+    if (it == defs.end()) return false;
+    out = it->second;
+    return true;
+}
+
 size_t AssetDb::materialDefCount() {
     std::lock_guard lock(mutex);
     return defs.size();

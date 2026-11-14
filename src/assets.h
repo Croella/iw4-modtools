@@ -46,6 +46,9 @@ public:
     // Stock world-material definitions found by the zone scan, for embedding in compiled maps
     // (cached in materialdefs.bin; the compiler reads that file).
     size_t materialDefCount();
+    // The stock definition of a world material by editor name ("atmos_particles_dust" or with
+    // its "wc/" prefix). False if the library doesn't have it.
+    bool materialDef(const std::string& name, matdef::Def& out);
 
     // Main thread only: zip readers aren't thread safe.
     bool loadMaterialImage(const std::string& materialName, int maxDim, IwiImage& out);

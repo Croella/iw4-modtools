@@ -19,6 +19,7 @@
 #include "mapio.h"
 #include "zone/iw4.h"
 #include "zone/zonebuild.h"
+#include "light/lightbake.h"
 #include <chrono>
 #include "zone/mapimport.h"
 #include "live/liveimport.h"
@@ -163,6 +164,11 @@ int compile(const std::string& mapPath, const std::string& outPath) {
     std::vector<uint8_t> ff;
     CompileOptions options;
     if (const char* la = std::getenv("LOCALAPPDATA")) options.cacheDir = std::string(la) + "\\iw4-radiant";
+    const std::string* pack = doc.ents.empty() ? nullptr : doc.ents[0].find("weaponpack");
+    if (pack && !pack->empty() && target == MapTarget::SP) options.addonLevel = weaponPackLevel(mapName);
+    if (readMapScript(mapPath, options.mapScript))
+        std::printf("map script: %s\n", mapScriptPath(mapPath).c_str());
+    options.zoneSourceDir = zoneSourcePath(mapPath);
     std::vector<std::string> warnings;
     options.warnings = &warnings;
     bool compiled = compileMapToFastfile(doc, mapName, ff, err, target, options);
@@ -178,9 +184,21 @@ int compile(const std::string& mapPath, const std::string& outPath) {
     }
     std::printf("compiled %s (zone name %s)\n", mapPath.c_str(), mapName.c_str());
     if (!verifyZone(back.zone)) return 2;  // never write a zone the loader would reject
+    {  // sun-shaft settings for iw4r_mapload.dll, next to the zone
+        std::filesystem::path vp = std::filesystem::path(outPath).replace_extension(".volumetric");
+        std::ofstream(vp, std::ios::trunc) << light::volumetricConfig(doc);
+    }
     if (!writeFile(outPath, ff)) {
         std::printf("error: can't write %s\n", outPath.c_str());
         return 1;
+    }
+    if (!options.addonLevel.empty()) {
+        std::string perr;
+        if (deployWeaponPack(options.gameDir, std::filesystem::path(outPath).parent_path().string(), *pack, mapName, perr))
+            std::printf("  weapon pack %s -> %s.ff; play with: devmap %s\n", pack->c_str(), options.addonLevel.c_str(),
+                        options.addonLevel.c_str());
+        else
+            std::printf("  weapon pack: %s\n", perr.c_str());
     }
     std::printf("  wrote %s (%zu bytes): ComWorld, FxWorld, GfxWorld, %s, clipMap (+MapEnts, %zu entities)\n",
                 outPath.c_str(), ff.size(), target == MapTarget::SP ? "GameWorldSp" : "GameWorldMp",
@@ -328,10 +346,207 @@ int matDefs(int argc, char** argv) {
     return matdef::save(cache, lib) ? 0 : 1;
 }
 
+// refprobe <zone.ff> <ref>... : loads the zone's leading assets the sim supports, then dumps the
+// 32 bytes each back-reference points to (as hex and as floats).
+int refProbe(int argc, char** argv) {
+    std::ifstream in(argv[0], std::ios::binary);
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    Fastfile zf;
+    std::string err;
+    if (!readFastfile(bytes, zf, err)) { std::printf("%s\n", err.c_str()); return 1; }
+    zone::SimulatedZone sim;
+    size_t loaded = 0;
+    std::string stopped;
+    zone::simulatePrefix(zf.zone, sim, loaded, stopped);
+    std::printf("loaded %zu assets; VIRTUAL used 0x%x; stopped: %s\n", loaded, sim.blockUsed[3], stopped.c_str());
+    for (int i = 1; i < argc; i++) {
+        uint64_t ref = std::strtoull(argv[i], nullptr, 16);
+        const uint8_t* p = sim.resolve(ref);
+        if (!p) { std::printf("  %s: not loaded\n", argv[i]); continue; }
+        float f[4];
+        std::memcpy(f, p, 16);
+        std::printf("  %s: %g %g %g %g |", argv[i], f[0], f[1], f[2], f[3]);
+        for (int k = 0; k < 32; k++) std::printf(" %02x", p[k]);
+        std::printf("\n");
+    }
+    return 0;
+}
+
+// modelprobe <zone.ff> : prefix-loads a stock zone and prints the XModels it reaches.
+int modelProbe(const char* path) {
+    std::ifstream in(path, std::ios::binary);
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    Fastfile zf;
+    std::string err;
+    if (!readFastfile(bytes, zf, err)) { std::printf("%s\n", err.c_str()); return 1; }
+    zone::SimulatedZone sim;
+    size_t loaded = 0;
+    std::string stopped;
+    zone::simulatePrefix(zf.zone, sim, loaded, stopped);
+    std::printf("loaded %zu assets; stopped: %s\n", loaded, stopped.c_str());
+    int shown = 0;
+    for (const auto& a : sim.assets) {
+        if (a.type != 4 || a.reference || shown >= 6) continue;
+        const iw4::XModel& m = *static_cast<const iw4::XModel*>(a.header);
+        shown++;
+        std::printf("xmodel %s: bones %u root %u surfs %u lodRamp %u scale %g numLods %u collLod %d flags 0x%x contents 0x%x radius %g collSurfs %d\n",
+                    m.name, m.numBones, m.numRootBones, m.numsurfs, m.lodRampType, m.scale, m.numLods, (int)(signed char)m.collLod, m.flags,
+                    m.contents, m.radius, m.numCollSurfs);
+        std::printf("  bounds mid %g %g %g half %g %g %g  memUsage %d bad %d physPreset %s physCollmap %p\n",
+                    m.bounds.midPoint[0], m.bounds.midPoint[1], m.bounds.midPoint[2], m.bounds.halfSize[0], m.bounds.halfSize[1],
+                    m.bounds.halfSize[2], m.memUsage, m.bad, m.physPreset && m.physPreset->name ? m.physPreset->name : "-", (void*)m.physCollmap);
+        for (int i = 0; i < m.numBones && i < 4; i++)
+            std::printf("  bone %d name idx %u class %u baseMat q %g %g %g %g t %g %g %g w %g\n", i, m.boneNames ? m.boneNames[i] : 0,
+                        m.partClassification ? m.partClassification[i] : 0, m.baseMat[i].quat[0], m.baseMat[i].quat[1], m.baseMat[i].quat[2],
+                        m.baseMat[i].quat[3], m.baseMat[i].trans[0], m.baseMat[i].trans[1], m.baseMat[i].trans[2], m.baseMat[i].transWeight);
+        if (std::getenv("IW4R_BONES")) {
+            const int nr = m.numRootBones;
+            if (std::getenv("IW4R_ALLBONES")) {  // name, parent, model-space bind pose, every bone
+                for (int i = 0; i < m.numBones; i++) {
+                    const int par = i < nr ? -1 : i - m.parentList[i - nr];
+                    auto nm = [&](int b) { return m.boneNames[b] < sim.scriptStrings.size() ? sim.scriptStrings[m.boneNames[b]].c_str() : "?"; };
+                    std::printf("  BONE %-3d %-32s parent %-28s base q %7.4f %7.4f %7.4f %7.4f t %8.3f %8.3f %8.3f\n", i, nm(i),
+                                par < 0 ? "-" : nm(par), m.baseMat[i].quat[0], m.baseMat[i].quat[1], m.baseMat[i].quat[2],
+                                m.baseMat[i].quat[3], m.baseMat[i].trans[0], m.baseMat[i].trans[1], m.baseMat[i].trans[2]);
+                    if (i >= nr)
+                        std::printf("           local q %6d %6d %6d %6d t %8.3f %8.3f %8.3f\n", m.quats[4 * (i - nr)], m.quats[4 * (i - nr) + 1],
+                                    m.quats[4 * (i - nr) + 2], m.quats[4 * (i - nr) + 3], m.trans[3 * (i - nr)], m.trans[3 * (i - nr) + 1],
+                                    m.trans[3 * (i - nr) + 2]);
+                }
+            }
+            for (int i = 0; i < m.numBones && i < 14; i++) {
+                std::printf("  B%-2d %-24s", i, m.boneNames && m.boneNames[i] < sim.scriptStrings.size() ? sim.scriptStrings[m.boneNames[i]].c_str() : "?");
+                if (i >= nr) {
+                    int j = i - nr;
+                    std::printf(" parentByte %3u q %6d %6d %6d %6d t %8.3f %8.3f %8.3f", m.parentList[j], m.quats[4 * j], m.quats[4 * j + 1],
+                                m.quats[4 * j + 2], m.quats[4 * j + 3], m.trans[3 * j], m.trans[3 * j + 1], m.trans[3 * j + 2]);
+                }
+                std::printf(" | base q %7.4f %7.4f %7.4f %7.4f t %8.3f %8.3f %8.3f w %g\n", m.baseMat[i].quat[0], m.baseMat[i].quat[1],
+                            m.baseMat[i].quat[2], m.baseMat[i].quat[3], m.baseMat[i].trans[0], m.baseMat[i].trans[1], m.baseMat[i].trans[2],
+                            m.baseMat[i].transWeight);
+            }
+            const iw4::XSurface& x = m.lodInfo[0].modelSurfs->surfs[0];
+            std::printf("  surf0 vertCount %u blend counts %u %u %u %u\n  blend[0..40]:", x.vertCount, x.vertInfo.vertCount[0],
+                        x.vertInfo.vertCount[1], x.vertInfo.vertCount[2], x.vertInfo.vertCount[3]);
+            const uint16_t* vb = x.vertInfo.vertsBlend;
+            if (!vb) { std::printf("\n"); continue; }
+            for (int i = 0; i < 12; i++) std::printf(" %u", vb[i]);
+            std::printf("\n  2-bone group start:");
+            const uint16_t* g2 = vb + x.vertInfo.vertCount[0];
+            for (int i = 0; i < 12; i++) std::printf(" %u", g2[i]);
+            std::printf("\n  3-bone group start:");
+            const uint16_t* g3 = g2 + 3 * x.vertInfo.vertCount[1];
+            for (int i = 0; i < 15; i++) std::printf(" %u", g3[i]);
+            std::printf("\n");
+        }
+        for (int l = 0; l < m.numLods; l++) {
+            const iw4::XModelLodInfo& lod = m.lodInfo[l];
+            std::printf("  lod %d dist %g numsurfs %u surfIndex %u smc %d/%d/%d/%d surfs %s\n", l, lod.dist, lod.numsurfs, lod.surfIndex,
+                        lod.lod, lod.smcBaseIndexPlusOne, lod.smcSubIndexMask, lod.smcBucket,
+                        lod.modelSurfs && lod.modelSurfs->name ? lod.modelSurfs->name : "-");
+            if (!lod.modelSurfs || !lod.modelSurfs->surfs || l > 0) continue;
+            for (int k = 0; k < lod.numsurfs && k < 3; k++) {
+                const iw4::XSurface& x = lod.modelSurfs->surfs[k];
+                std::printf("    surf %d tile %d deformed %d verts %u tris %u baseTri %u baseVert %u vertInfo %u/%u/%u/%u blend %p lists %u partBits %08x\n", k,
+                            x.tileMode, x.deformed, x.vertCount, x.triCount, x.baseTriIndex, x.baseVertIndex, x.vertInfo.vertCount[0],
+                            x.vertInfo.vertCount[1], x.vertInfo.vertCount[2], x.vertInfo.vertCount[3], (void*)x.vertInfo.vertsBlend,
+                            x.vertListCount, x.partBits[0]);
+                for (unsigned v = 0; v < x.vertListCount && v < 2; v++) {
+                    const iw4::XRigidVertList& rl = x.vertList[v];
+                    std::printf("      rigid bone %u verts %u triOff %u tris %u tree %p", rl.boneOffset, rl.vertCount, rl.triOffset, rl.triCount,
+                                (void*)rl.collisionTree);
+                    if (rl.collisionTree)
+                        std::printf(" nodes %u leafs %u trans %g %g %g scale %g %g %g", rl.collisionTree->nodeCount, rl.collisionTree->leafCount,
+                                    rl.collisionTree->trans[0], rl.collisionTree->trans[1], rl.collisionTree->trans[2],
+                                    rl.collisionTree->scale[0], rl.collisionTree->scale[1], rl.collisionTree->scale[2]);
+                    std::printf("\n");
+                    if (rl.collisionTree && rl.collisionTree->nodeCount)
+                        for (unsigned n = 0; n < rl.collisionTree->nodeCount && n < 3; n++) {
+                            const auto& nd = rl.collisionTree->nodes[n];
+                            std::printf("        node %u mins %u %u %u maxs %u %u %u child %u count %u\n", n, nd.aabb.mins[0], nd.aabb.mins[1],
+                                        nd.aabb.mins[2], nd.aabb.maxs[0], nd.aabb.maxs[1], nd.aabb.maxs[2], nd.childBeginIndex, nd.childCount);
+                        }
+                }
+                const iw4::GfxPackedVertex& pv = x.verts0[0];
+                std::printf("      v0 xyz %g %g %g binSign %g color %08x tex %08x normal %08x tangent %08x\n", pv.xyz[0], pv.xyz[1], pv.xyz[2],
+                            pv.binormalSign, pv.color.packed, pv.texCoord.packed, pv.normal.packed, pv.tangent.packed);
+            }
+        }
+        for (int i = 0; i < m.numsurfs && m.materialHandles; i++)
+            if (m.materialHandles[i]) {
+                const iw4::Material* mt = m.materialHandles[i];
+                std::printf("  material %d %s sortKey %u techset %s\n", i, mt->info.name ? mt->info.name : "?", mt->info.sortKey,
+                            mt->techniqueSet && mt->techniqueSet->name ? mt->techniqueSet->name : "?");
+            }
+    }
+    return 0;
+}
+
+// animprobe <zone.ff> : prefix-loads a stock zone and, for each XAnimParts reached, checks the
+// key-data reading of the anim evaluator (iw4mp 0x2b4d30) against the declared array sizes.
+int animProbe(const char* path) {
+    std::ifstream in(path, std::ios::binary);
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    Fastfile zf;
+    std::string err;
+    if (!readFastfile(bytes, zf, err)) { std::printf("%s\n", err.c_str()); return 1; }
+    zone::SimulatedZone sim;
+    size_t loaded = 0;
+    std::string stopped;
+    zone::simulatePrefix(zf.zone, sim, loaded, stopped);
+    std::printf("loaded %zu assets; stopped: %s\n", loaded, stopped.c_str());
+    int shown = 0, ok = 0, total = 0;
+    for (const auto& a : sim.assets) {
+        if (a.type != 2) continue;
+        const iw4::XAnimParts& x = *static_cast<const iw4::XAnimParts*>(a.header);
+        total++;
+        if (x.numframes >= 256) continue;
+        const uint8_t* b = x.boneCount;
+        size_t db = 0, ds = 0, di = 0, rds = 0, rdb = 0;
+        auto sh = [&](size_t i) { return i < x.dataShortCount ? static_cast<uint16_t>(x.dataShort[i]) : 0; };
+        for (int i = 0; i < b[1]; i++) { uint16_t n = sh(ds++); db += n + 1; rds += 2ull * (n + 1); }
+        for (int i = 0; i < b[2]; i++) { uint16_t n = sh(ds++); db += n + 1; rds += 4ull * (n + 1); }
+        ds += 2ull * b[3] + 4ull * b[4];
+        for (int i = 0; i < b[5]; i++) { uint16_t n = sh(ds++); db += 1 + n + 1; di += 6; rdb += 3ull * (n + 1); }
+        for (int i = 0; i < b[6]; i++) { uint16_t n = sh(ds++); db += 1 + n + 1; di += 6; rds += 3ull * (n + 1); }
+        db += b[7] + b[8];
+        di += 3ull * b[7];
+        if (std::getenv("IW4R_FRAMES") && x.boneCount[2]) {  // first full-quat bone's key frames + first key
+            size_t s0 = x.boneCount[1] ? 0 : 0, d0 = 0;
+            for (int i = 0; i < b[1]; i++) { uint16_t n = sh(s0++); d0 += n + 1; }
+            uint16_t n = sh(s0);
+            std::printf("  %s: full-quat bone 0: %u keys, frames:", x.name, n + 1);
+            for (unsigned k = 0; k <= n && k < 40; k++) std::printf(" %u", static_cast<uint8_t>(x.dataByte[d0 + k]));
+            std::printf("\n");
+        }
+        const bool match = db == x.dataByteCount && ds == x.dataShortCount && di == x.dataIntCount &&
+                           rds == x.randomDataShortCount && rdb == x.randomDataByteCount;
+        ok += match;
+        if (shown++ < 8 || !match)
+            std::printf("%-40s frames %3u rate %4.1f flags 0x%02x bones %u [%u %u %u %u %u | %u %u %u %u] idx %u delta %s | "
+                        "byte %zu/%u short %zu/%u int %zu/%u rshort %zu/%u rbyte %zu/%u rint %u %s\n",
+                        x.name, x.numframes, x.framerate, (unsigned)(uint8_t)x.flags, b[9], b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                        b[8], x.indexCount, x.deltaPart ? "yes" : "no", db, x.dataByteCount, ds, x.dataShortCount, di, x.dataIntCount, rds,
+                        x.randomDataShortCount, rdb, x.randomDataByteCount, x.randomDataIntCount, match ? "OK" : "MISMATCH");
+    }
+    std::printf("%d of %d short anims match the decoding (%d anims total)\n", ok, shown, total);
+    return 0;
+}
+
 int liveWorld() {
     std::string report, err;
     if (!live::inspectWorld(report, err, gLiveGame)) {
         std::printf("live world failed: %s\n", err.c_str());
+        return 1;
+    }
+    std::fputs(report.c_str(), stdout);
+    return 0;
+}
+
+int liveWeapon(const char* name) {
+    std::string report, err;
+    if (!live::dumpWeapons(name ? name : "", report, err, gLiveGame)) {
+        std::printf("liveweapon failed: %s\n", err.c_str());
         return 1;
     }
     std::fputs(report.c_str(), stdout);
@@ -379,8 +594,12 @@ int main(int argc, char** argv) {
     if (argc >= 3 && std::string(argv[1]) == "import") return importMap(argv[2], argc >= 4 ? argv[3] : "");
     if (argc >= 2 && std::string(argv[1]) == "livedump") return liveDump(argc >= 3 ? argv[2] : "");
     if (argc >= 2 && std::string(argv[1]) == "liveprobe") return liveProbe();
+    if (argc >= 2 && std::string(argv[1]) == "liveweapon") return liveWeapon(argc >= 3 ? argv[2] : nullptr);
     if (argc >= 2 && std::string(argv[1]) == "liveworld") return liveWorld();
     if (argc >= 3 && std::string(argv[1]) == "matdefs") return matDefs(argc - 2, argv + 2);
+    if (argc >= 4 && std::string(argv[1]) == "refprobe") return refProbe(argc - 2, argv + 2);
+    if (argc >= 3 && std::string(argv[1]) == "modelprobe") return modelProbe(argv[2]);
+    if (argc >= 3 && std::string(argv[1]) == "animprobe") return animProbe(argv[2]);
     if (argc >= 3 && std::string(argv[1]) == "livemodels") return liveModels(argc - 2, argv + 2);
     std::printf("usage:\n"
                 "  iw4r_zone info <in.ff>\n"

@@ -16,6 +16,9 @@
 #include "zone/zonebuild.h"
 #include "zone/zonedump.h"
 #include "zone/zonesim.h"
+#include "model/imageio.h"
+#include "model/xmodelexport.h"
+#include "zone/modelbuild.h"
 
 static int failures = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
@@ -791,6 +794,8 @@ static void testSkyCompile() {
         if (surf.material) {
             const iw4::Material& m = *surf.material;
             CHECK(m.techniqueSet && m.textureCount == 1 && m.textureTable[0].u.image == s.skyImage);
+            CHECK(m.techniqueSet && m.techniqueSet->techniques[9] == m.techniqueSet->techniques[4] &&
+                  m.techniqueSet->techniques[36] == m.techniqueSet->techniques[4]);
         }
     }
     // Every embedded asset is loaded (sim counts them): sky material, techset, decl, two shaders.
@@ -854,6 +859,265 @@ static void testMaterialEmbed() {
         }
     }
     std::printf("materials: %zu stock world materials in trainer, embedded %s\n", lib->size(), pick->name.c_str());
+
+    // Effect material: wc/atmos_particles_dust (falloff + uv anim + additive) gets iw4-radiant's
+    // embedded technique set, keeps its constants, and its surface is unlit (no lightmap / sun).
+    auto dust = lib->find("wc/atmos_particles_dust");
+    CHECK(dust != lib->end());
+    if (dust == lib->end()) return;
+    CHECK(matdef::shadingFor(dust->second) == matdef::Shading::FalloffAdd);
+    Document e;
+    e.ents[0].set("sundirection", "-60 45 0");
+    e.addBrush(makeBox({-256, -256, -16}, {256, 256, 0}, pick->name.substr(3)));
+    {
+        Brush dustBox = makeBox({0, 0, 0}, {128, 128, 128}, "atmos_particles_dust");
+        dustBox.setTwoSided(true);  // a volume seen from inside
+        e.addBrush(std::move(dustBox));
+    }
+    CompileOptions eo;
+    eo.materials = lib;
+    eo.light.skySamples = 8;
+    std::vector<uint8_t> eff;
+    CHECK(compileMapToFastfile(e, "mp_dust", eff, err, MapTarget::MP, eo));
+    Fastfile ezf;
+    CHECK(readFastfile(eff, ezf, err));
+    zone::SimulatedZone esim;
+    CHECK(zone::simulateLoad(ezf.zone, esim, err));
+    if (!err.empty()) std::printf("  simulateLoad (dust): %s\n", err.c_str());
+    auto* eg = static_cast<const iw4::GfxWorld*>(esim.find(IW4_GFXWORLD));
+    bool sawDust = false;
+    for (unsigned i = 0; eg && i < eg->surfaceCount; i++) {
+        const iw4::GfxSurface& su = eg->dpvs.surfaces[i];
+        if (!su.material || std::string(su.material->info.name) != "wc/atmos_particles_dust") continue;
+        sawDust = true;
+        const iw4::Material& m = *su.material;
+        CHECK(su.laf.fields.lightmapIndex == 31 && su.laf.fields.primaryLightIndex == 0);
+        // Additive effect (sort key 29) goes in the lit-trans range, after the opaque surfaces.
+        CHECK(i >= eg->dpvs.litTransSurfsBegin && i < eg->dpvs.litTransSurfsEnd);
+        CHECK(eg->dpvs.litOpaqueSurfsEnd == eg->dpvs.litTransSurfsBegin);
+        CHECK(m.techniqueSet && std::string(m.techniqueSet->name) == "iw4r_falloff_add_ua");
+        CHECK(m.techniqueSet && m.techniqueSet->techniques[4] && m.techniqueSet->techniques[4]->passCount == 1);
+        // Lit slots reuse the effect technique (stock layout; null there crashes the game's material sort).
+        bool litSlots = m.techniqueSet != nullptr;
+        for (int t = 9; t <= 36 && litSlots; t++) litSlots = m.techniqueSet->techniques[t] == m.techniqueSet->techniques[4];
+        CHECK(litSlots);
+        if (m.techniqueSet && m.techniqueSet->techniques[4]) {
+            const iw4::MaterialPass& ps = m.techniqueSet->techniques[4]->passArray[0];
+            CHECK(ps.vertexShader && ps.pixelShader && ps.vertexDecl && ps.args);
+            CHECK(ps.perPrimArgCount + ps.perObjArgCount + ps.stableArgCount == 9);
+        }
+        CHECK(m.constantCount == 5 && m.textureCount == 1);
+        CHECK(su.tris.triCount == 24);  // 6 faces x 2 tris, plus the mirrored copies
+    }
+    CHECK(sawDust);
+    // Effect brushes are nonsolid: only the floor collides.
+    auto* ecm = static_cast<const iw4::clipMap_t*>(esim.find(IW4_CLIPMAP_MP));
+    CHECK(ecm && ecm->numBrushes == 1);
+}
+
+// A custom map script (<map>.gsc next to the .map) replaces the generated one in the zone.
+// Weapon pack (SP): the zone also carries level so_w_<map>'s script and an empty add-on lump.
+static void testWeaponPackLevel() {
+    CHECK(weaponPackLevel("basic") == "so_w_basic");
+    Document d;
+    d.ents[0].set("weaponpack", "so_demo_so_bridge");
+    d.addBrush(makeBox({-64, -64, -16}, {64, 64, 0}, "wc/me_concrete"));
+    CompileOptions o = kNoBake;
+    o.addonLevel = weaponPackLevel("basic");
+    std::vector<uint8_t> ff;
+    std::string err;
+    CHECK(compileMapToFastfile(d, "basic", ff, err, MapTarget::SP, o));
+    Fastfile zf;
+    CHECK(readFastfile(ff, zf, err));
+    zone::SimulatedZone sim;
+    CHECK(zone::simulateLoad(zf.zone, sim, err));
+    if (!err.empty()) std::printf("  simulateLoad (pack): %s\n", err.c_str());
+    auto* ame = static_cast<const iw4::AddonMapEnts*>(sim.find(IW4_ADDON_MAP_ENTS));
+    CHECK(ame && std::string(ame->name) == "maps/so_w_basic.mapents" && ame->numEntityChars == 1);
+    bool levelScript = false, mapScript = false;
+    for (const auto& a : sim.assets)
+        if (a.type == IW4_RAWFILE) {
+            std::string n = static_cast<const iw4::RawFile*>(a.header)->name;
+            levelScript |= n == "maps/so_w_basic.gsc";
+            mapScript |= n == "maps/basic.gsc";
+        }
+    CHECK(levelScript && mapScript);
+}
+
+static void testCustomMapScript() {
+    namespace fs = std::filesystem;
+    fs::path dir = fs::temp_directory_path() / "iw4r_script_test";
+    fs::create_directories(dir);
+    const std::string mapPath = (dir / "sp_scripted.map").string();
+    CHECK(mapScriptPath(mapPath) == (dir / "sp_scripted.gsc").string());
+    const std::string src = "main()\n{\n\tmaps\\_load::main();\n\tlevel.custom = 1;\n}\n";
+    { std::ofstream(mapScriptPath(mapPath), std::ios::binary) << src; }
+    CompileOptions o = kNoBake;
+    CHECK(readMapScript(mapPath, o.mapScript) && o.mapScript == src);
+    Document d;
+    d.addBrush(makeBox({-64, -64, -16}, {64, 64, 0}, "wc/me_concrete"));
+    std::vector<uint8_t> ff;
+    std::string err;
+    CHECK(compileMapToFastfile(d, "sp_scripted", ff, err, MapTarget::SP, o));
+    Fastfile zf;
+    CHECK(readFastfile(ff, zf, err));
+    zone::SimulatedZone sim;
+    CHECK(zone::simulateLoad(zf.zone, sim, err));
+    auto* gsc = static_cast<const iw4::RawFile*>(sim.find(IW4_RAWFILE));
+    CHECK(gsc && std::string(gsc->name) == "maps/sp_scripted.gsc");
+    if (gsc) {
+        std::vector<uint8_t> text(static_cast<size_t>(gsc->len));
+        mz_ulong n = static_cast<mz_ulong>(text.size());
+        CHECK(mz_uncompress(text.data(), &n, reinterpret_cast<const unsigned char*>(gsc->buffer), static_cast<mz_ulong>(gsc->compressedLen)) == MZ_OK);
+        CHECK(std::string(text.begin(), text.end()) == src);
+    }
+    std::string none;
+    CHECK(!readMapScript((dir / "missing.map").string(), none) && none.empty());
+    fs::remove(mapScriptPath(mapPath));
+}
+
+
+// A cube in xmodel_export form, as the export plugins write it (v6): one bone, 8 verts, 12 tris.
+static std::string cubeXModelExport(const char* material, const char* texture) {
+    std::string s = "// test cube\nMODEL\nVERSION 6\n\nNUMBONES 1\nBONE 0 -1 \"tag_origin\"\n\nBONE 0\n"
+                    "OFFSET 0.000000, 0.000000, 0.000000\nSCALE 1.000000, 1.000000, 1.000000\n"
+                    "X 1.000000, 0.000000, 0.000000\nY 0.000000, 1.000000, 0.000000\nZ 0.000000, 0.000000, 1.000000\n\n";
+    const float P[8][3] = {{-16, -16, 0}, {16, -16, 0}, {16, 16, 0}, {-16, 16, 0},
+                           {-16, -16, 32}, {16, -16, 32}, {16, 16, 32}, {-16, 16, 32}};
+    s += "NUMVERTS 8\n";
+    char line[160];
+    for (int i = 0; i < 8; i++) {
+        std::snprintf(line, sizeof line, "VERT %d\nOFFSET %f, %f, %f\nBONES 1\nBONE 0 1.000000\n\n", i, P[i][0], P[i][1], P[i][2]);
+        s += line;
+    }
+    // quads (outward normal) -> 2 tris each
+    const int Q[6][4] = {{0, 3, 2, 1}, {4, 5, 6, 7}, {0, 1, 5, 4}, {2, 3, 7, 6}, {1, 2, 6, 5}, {3, 0, 4, 7}};
+    const float N[6][3] = {{0, 0, -1}, {0, 0, 1}, {0, -1, 0}, {0, 1, 0}, {1, 0, 0}, {-1, 0, 0}};
+    const float UV[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
+    s += "NUMFACES 12\n";
+    for (int q = 0; q < 6; q++)
+        for (int t = 0; t < 2; t++) {
+            int c[3] = {0, t ? 2 : 1, t ? 3 : 2};
+            s += "TRI 0 0 0 0\n";
+            for (int k = 0; k < 3; k++) {
+                std::snprintf(line, sizeof line, "VERT %d\nNORMAL %f %f %f\nCOLOR 1.000000 1.000000 1.000000 1.000000\nUV 1 %f %f\n",
+                              Q[q][c[k]], N[q][0], N[q][1], N[q][2], UV[c[k]][0], UV[c[k]][1]);
+                s += line;
+            }
+        }
+    s += "\nNUMOBJECTS 1\nOBJECT 0 \"cube\"\n\nNUMMATERIALS 1\n";
+    s += std::string("MATERIAL 0 \"") + material + "\" \"Lambert\" \"" + texture + "\"\nCOLOR 0.000000 0.000000 0.000000 1.000000\n";
+    return s;
+}
+
+// A tiny valid PNG (4x4 RGBA, stored zlib) for embedding tests.
+static std::vector<uint8_t> tinyPng() {
+    std::vector<uint8_t> raw;
+    for (int y = 0; y < 4; y++) {
+        raw.push_back(0);
+        for (int x = 0; x < 4; x++) {
+            raw.push_back(uint8_t(x * 60)), raw.push_back(uint8_t(y * 60)), raw.push_back(200), raw.push_back(255);
+        }
+    }
+    mz_ulong cap = mz_compressBound(static_cast<mz_ulong>(raw.size()));
+    std::vector<uint8_t> z(cap);
+    mz_compress(z.data(), &cap, raw.data(), static_cast<mz_ulong>(raw.size()));
+    z.resize(cap);
+    std::vector<uint8_t> png = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    auto chunk = [&](const char* tag, const std::vector<uint8_t>& body) {
+        uint32_t n = static_cast<uint32_t>(body.size());
+        uint8_t len[4] = {uint8_t(n >> 24), uint8_t(n >> 16), uint8_t(n >> 8), uint8_t(n)};
+        png.insert(png.end(), len, len + 4);
+        std::vector<uint8_t> tb(tag, tag + 4);
+        tb.insert(tb.end(), body.begin(), body.end());
+        png.insert(png.end(), tb.begin(), tb.end());
+        mz_ulong crc = mz_crc32(MZ_CRC32_INIT, tb.data(), tb.size());
+        uint8_t c[4] = {uint8_t(crc >> 24), uint8_t(crc >> 16), uint8_t(crc >> 8), uint8_t(crc)};
+        png.insert(png.end(), c, c + 4);
+    };
+    chunk("IHDR", {0, 0, 0, 4, 0, 0, 0, 4, 8, 6, 0, 0, 0});
+    chunk("IDAT", z);
+    chunk("IEND", {});
+    return png;
+}
+
+// zone_source/xmodels/*.xmodel_export -> XModel in the map zone, loader-checked: one bone, one
+// rigid surface, a custom material on the stock mc_l_sm_b0c0 template with the texture embedded.
+static void testZoneSourceModel() {
+    namespace fs = std::filesystem;
+    const std::string trainer = std::string(kGame) + "/zone/english/trainer.ff";
+    if (!fs::exists(trainer)) {
+        std::printf("zone_source models: skipped (no game install)\n");
+        return;
+    }
+    // parser + builder
+    xmodelexport::Model src;
+    std::string err;
+    CHECK(xmodelexport::parse(cubeXModelExport("crate", "c:/art/crate_col.tga"), src, err));
+    CHECK(src.bones.size() == 1 && src.verts.size() == 8 && src.faces.size() == 12 && src.materials.size() == 1);
+    CHECK(src.materials[0].texture == "c:/art/crate_col.tga");
+    modelbuild::Model md;
+    CHECK(modelbuild::build(src, "iw4r_test_crate", md, err));
+    CHECK(md.surfaces.size() == 1 && md.surfaces[0].tris.size() == 36 && md.radius > 20);
+
+    fs::path dir = fs::temp_directory_path() / "iw4r_zs_test";
+    fs::create_directories(dir / "zone_source" / "xmodels");
+    fs::create_directories(dir / "zone_source" / "images");
+    { std::ofstream(dir / "zone_source" / "xmodels" / "iw4r_test_crate.xmodel_export") << cubeXModelExport("crate", "c:/art/crate_col.png"); }
+    { auto png = tinyPng(); std::ofstream(dir / "zone_source" / "images" / "crate_col.png", std::ios::binary).write(reinterpret_cast<const char*>(png.data()), png.size()); }
+    imageio::Rgba img;
+    CHECK(imageio::load((dir / "zone_source" / "images" / "crate_col.png").string(), img, err) && img.width == 4 && img.pixels[4] == 60);
+
+    std::ifstream in(trainer, std::ios::binary);
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    Fastfile tz;
+    CHECK(readFastfile(bytes, tz, err));
+    auto lib = std::make_shared<matdef::Library>();
+    matdef::scan(tz.zone, *lib);
+
+    Document d;
+    d.addBrush(makeBox({-128, -128, -16}, {128, 128, 0}, "wc/me_concrete"));
+    Sel e = d.addPointEntity("misc_model", {0, 0, 0});
+    d.ents[e.ent].set("model", "iw4r_test_crate");
+    CompileOptions o = kNoBake;
+    o.materials = lib;
+    o.zoneSourceDir = (dir / "zone_source").string();
+    std::vector<std::string> warnings;
+    o.warnings = &warnings;
+    std::vector<uint8_t> ff;
+    CHECK(compileMapToFastfile(d, "sp_models", ff, err, MapTarget::SP, o));
+    for (const std::string& w : warnings) std::printf("  warning: %s\n", w.c_str());
+    Fastfile zf;
+    CHECK(readFastfile(ff, zf, err));
+    zone::SimulatedZone sim;
+    CHECK(zone::simulateLoad(zf.zone, sim, err));
+    if (!err.empty()) std::printf("  simulateLoad (models): %s\n", err.c_str());
+    auto* xm = static_cast<const iw4::XModel*>(sim.find(IW4_XMODEL));
+    CHECK(xm != nullptr);
+    if (xm) {
+        CHECK(std::string(xm->name) == "iw4r_test_crate" && xm->numBones == 1 && xm->numsurfs == 1 && xm->numLods == 1);
+        CHECK(xm->boneNames && sim.scriptStrings.size() >= 2 && sim.scriptStrings[xm->boneNames[0]] == "tag_origin");
+        CHECK(xm->baseMat && xm->baseMat[0].quat[3] == 1.0f && xm->baseMat[0].transWeight == 2.0f);
+        const iw4::XModelLodInfo& lod = xm->lodInfo[0];
+        CHECK(lod.modelSurfs && lod.modelSurfs->surfs && lod.numsurfs == 1);
+        if (lod.modelSurfs && lod.modelSurfs->surfs) {
+            const iw4::XSurface& xs = lod.modelSurfs->surfs[0];
+            CHECK(xs.triCount == 12 && xs.vertCount >= 8 && xs.vertListCount == 1 && xs.vertList[0].vertCount == xs.vertCount);
+            CHECK(xs.triIndices && xs.verts0);
+        }
+        const iw4::Material* mt = xm->materialHandles ? xm->materialHandles[0] : nullptr;
+        CHECK(mt && std::string(mt->info.name) == "mc/iw4r_test_crate_crate");
+        if (mt) {
+            CHECK(mt->techniqueSet && std::string(mt->techniqueSet->name) == ",mc_l_sm_b0c0");
+            CHECK(mt->textureCount == 1 && mt->textureTable[0].u.image &&
+                  std::string(mt->textureTable[0].u.image->name) == "iw4r_iw4r_test_crate_crate_col" &&
+                  mt->textureTable[0].u.image->texture.loadDef->resourceSize == 4 * 4 * 4);
+        }
+    }
+    // the misc_model became a script_model in the entity lump
+    auto* me = static_cast<const iw4::MapEnts*>(sim.find(IW4_MAPENTS));
+    CHECK(me && std::string(me->entityString).find("\"classname\" \"script_model\"") != std::string::npos);
+    fs::remove_all(dir);
 }
 
 static void testGfxWorldCompile() {
@@ -1144,6 +1408,9 @@ int main() {
     testLargeClipMapTree();
     testGfxWorldCompile();
     testLightingBake();
+    testCustomMapScript();
+    testWeaponPackLevel();
+    testZoneSourceModel();
     testSkyCompile();
     testMaterialEmbed();
     testDumpFastfile();

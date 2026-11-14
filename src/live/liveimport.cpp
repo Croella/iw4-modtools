@@ -1,4 +1,5 @@
 #include "live/liveimport.h"
+#include "zone/weapondef.h"
 
 #include <array>
 #include <cctype>
@@ -339,6 +340,148 @@ bool loadLiveModels(const std::vector<std::string>& names, LiveModelLibrary& lib
     }
     for (const auto& [key, found] : wanted)
         if (!found) stats.missing.push_back(key);
+    return true;
+}
+
+bool dumpWeapons(const std::string& name, std::string& report, std::string& error, const char* exeName) {
+    ProcessReader r;
+    const GameLayout* g = attachGame(r, exeName, error);
+    if (!g) return false;
+    constexpr uint32_t kWeapon = 0x1C;
+    const uint64_t pool = r.readPtr(r.rva(g->dbXAssetPool + 8 * kWeapon));
+    const uint32_t cap = r.readOr<uint32_t>(r.rva(g->gPoolSize + 4 * kWeapon));
+    if (!pool || !cap || cap > 8192) {
+        error = "couldn't find the game's weapon pool";
+        return false;
+    }
+    char line[1024];
+    auto add = [&](const char* fmt, auto... a) {
+        std::snprintf(line, sizeof(line), fmt, a...);
+        report += line;
+    };
+    // Entries are 160-byte WeaponCompleteDefs, possibly after an 8-byte free-list head (as the SP
+    // XModel pool); a used entry has a name and a weapDef pointer outside the pool. The SP pool's
+    // slots are 2192 bytes (WeaponDef-sized), MP's 160.
+    std::vector<uint8_t> raw;
+    if (!r.readVec(pool, size_t(weapondef::kDefSize) * cap + 8, raw) && !r.readVec(pool, size_t(weapondef::kCompleteSize) * cap + 8, raw)) {
+        error = "couldn't read the weapon pool";
+        return false;
+    }
+    auto q = [&](size_t at) { uint64_t v; std::memcpy(&v, raw.data() + at, 8); return v; };
+    const uint64_t poolEnd = pool + raw.size();
+    std::vector<std::pair<std::string, uint64_t>> found[4];
+    for (int v = 0; v < 4; v++)
+        for (uint32_t i = 0; i < cap; i++) {
+            const int head = v & 1;
+            const size_t kStride = v & 2 ? weapondef::kDefSize : weapondef::kCompleteSize;
+            size_t at = head * 8 + kStride * i;
+            if (at + weapondef::kCompleteSize > raw.size()) break;
+            uint64_t n = q(at), d = q(at + 8);
+            if (!n || (n >= pool && n < poolEnd) || !d) continue;
+            std::string s = r.readString(n, 128);
+            if (s.empty() || s.size() > 100) continue;
+            bool printable = true;
+            for (char ch : s) printable &= ch > 32 && ch < 127;
+            if (printable) found[v].push_back({s, pool + at});
+        }
+    size_t best = 0;
+    for (int v = 1; v < 4; v++)
+        if (found[v].size() > found[best].size()) best = v;
+    const auto& list = found[best];
+    if (name.empty()) {
+        add("%zu weapons loaded (%s):\n", list.size(), g->exe);
+        for (const auto& [n, at] : list) add("  %s\n", n.c_str());
+        return true;
+    }
+    uint64_t addr = 0;
+    for (const auto& [n, at] : list)
+        if (_stricmp(n.c_str(), name.c_str()) == 0) addr = at;
+    if (!addr) {
+        error = "weapon '" + name + "' isn't loaded (run without a name to list them)";
+        return false;
+    }
+    std::vector<uint8_t> c, d;
+    r.readVec(addr, weapondef::kCompleteSize, c);
+    uint64_t defAddr;
+    std::memcpy(&defAddr, c.data() + 8, 8);
+    if (!r.readVec(defAddr, weapondef::kDefSize, d)) {
+        error = "couldn't read the WeaponDef";
+        return false;
+    }
+    auto ptrAt = [&](const std::vector<uint8_t>& b, size_t off) { uint64_t v; std::memcpy(&v, b.data() + off, 8); return v; };
+    auto nameAt = [&](uint64_t p) { return p ? r.readString(r.readPtr(p), 128) : std::string(); };  // asset: name ptr at +0
+    add("weapon %s  (complete @0x%llX, def @0x%llX)\n", name.c_str(), (unsigned long long)addr, (unsigned long long)defAddr);
+    for (const weapondef::Field& f : weapondef::fields()) {
+        const std::vector<uint8_t>& b = f.complete ? c : d;
+        std::string v;
+        char tmp[64];
+        switch (f.kind) {
+            case weapondef::Kind::Int:
+            case weapondef::Kind::Msec: {
+                int32_t x;
+                std::memcpy(&x, b.data() + f.offset, 4);
+                std::snprintf(tmp, sizeof tmp, f.kind == weapondef::Kind::Msec ? "%d ms" : "%d", x);
+                v = tmp;
+                break;
+            }
+            case weapondef::Kind::Float: {
+                float x;
+                std::memcpy(&x, b.data() + f.offset, 4);
+                std::snprintf(tmp, sizeof tmp, "%g", x);
+                v = tmp;
+                break;
+            }
+            case weapondef::Kind::Bool: v = std::to_string(b[f.offset]); break;
+            case weapondef::Kind::Enum: {
+                int32_t x;
+                std::memcpy(&x, b.data() + f.offset, 4);
+                int n = 0;
+                while (f.enumNames[n]) n++;
+                v = std::to_string(x) + (x >= 0 && x < n ? std::string(" (") + f.enumNames[x] + ")" : " (?)");
+                break;
+            }
+            case weapondef::Kind::Str: v = r.readString(ptrAt(b, f.offset), 128); break;
+            case weapondef::Kind::Ignored: {
+                uint64_t p = ptrAt(b, f.offset);
+                v = p ? nameAt(p) : "";
+                break;
+            }
+            default: v = nameAt(ptrAt(b, f.offset)); break;  // model / material / fx / sound
+        }
+        add("  %-36s %s\n", f.key, v.c_str());
+    }
+    auto strArray = [&](uint64_t p, int n, const char* label) {
+        if (!p) return;
+        for (int i = 0; i < n; i++) {
+            std::string s = r.readString(r.readPtr(p + 8ull * i), 128);
+            if (!s.empty()) add("  %s[%d] %s\n", label, i, s.c_str());
+        }
+    };
+    strArray(ptrAt(c, weapondef::off::cXAnims), weapondef::kAnimCount, "anim");
+    for (int i = 0; i < weapondef::kModelCount; i++) {
+        uint64_t gm = ptrAt(d, weapondef::off::dGunModels) ? r.readPtr(ptrAt(d, weapondef::off::dGunModels) + 8ull * i) : 0;
+        uint64_t wm = ptrAt(d, weapondef::off::dWorldModels) ? r.readPtr(ptrAt(d, weapondef::off::dWorldModels) + 8ull * i) : 0;
+        if (gm) add("  gunModel[%d] %s\n", i, nameAt(gm).c_str());
+        if (wm) add("  worldModel[%d] %s\n", i, nameAt(wm).c_str());
+    }
+    add("  same anim arrays: complete %llX right %llX left %llX\n", (unsigned long long)ptrAt(c, 32),
+        (unsigned long long)ptrAt(d, 24), (unsigned long long)ptrAt(d, 32));
+    if (uint64_t pb = ptrAt(d, weapondef::off::dParallelBounce)) {
+        std::vector<float> f;
+        r.readVec(pb, 31, f);
+        add("  parallelBounce[0..3] %g %g %g %g\n", f[0], f[1], f[2], f[3]);
+    }
+    if (uint64_t ld = ptrAt(d, weapondef::off::dLocationDamage)) {
+        std::vector<float> f;
+        r.readVec(ld, 20, f);
+        add("  locationDamage:");
+        for (float x : f) add(" %g", x);
+        add("\n");
+    }
+    add("  hideTags %s, tracer %s, bounceSound[0] %s, accuracy graphs %s / %s\n", ptrAt(c, 24) ? "yes" : "none",
+        nameAt(ptrAt(d, weapondef::off::dTracer)).c_str(),
+        ptrAt(d, 504) ? nameAt(r.readPtr(ptrAt(d, 504))).c_str() : "-",
+        r.readString(ptrAt(d, 1696), 64).c_str(), r.readString(ptrAt(d, 1704), 64).c_str());
     return true;
 }
 

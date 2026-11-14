@@ -30,7 +30,17 @@ struct Brush {
     // brush unchanged, if that would collapse it.
     bool moveFaces(int axis, int sign, double amount);
     void setMaterial(const std::string& name);
+
+    // Two-sided: the brush's faces are also drawn from behind (compiled as a mirrored copy), so a
+    // volume such as a dust brush shows from inside. The game culls back faces otherwise. Stored
+    // as the brush attribute line kTwoSidedAttr, which .map files keep verbatim.
+    bool twoSided() const;
+    void setTwoSided(bool on);
 };
+
+inline constexpr const char* kTwoSidedAttr = "iw4r_twosided;";
+// The face seen from behind: winding reversed, normal and plane flipped.
+Face mirroredFace(const Face& f);
 
 Brush makeBox(const Vec3& mins, const Vec3& maxs, const std::string& material);
 bool rayBrush(const Brush& b, const Vec3& origin, const Vec3& dir, double& tOut, int& faceOut);

@@ -1,4 +1,5 @@
 #pragma once
+#include <set>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -118,6 +119,9 @@ struct ClipMapData {
 uint32_t contentsForMaterial(const std::string& name);
 
 // Compiles worldspawn's brushes. Brush entities (submodels) are not compiled yet.
-bool buildClipMapData(const Document& doc, ClipMapData& out, std::string& error);
+// nonSolid: lower-case editor material names with no collision (additive effect materials such
+// as atmos_particles_dust, which stock maps use as nonsolid sheets/volumes).
+bool buildClipMapData(const Document& doc, ClipMapData& out, std::string& error,
+                      const std::set<std::string>* nonSolid = nullptr);
 
 }  // namespace clip

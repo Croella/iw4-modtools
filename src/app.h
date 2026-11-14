@@ -78,6 +78,7 @@ private:
     enum class PendingCompile { None, ToFile, AndRun };
     void requestCompile(PendingCompile what);
     void drawCompileTargetPopup();
+    void deployToGameZone(const std::string& mapName, const std::vector<uint8_t>& ff, const std::string& already);
     void compileDialog(MapTarget target);  // File > Compile to .ff (F7): compile, loader-check, write
     void compileAndRun(MapTarget target);  // File > Compile & Run in Game (F5): save, compile, deploy, launch
     bool compileCurrentMap(const std::string& mapName, MapTarget target, std::vector<uint8_t>& ff,
@@ -101,6 +102,11 @@ private:
     uint64_t currentSceneHash();
     bool bakeUpToDate();
     void addLightAtCamera();
+    void refreshUnlitMaterials();  // fills lightSettings.unlitMaterials from the map's materials
+    void editMapScript();          // File > Edit Map Script: <map>.gsc next to the .map
+    void loadZoneSourcePreview();  // zone_source/xmodels -> model preview library
+    void drawWeaponsMenu();        // Weapons: worldspawn "weaponpack" (SP Special Ops add-on zone)
+    std::string deployPackFor(const std::string& mapName, MapTarget target, const std::string& folder);
 
     void loadLaunchConfig();  // deploy folder for "Compile & Run" (persisted under cacheDir)
     void saveLaunchConfig();

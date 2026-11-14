@@ -17,6 +17,7 @@
 #include <tlhelp32.h>
 
 #include <cstdio>
+#include "dll/volumetric.h"
 #include <cstring>
 #include <string>
 #include <vector>
@@ -66,8 +67,21 @@ std::string redirectPath(const char* path) {
     if (!endsWithFf(path, len)) return {};
     const char* base = baseName(path);
     std::string candidate = g_deployDir + "\\" + base;
-    if (candidate == path) return {};  // already the deploy copy
-    if (GetFileAttributesA(candidate.c_str()) == INVALID_FILE_ATTRIBUTES) return {};  // not a custom map
+    // A custom map the game opens in place (e.g. copied into zone/english): its sun-shaft settings
+    // sit next to it.
+    auto inPlace = [&] {
+        const std::string vol = std::string(path, len - 3) + ".volumetric";
+        volumetric::onZoneOpen(path, GetFileAttributesA(vol.c_str()) != INVALID_FILE_ATTRIBUTES ? std::string(path) : std::string());
+    };
+    if (candidate == path) {  // already the deploy copy
+        inPlace();
+        return {};
+    }
+    if (GetFileAttributesA(candidate.c_str()) == INVALID_FILE_ATTRIBUTES) {  // not in the deploy folder
+        inPlace();
+        return {};
+    }
+    volumetric::onZoneOpen(path, candidate);
     return candidate;
 }
 
@@ -287,6 +301,7 @@ DWORD WINAPI initThread(LPVOID) {
         logLine("CreateFileA/W not found in KernelBase; nothing hooked");
         return 0;
     }
+    volumetric::init(logLine);
     // Backup: hook KernelBase itself; when it succeeds the "real" function becomes its trampoline.
     inlineHook(kbA, kPrologueCreateFileA, reinterpret_cast<void*>(hookedCreateFileA),
                reinterpret_cast<void**>(&g_realCreateFileA), "CreateFileA");

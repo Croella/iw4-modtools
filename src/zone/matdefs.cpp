@@ -9,7 +9,7 @@ namespace {
 
 constexpr uint64_t kFollow = ~0ull, kInsert = ~1ull;
 constexpr size_t kMaterial = 0x78, kTexDef = 16, kImage = 0x28;
-constexpr uint32_t kMagic = 0x3146444D;  // "MDF1"
+constexpr uint32_t kMagic = 0x3246444D;  // "MDF2" (world + model materials)
 
 bool inlinePtr(uint64_t v) { return v == kFollow || v == kInsert; }
 
@@ -108,7 +108,7 @@ bool parseAt(const std::vector<uint8_t>& d, size_t nameAt, Def& out) {
     if (table != kFollow) return false;  // texture table must be inline (back-refs can't be read here)
     out = Def{};
     out.name = r.xstring(kFollow);
-    if (!r.ok || !printableName(out.name) || out.name.rfind("wc/", 0) != 0) return false;
+    if (!r.ok || !printableName(out.name) || (out.name.rfind("wc/", 0) != 0 && out.name.rfind("mc/", 0) != 0)) return false;
     out.header = r.bytes(m, kMaterial);
     if (inlinePtr(techset)) r.skipTechset();
     if (!r.ok) return false;
@@ -189,13 +189,53 @@ std::string key(const std::string& name) {
 void scan(const std::vector<uint8_t>& d, Library& out) {
     // A material's name follows its struct; look for the "wc/" names and check the struct.
     for (size_t o = kMaterial; o + 4 < d.size(); o++) {
-        if (d[o] != 'w' || d[o + 1] != 'c' || d[o + 2] != '/') continue;
+        if ((d[o] != 'w' && d[o] != 'm') || d[o + 1] != 'c' || d[o + 2] != '/') continue;
         Def def;
         if (!parseAt(d, o, def)) continue;
         std::string k = key(def.name);
         auto it = out.find(k);
         if (it == out.end() || knownImages(def) > knownImages(it->second)) out[k] = std::move(def);
     }
+}
+
+namespace {
+std::string constantName(const Def& d, size_t i) {
+    const char* p = reinterpret_cast<const char*>(d.constants.data() + 32 * i + 4);
+    size_t n = 0;
+    while (n < 12 && p[n]) n++;
+    return std::string(p, n);
+}
+}  // namespace
+
+bool hasConstant(const Def& d, uint32_t nameHash) {
+    for (size_t i = 0; i + 1 <= d.constants.size() / 32; i++) {
+        uint32_t h;
+        std::memcpy(&h, d.constants.data() + 32 * i, 4);
+        if (h == nameHash) return true;
+    }
+    return false;
+}
+
+bool constantValue(const Def& d, const char* namePrefix, float out[4]) {
+    for (size_t i = 0; i < d.constants.size() / 32; i++)
+        if (constantName(d, i).rfind(namePrefix, 0) == 0) {
+            std::memcpy(out, d.constants.data() + 32 * i + 16, 16);
+            return true;
+        }
+    return false;
+}
+
+Shading shadingFor(const Def& d) {
+    bool falloff = false, other = false;
+    for (size_t i = 0; i < d.constants.size() / 32; i++) {
+        std::string n = constantName(d, i);
+        if (n.rfind("falloff", 0) == 0) falloff = true;
+        else if (n != "colorTint" && n != "envMapParms" && n != "detailScale" && n != "uvAnimParms") other = true;
+    }
+    bool color = false;
+    for (const Texture* t : usedTextures(d)) color |= t->kind() == 'c';
+    if (!color || other) return Shading::Unsupported;
+    return falloff ? Shading::FalloffAdd : Shading::Lit;
 }
 
 std::vector<const Texture*> usedTextures(const Def& d) {
@@ -210,6 +250,7 @@ std::vector<const Texture*> usedTextures(const Def& d) {
 }
 
 std::string techsetFor(const Def& d) {
+    if (shadingFor(d) != Shading::Lit) return {};
     bool c = false, n = false, s = false;
     for (const Texture* t : usedTextures(d)) {
         c |= t->kind() == 'c';
@@ -217,7 +258,9 @@ std::string techsetFor(const Def& d) {
         s |= t->kind() == 's';
     }
     if (!c) return {};
-    return std::string("wc_l_sm_b0c0") + (n ? "n0" : "") + (s ? "s0" : "");
+    // World (wc/) and model (mc/) materials use the matching common.ff family.
+    const bool model = d.name.rfind("mc/", 0) == 0;
+    return std::string(model ? "mc_l_sm_b0c0" : "wc_l_sm_b0c0") + (n ? "n0" : "") + (s ? "s0" : "");
 }
 
 bool save(const std::string& path, const Library& lib) {

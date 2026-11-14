@@ -37,7 +37,7 @@ Bounds toBounds(const AABB& b) {
 
 class Builder {
 public:
-    explicit Builder(ClipMapData& out) : out_(out) {}
+    explicit Builder(ClipMapData& out, const std::set<std::string>* nonSolid) : out_(out), nonSolid_(nonSolid) {}
 
     uint32_t plane(const Vec3& n, double d) {
         std::array<long long, 4> key = {std::llround(n.x * 1e5), std::llround(n.y * 1e5),
@@ -71,6 +71,13 @@ public:
         return idx;
     }
 
+    bool isNonSolid(const std::string& material) const {
+        if (!nonSolid_ || nonSolid_->empty()) return false;
+        std::string n = lower(material);
+        if (n.rfind("wc/", 0) == 0) n = n.substr(3);
+        return nonSolid_->count(n) > 0;
+    }
+
     // Returns false if the brush has no collision (or is degenerate) and was skipped.
     bool addBrush(const ::Brush& src) {
         ::Brush b = src;
@@ -78,7 +85,7 @@ public:
 
         uint32_t contents = 0;
         for (const Face& f : b.faces)
-            if (!f.winding.empty()) contents |= contentsForMaterial(f.material);
+            if (!f.winding.empty() && !isNonSolid(f.material)) contents |= contentsForMaterial(f.material);
         if (!contents) return false;
         for (const std::string& a : b.attrs)
             if (contains(lower(a), "detail")) contents |= CONTENTS_DETAIL;
@@ -178,6 +185,7 @@ public:
 
 private:
     ClipMapData& out_;
+    const std::set<std::string>* nonSolid_ = nullptr;
     std::map<std::array<long long, 4>, uint32_t> planeIndex_;
     std::map<std::string, uint16_t> materialIndex_;
     AABB worldBounds_;
@@ -290,7 +298,8 @@ uint32_t buildLeafBrushTree(ClipMapData& out, std::vector<uint32_t> idx, int dep
     return self;
 }
 
-bool buildClipMapData(const Document& doc, ClipMapData& out, std::string& error) {
+bool buildClipMapData(const Document& doc, ClipMapData& out, std::string& error,
+                      const std::set<std::string>* nonSolid) {
     out = ClipMapData{};
     if (doc.ents.empty()) {
         error = "map has no worldspawn";
@@ -299,7 +308,7 @@ bool buildClipMapData(const Document& doc, ClipMapData& out, std::string& error)
     out.leafs.push_back(Leaf{});                     // leaf 0: reserved, empty
     out.leafBrushNodes.push_back(LeafBrushNode{});   // node 0: "no brushes"
 
-    Builder b(out);
+    Builder b(out, nonSolid);
     for (const ::Brush& br : doc.ents[0].brushes) b.addBrush(br);
 
     // leafBrushes holds u16 brush indices, so the map can have at most 65535 collision brushes.

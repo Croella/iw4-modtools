@@ -35,11 +35,25 @@ struct Def {
 
 using Library = std::map<std::string, Def>;  // key: lower-case full name
 
-// Adds every fully-inline world material ("wc/...") found in an inflated zone.
+// Adds every fully-inline world ("wc/...") and model ("mc/...") material found in an inflated zone.
 void scan(const std::vector<uint8_t>& zone, Library& out);
 
 bool save(const std::string& path, const Library& lib);
 bool load(const std::string& path, Library& lib);
+
+// How a stock world material is drawn, decided from its material constants:
+//   Lit        only colorTint / envMapParms / detailScale / uvAnimParms: the common.ff lit sets
+//   FalloffAdd falloffBeginColor/EndColor/Parms (stock wc_unlit_falloff_add_lin[_ua], e.g.
+//              wc/atmos_particles_dust): iw4-radiant's own embedded shader (scrolling, additive,
+//              faded by view angle)
+//   Unsupported anything else (distortion, ...): left as a by-name reference
+enum class Shading { Lit, FalloffAdd, Unsupported };
+Shading shadingFor(const Def& d);
+// Material constant nameHashes (the first 4 bytes of a MaterialConstantDef).
+constexpr uint32_t kHashUvAnimParms = 0x70ebaf95;
+bool hasConstant(const Def& d, uint32_t nameHash);
+// Constant value by name prefix (MaterialConstantDef.name is 12 chars, so "falloffBegin" etc.).
+bool constantValue(const Def& d, const char* namePrefix, float out[4]);
 
 // The common.ff lit technique set for a definition ("" if it has no colorMap), and the textures
 // that set samples (colorMap, then normalMap / specularMap if present), in table order.
