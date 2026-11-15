@@ -1,4 +1,4 @@
-"""Generates maps/zm_test.map: a zombies sample for maps\\_zombies (SP).
+"""Generates maps/zm_test/zm_test.map: a zombies sample for maps\\_zombies (SP).
 
 A walled yard with a house in the middle. Each house wall has a boarded window (zm_board script
 models, a zm_window script_origin outside, its inside target, and a clip_player brush in the
@@ -10,7 +10,7 @@ usage: python tools/make_zm_test.py [out.map]
 import os
 import sys
 
-out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), '..', 'maps', 'zm_test.map')
+out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), '..', 'maps', 'zm_test', 'zm_test.map')
 T = ' 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0'
 
 
@@ -105,6 +105,14 @@ ent(classname='fx_origin', origin='600 0 0', fx='env/smoke/fx_smk_plume_md_blk')
 for x, y in ((0, -600), (0, 600), (-600, 0)):
     ent(classname='fx_origin', origin='%d %d 0' % (x, y), fx='env/smoke/fx_fog_low_sm')
 ent(classname='fx_origin', origin='0 0 400', fx='env/fire/fx_embers_falling_md')
+# fireflies drifting over the yard (hand-written example effect)
+for x, y in ((-450, -450), (450, 450)):
+    ent(classname='fx_origin', origin='%d %d 0' % (x, y), fx='env/nature/fx_fireflies')
+# a dynamic effect: a fire that flares up for 10 seconds when a player walks onto the spot
+# (a trigger_multiple brush whose target is the fx_origin's targetname; scripts can also
+# level notify("zm_fire_trap"))
+ent(classname='fx_origin', origin='-450 450 0', fx='env/fire/fx_fire_barrel_small', targetname='zm_fire_trap', duration='10')
+ent(classname='trigger_multiple', target='zm_fire_trap', brush=box(-546, 354, 0, -354, 546, 128, 'trigger'))
 
 world = {
     'classname': 'worldspawn', 'weaponpack': 'so_juggernauts_favela',
@@ -120,6 +128,7 @@ for i, b in enumerate(brushes):
     s += '// brush %d\n' % i + b
 s += '}\n' + ''.join(ents)
 out = os.path.abspath(out)
+os.makedirs(os.path.dirname(out), exist_ok=True)  # maps/<map>/<map>.map
 open(out, 'w').write(s)
 print('wrote', out, len(brushes), 'brushes', len(ents), 'entities', len(nodes), 'path nodes')
 gsc = os.path.splitext(out)[0] + '.gsc'

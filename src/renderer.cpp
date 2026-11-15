@@ -43,6 +43,12 @@ VsOut vsMain(VsIn i) {
 }
 float4 psMain(VsOut i) : SV_Target {
     if (options.x > 0.5) return i.color;
+    if (options.z > 2.5) {  // effect sprite: 3 = additive, 4 = alpha blend (premultiplied)
+        float4 t = tex.Sample(samp, i.uv);
+        float a = t.a * i.color.a;
+        if (options.z < 3.5) return float4(t.rgb * i.color.rgb * a, 0);
+        return float4(t.rgb * i.color.rgb * a, a);
+    }
     if (i.lm.x < -1.5) return float4(skyColor.rgb * i.color.rgb, 0);  // sky face (alpha 0 = sky for the post passes)
     if (options.z > 0.5) {  // effect: additive, faded by view angle (falloffParms.zw on cos^2)
         float4 t = tex.Sample(samp, i.uv);
@@ -277,6 +283,20 @@ bool Renderer::init(ID3D11Device* device, ID3D11DeviceContext* context, std::str
     bdesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
     bdesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
     dev->CreateBlendState(&bdesc, &blendAdd);
+    {  // effect sprites: colour only (the alpha channel marks the sky for the volumetric passes)
+        D3D11_BLEND_DESC spd{};
+        D3D11_RENDER_TARGET_BLEND_DESC& t = spd.RenderTarget[0];
+        t.BlendEnable = TRUE;
+        t.SrcBlend = D3D11_BLEND_ONE;
+        t.DestBlend = D3D11_BLEND_ONE;
+        t.BlendOp = t.BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        t.SrcBlendAlpha = D3D11_BLEND_ZERO;
+        t.DestBlendAlpha = D3D11_BLEND_ONE;
+        t.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE;
+        dev->CreateBlendState(&spd, &blendSpriteAdd);
+        t.DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+        dev->CreateBlendState(&spd, &blendSpriteBlend);
+    }
     startTime = static_cast<double>(GetTickCount64()) / 1000.0;
 
     // Volumetric preview passes.
@@ -389,6 +409,64 @@ ID3D11ShaderResourceView* Renderer::texture(const std::string& material) {
 void Renderer::setTextureFile(const std::string& material, const std::string& path) {
     textureFiles[material] = path;
     textures.erase(material);  // reload on next use
+}
+
+void Renderer::setTextureImage(const std::string& material, const IwiImage& image) {
+    ComPtr<ID3D11ShaderResourceView> srv;
+    srv.Attach(makeTexture(image));
+    if (srv) textures[material] = srv;
+}
+
+void Renderer::drawSprites(void* constantsData) {
+    Constants& cb = *static_cast<Constants*>(constantsData);
+    std::vector<const fxpreview::Sprite*> order;
+    order.reserve(sprites.size());
+    for (const fxpreview::Sprite& s : sprites) order.push_back(&s);
+    std::stable_sort(order.begin(), order.end(), [](const fxpreview::Sprite* a, const fxpreview::Sprite* b) { return a->depth > b->depth; });
+    std::vector<Vertex> verts;
+    verts.reserve(order.size() * 6);
+    for (const fxpreview::Sprite* s : order) {
+        const Vec3 c[4] = {s->pos - s->right + s->up, s->pos + s->right + s->up, s->pos + s->right - s->up, s->pos - s->right - s->up};
+        const float uv[4][2] = {{s->uv[0], s->uv[1]}, {s->uv[2], s->uv[1]}, {s->uv[2], s->uv[3]}, {s->uv[0], s->uv[3]}};
+        for (int k : {0, 1, 2, 0, 2, 3}) {
+            Vertex v{};
+            v.pos[0] = static_cast<float>(c[k].x), v.pos[1] = static_cast<float>(c[k].y), v.pos[2] = static_cast<float>(c[k].z);
+            v.normal[2] = 1;
+            v.uv[0] = uv[k][0], v.uv[1] = uv[k][1];
+            std::memcpy(v.color, s->color, 16);
+            verts.push_back(v);
+        }
+    }
+    uploadVertices(spriteBuffer, spriteCapacity, verts);
+    UINT stride = sizeof(Vertex), offset = 0;
+    ctx->RSSetState(rasterFill.Get());
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx->IASetVertexBuffers(0, 1, spriteBuffer.GetAddressOf(), &stride, &offset);
+    ctx->OMSetDepthStencilState(depthTestOnly.Get(), 0);
+    cb.options[0] = 0;
+    cb.options[1] = 0;
+    float mode = 0;
+    for (size_t i = 0; i < order.size();) {  // runs of the same material and blend mode
+        size_t j = i + 1;
+        while (j < order.size() && order[j]->material == order[i]->material && order[j]->additive == order[i]->additive) j++;
+        const float m = order[i]->additive ? 3.0f : 4.0f;
+        if (m != mode) {
+            mode = m;
+            cb.options[2] = m;
+            D3D11_MAPPED_SUBRESOURCE mp;
+            if (SUCCEEDED(ctx->Map(constants.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mp))) {
+                std::memcpy(mp.pData, &cb, sizeof cb);
+                ctx->Unmap(constants.Get(), 0);
+            }
+            ctx->OMSetBlendState(order[i]->additive ? blendSpriteAdd.Get() : blendSpriteBlend.Get(), nullptr, 0xffffffff);
+        }
+        ID3D11ShaderResourceView* srv = texture(order[i]->material);
+        ctx->PSSetShaderResources(0, 1, &srv);
+        ctx->Draw(static_cast<UINT>((j - i) * 6), static_cast<UINT>(i * 6));
+        i = j;
+    }
+    ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+    ctx->OMSetDepthStencilState(depthOn.Get(), 0);
 }
 
 void Renderer::pumpTextures(int budget) {
@@ -921,6 +999,7 @@ void Renderer::render(const FlyCamera& cam, int width, int height) {
             ctx->OMSetDepthStencilState(depthOn.Get(), 0);
         }
     }
+    if (!sprites.empty()) drawSprites(&cb);
     // Volumetric preview with the baked lighting, then make the view opaque (sky alpha was a marker).
     if (lit && showVolumetrics && vol.enabled) {
         // player clip faces: mark them "not sky" (alpha 1) where they're in front, so the sun's shafts

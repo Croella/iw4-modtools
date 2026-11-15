@@ -181,6 +181,12 @@ private:
     double contextU = 0, contextV = 0, contextW = 0;
 
     uint64_t meshRevision = 0;
+    // Live effect preview (fxpreview.h): starts after a lighting bake or a compile, View > Effects Preview.
+    fxpreview::Preview fxPreview;
+    bool showEffects = false;
+    uint64_t fxRevision = 0;
+    void startFxPreview(const char* why);
+    void updateFxPreview();
     uint64_t materialsSeen = 0;
     std::vector<MaterialEntry> materials;
     std::vector<int> filtered;

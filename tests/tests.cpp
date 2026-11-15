@@ -23,6 +23,7 @@
 #include "zone/efx.h"
 #include "brushshapes.h"
 #include "terrain.h"
+#include "fxpreview.h"
 #include "model/skeleton.h"
 #include <map>
 #include "zone/clipmap.h"
@@ -513,6 +514,92 @@ static void testPathNodes() {
     }
     auto* me = static_cast<const iw4::MapEnts*>(sim.find(IW4_MAPENTS));
     CHECK(me && std::string(me->entityString).find("node_pathnode") == std::string::npos);
+}
+
+// Brush triggers: trigger_multiple brushes -> MapEnts.trigger ("?N" models, a hull per brush with
+// slabs for its slanted faces, relative to the entity origin), as stock maps store them.
+static void testBrushTriggers() {
+    Document d;
+    d.ents[0].brushes.push_back(makeBox({-512, -512, -16}, {512, 512, 0}, "caulk"));
+    Entity t;
+    t.set("classname", "trigger_multiple");
+    t.set("targetname", "zone_a");
+    t.brushes.push_back(makeBox({100, 100, 0}, {200, 300, 64}, "trigger"));  // axial: no slabs
+    std::vector<Brush> wedge = shapes::make(shapes::Shape::Wedge, {200, 100, 0}, {300, 300, 64}, {}, "trigger");
+    CHECK(wedge.size() == 1);
+    for (Brush& b : wedge) t.brushes.push_back(b);
+    d.ents.push_back(t);
+    Entity u;  // a second trigger, with its own origin
+    u.set("classname", "trigger_hurt");
+    u.set("origin", "0 0 100");
+    std::vector<Brush> cyl = shapes::make(shapes::Shape::Cylinder, {-64, -64, 0}, {64, 64, 128}, {}, "trigger");
+    for (Brush& b : cyl) u.brushes.push_back(b);
+    d.ents.push_back(u);
+    Entity bm;  // not a trigger: warned, left out
+    bm.set("classname", "script_brushmodel");
+    bm.brushes.push_back(makeBox({0, 0, 0}, {8, 8, 8}, "caulk"));
+    d.ents.push_back(bm);
+
+    // inside test convention used by the preview: normal . p <= dist
+    {
+        const Brush& b = t.brushes[0];
+        bool in = true;
+        for (const Face& f : b.faces) in &= dot(f.normal, Vec3{150, 200, 32}) <= f.dist;
+        CHECK(in);
+    }
+    Document e = d;
+    clip::ClipMapData cm;
+    std::vector<std::string> w;
+    clip::buildTriggers(e, cm, &w);
+    CHECK(cm.triggerModels.size() == 2 && cm.triggerHulls.size() == 3 && w.size() == 1);
+    CHECK(*e.ents[1].find("model") == "?0" && *e.ents[2].find("model") == "?1");
+    CHECK(*e.ents[1].find("origin") == "200 200 32");  // the brushes' centre
+    CHECK(*e.ents[2].find("origin") == "0 0 100");     // kept
+    CHECK(!e.ents[3].find("model"));
+    if (cm.triggerHulls.size() == 3) {
+        const clip::TriggerHull& h0 = cm.triggerHulls[0];
+        CHECK(h0.slabCount == 0 && h0.bounds.midPoint[0] == -50 && h0.bounds.midPoint[1] == 0 && h0.bounds.midPoint[2] == 0 &&
+              h0.bounds.halfSize[0] == 50 && h0.bounds.halfSize[1] == 100 && h0.bounds.halfSize[2] == 32);
+        CHECK(cm.triggerHulls[1].slabCount == 1);          // the wedge's ramp
+        CHECK(cm.triggerHulls[2].slabCount >= 1 && cm.triggerHulls[2].slabCount <= 4);  // octagon: diagonal pairs
+        CHECK(cm.triggerHulls[2].bounds.midPoint[2] == -36);  // z 0..128 around origin z 100
+        // every slab holds all of its brush's vertices
+        bool fits = true;
+        const Brush* srcs[3] = {&t.brushes[0], &t.brushes[1], &u.brushes[0]};
+        const Vec3 orgs[3] = {{200, 200, 32}, {200, 200, 32}, {0, 0, 100}};
+        for (int h = 0; h < 3; h++)
+            for (int s = 0; s < cm.triggerHulls[h].slabCount; s++) {
+                const clip::TriggerSlab& sl = cm.triggerSlabs[cm.triggerHulls[h].firstSlab + s];
+                const Vec3 dir{sl.dir[0], sl.dir[1], sl.dir[2]};
+                double lo = 1e9, hi = -1e9;
+                for (const Face& f : srcs[h]->faces)
+                    for (const Vec3& v : f.winding) lo = std::min(lo, dot(v - orgs[h], dir)), hi = std::max(hi, dot(v - orgs[h], dir));
+                fits &= std::fabs(sl.midPoint - (lo + hi) / 2) < 0.01 && std::fabs(sl.halfSize - (hi - lo) / 2) < 0.01;
+            }
+        CHECK(fits);
+    }
+    CHECK(cm.triggerModels[0].contents == clip::kTriggerContents && cm.triggerModels[0].hullCount == 2 &&
+          cm.triggerModels[1].firstHull == 2);
+
+    // whole compile: the loader reads them back
+    for (MapTarget target : {MapTarget::MP, MapTarget::SP}) {
+        std::vector<uint8_t> ff;
+        std::string err;
+        CHECK(compileMapToFastfile(d, target == MapTarget::SP ? "sp_trig" : "mp_trig", ff, err, target, kNoBake));
+        Fastfile zf;
+        zone::SimulatedZone sim;
+        CHECK(readFastfile(ff, zf, err) && zone::simulateLoad(zf.zone, sim, err));
+        if (!err.empty()) std::printf("  simulateLoad (triggers): %s\n", err.c_str());
+        auto* me = static_cast<const iw4::MapEnts*>(sim.find(IW4_MAPENTS));
+        CHECK(me && me->trigger.count == 2 && me->trigger.hullCount == 3 && me->trigger.models && me->trigger.hulls && me->trigger.slabs);
+        if (me && me->trigger.models && me->trigger.hulls) {
+            CHECK(me->trigger.models[1].firstHull == 2 && me->trigger.models[1].hullCount == 1);
+            CHECK(me->trigger.hulls[0].bounds.halfSize[1] == 100 && me->trigger.hulls[2].bounds.midPoint[2] == -36);
+            CHECK(me->trigger.slabCount == cm.triggerSlabs.size() && me->trigger.slabs[0].halfSize == cm.triggerSlabs[0].halfSize);
+            const std::string ents(me->entityString);
+            CHECK(ents.find("\"model\" \"?0\"") != std::string::npos && ents.find("\"model\" \"?1\"") != std::string::npos);
+        }
+    }
 }
 
 static void testZoneCompile() {
@@ -1061,7 +1148,24 @@ static void testEffects() {
     std::vector<std::string> warnings;
     CHECK(efx::compile(fx, "muzzleflashes/saw_flshview_c", lookup, c, warnings, err));
     CHECK(c.elems.size() == 2 && c.countOneShot == 2 && c.countLooping == 0 && c.flags == 1);
-    auto f32 = [](const uint8_t* p) { float v; std::memcpy(&v, p, 4); return v; };
+    {  // a forever-looping element (spawnLooping count 0): INT_MAX count and looping life, as stock fire/firelp_med_pm
+        std::ifstream in("maps/zm_test/zone_source/fx/env/nature/fx_fireflies.efx");
+        const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        efx::Effect ff;
+        efx::Compiled fc;
+        std::vector<std::string> fw;
+        const bool ok = efx::parse(text, ff, err) &&
+                        efx::compile(ff, "env/nature/fx_fireflies", [](const std::string&) { efx::MaterialInfo m; m.known = true; return m; },
+                                     fc, fw, err);
+        CHECK(ok && fc.countLooping == 1 && fc.msecLoopingLife == 0x7FFFFFFF);
+        if (ok && !fc.elems.empty()) {
+            int32_t interval, count;
+            std::memcpy(&interval, fc.elems[0].def.data() + 4, 4);
+            std::memcpy(&count, fc.elems[0].def.data() + 8, 4);
+            CHECK(interval == 175 && count == 0x7FFFFFFF);
+        }
+    }
+    auto f32 =[](const uint8_t* p) { float v; std::memcpy(&v, p, 4); return v; };
     auto i32 = [](const uint8_t* p) { int32_t v; std::memcpy(&v, p, 4); return v; };
     auto near = [](float a, float b) { return std::fabs(a - b) <= 1e-5f + 1e-4f * std::fabs(b); };
     if (c.elems.size() == 2) {
@@ -1415,6 +1519,225 @@ static void testTerrain() {
         terrain::rebuildCells(big, bf, 0, 0, bf.nx, bf.ny);
         CHECK(saveMap(out, big, err));
     }
+}
+
+// Effect preview: a hand-written effect in a temp zone_source runs from an fx_origin: looping
+// spawn rate, lifetimes, spawn volume in the fx_origin's axes, graphs, atlas frames, one-shot replay.
+static void testFxPreview() {
+    namespace fs = std::filesystem;
+    const fs::path zs = fs::temp_directory_path() / "iw4r_fxpreview" / "zone_source";
+    std::error_code ec;
+    fs::remove_all(zs.parent_path(), ec);
+    fs::create_directories(zs / "fx" / "test", ec);
+    auto write = [&](const char* name, const std::string& text) { std::ofstream(zs / "fx" / "test" / name) << text; };
+    // looping: one sprite per 100 ms, 1 s life, spawned 50 up (X = up for the default angles),
+    // y/z in -100..100, rising 20 u/s, size 10 -> 30, colour red -> blue, 2x2 atlas over life
+    write("loop.efx", R"(iwfx 3
+{
+	name "a";
+	editorFlags looping;
+	flags spawnRelative;
+	spawnLooping 100 0;
+	lifeSpanMsec 1000 0;
+	spawnOrgX 50 0;
+	spawnOrgY -100 200;
+	spawnOrgZ -100 200;
+	atlasBehavior playOverLife;
+	velGraph0X 20 { { 0 1 1 1 } { 0 1 1 1 } };
+	sizeGraph0 10 { { 0 1 1 3 } { 0 1 1 3 } };
+	colorGraph 1 { { 0 1 0 0 1 0 0 1 } { 0 1 0 0 1 0 0 1 } };
+	alphaGraph 1 { { 0 1 1 1 } { 0 1 1 1 } };
+	billboardSprite { "mat_loop" };
+}
+)");
+    // one-shot: 5 sprites, 0.5 s life, replayed every `delay` seconds
+    write("burst.efx", R"(iwfx 3
+{
+	name "b";
+	editorFlags;
+	spawnOneShot 5 0;
+	lifeSpanMsec 500 0;
+	sizeGraph0 4 { { 0 1 1 1 } { 0 1 1 1 } };
+	billboardSprite { "mat_burst" };
+}
+{
+	name "skipped";
+	editorFlags;
+	spawnOneShot 5 0;
+	billboardSprite { "missing_material" };
+}
+)");
+    fxpreview::Preview pv;
+    std::vector<std::string> warnings;
+    pv.load(zs.string(),
+            [](const std::string& m) {
+                fxpreview::MaterialInfo mi;
+                mi.found = m != "missing_material";
+                mi.additive = m == "mat_loop";
+                mi.rows = mi.cols = m == "mat_loop" ? 2 : 1;
+                return mi;
+            },
+            warnings);
+    CHECK(pv.effectCount() == 2 && warnings.empty());
+    Document d;
+    Sel a = d.addPointEntity("fx_origin", {1000, 2000, 300});
+    d.ents[a.ent].set("fx", "test/loop");
+    Sel b = d.addPointEntity("fx_origin", {0, 0, 0});
+    d.ents[b.ent].set("fx", "test/burst");
+    d.ents[b.ent].set("delay", "1");
+    Sel c = d.addPointEntity("fx_origin", {0, 0, 0});
+    d.ents[c.ent].set("fx", "test/nope");
+    pv.sync(d);
+    CHECK(pv.emitterCount() == 2 && pv.missing().count("test/nope") == 1);
+    pv.warmup(3.0);
+    // steady state: ~10 looping (1 s / 100 ms) + 5 burst (still alive 0..0.5 s after a replay, or not)
+    const size_t n = pv.particleCount();
+    if (n < 9 || n > 16) std::printf("  fx preview particles %zu\n", n);
+    CHECK(n >= 9 && n <= 16);
+    std::vector<fxpreview::Sprite> sp;
+    const Vec3 eye{-5000, 0, 0};  // looking along +x at everything
+    pv.sprites(eye, {1, 0, 0}, {0, -1, 0}, {0, 0, 1}, sp);
+    int loops = 0, bursts = 0;
+    bool inVolume = true, sized = true, colours = true, atlas = true, modes = true;
+    for (const fxpreview::Sprite& s : sp) {
+        if (s.material == "mat_loop") {
+            loops++;
+            // spawned at z 350, rising 20 u/s for up to 1 s; the effect's Y/Z (left/up, for the default
+            // angles world y and -x) within +-100
+            inVolume &= s.pos.z >= 349 && s.pos.z <= 371 && std::fabs(s.pos.y - 2000) <= 100.01 && std::fabs(s.pos.x - 1000) <= 100.01;
+            const double w = length(s.right) * 2;
+            const double age = (s.pos.z - 350) / 20;  // 0..1
+            sized &= std::fabs(w - (10 + 20 * age)) < 1.5;
+            colours &= std::fabs(s.color[0] - (1 - age)) < 0.08 && std::fabs(s.color[2] - age) < 0.08;
+            const int frame = static_cast<int>(s.uv[0] * 2 + 0.01) + 2 * static_cast<int>(s.uv[1] * 2 + 0.01);
+            atlas &= frame == std::min(3, static_cast<int>(age * 4 + 1e-3)) || std::fabs(age * 4 - std::round(age * 4)) < 0.15;
+            modes &= s.additive;
+        } else {
+            bursts++;
+            modes &= !s.additive && s.material == "mat_burst";
+        }
+    }
+    if (!(inVolume && sized && colours && atlas && modes))
+        std::printf("  fx preview: volume %d size %d colour %d atlas %d modes %d\n", inVolume, sized, colours, atlas, modes);
+    CHECK(loops >= 9 && inVolume && sized && colours && atlas && modes);
+    // the one-shot replays every second: after the burst dies (0.5 s) and comes back
+    int seen = 0, gone = 0;
+    for (int k = 0; k < 60; k++) {
+        pv.update(1.0 / 30);
+        std::vector<fxpreview::Sprite> s2;
+        pv.sprites(eye, {1, 0, 0}, {0, -1, 0}, {0, 0, 1}, s2);
+        int nb = 0;
+        for (const fxpreview::Sprite& s : s2) nb += s.material == "mat_burst";
+        seen += nb == 5;
+        gone += nb == 0;
+    }
+    CHECK(seen > 5 && gone > 5);
+    // moving the fx_origin restarts only that emitter; removing one drops it
+    d.ents[a.ent].setOrigin({0, 0, 0});
+    pv.sync(d);
+    CHECK(pv.emitterCount() == 2);
+    d.ents.erase(d.ents.begin() + b.ent);
+    pv.sync(d);
+    CHECK(pv.emitterCount() == 1);
+    // the shipped firefly example parses and runs
+    fxpreview::Preview ff;
+    ff.load("maps/zm_test/zone_source", [](const std::string&) { return fxpreview::MaterialInfo{}; }, warnings);
+    Document fd;
+    Sel f = fd.addPointEntity("fx_origin", {0, 0, 0});
+    fd.ents[f.ent].set("fx", "env/nature/fx_fireflies");
+    ff.sync(fd);
+    ff.warmup(10);
+    std::vector<fxpreview::Sprite> fly;
+    ff.sprites({-2000, 0, 50}, {1, 0, 0}, {0, -1, 0}, {0, 0, 1}, fly);
+    bool flies = ff.particleCount() > 30;
+    for (const fxpreview::Sprite& s : fly) flies &= s.pos.z > 0 && s.pos.z < 200 && std::fabs(s.pos.x) < 400 && std::fabs(s.pos.y) < 400;
+    CHECK(flies && !fly.empty());
+
+    // Dynamic effects: a trigger_radius aimed at a named fx_origin starts it when the viewer walks in.
+    {
+        fxpreview::Preview pd;
+        pd.load(zs.string(), [](const std::string& m) { return fxpreview::MaterialInfo{m != "missing_material", true, 1, 1}; }, warnings);
+        Document dd;
+        Sel lf = dd.addPointEntity("fx_origin", {0, 0, 0});  // looping, triggered, 1.5 s each time
+        dd.ents[lf.ent].set("fx", "test/loop");
+        dd.ents[lf.ent].set("targetname", "fire");
+        dd.ents[lf.ent].set("duration", "1.5");
+        Sel bf = dd.addPointEntity("fx_origin", {500, 0, 0});  // one-shot, script-started only, once
+        dd.ents[bf.ent].set("fx", "test/burst");
+        dd.ents[bf.ent].set("targetname", "boom");
+        dd.ents[bf.ent].set("start_off", "1");
+        dd.ents[bf.ent].set("once", "1");
+        Sel st = dd.addPointEntity("fx_origin", {-500, 0, 0});  // static: unaffected
+        dd.ents[st.ent].set("fx", "test/loop");
+        Sel tr = dd.addPointEntity("trigger_radius", {0, 1000, 0});
+        dd.ents[tr.ent].set("target", "fire");
+        dd.ents[tr.ent].set("radius", "100");
+        dd.ents[tr.ent].set("height", "50");
+        pd.sync(dd);
+        pd.setViewer({0, 0, 500});
+        pd.warmup(2.0);
+        auto count = [&](const char* mat, double x) {
+            std::vector<fxpreview::Sprite> s;
+            pd.sprites({-5000, 0, 0}, {1, 0, 0}, {0, -1, 0}, {0, 0, 1}, s);
+            int n = 0;
+            for (const fxpreview::Sprite& q : s) n += q.material == mat && std::fabs(q.pos.x - x) < 200;
+            return n;
+        };
+        const bool idle = count("mat_loop", 0) == 0 && count("mat_burst", 500) == 0 && count("mat_loop", -500) > 5;
+        pd.setViewer({0, 1050, 20});  // walk in
+        pd.warmup(1.0);
+        const bool started = count("mat_loop", 0) > 5;
+        pd.warmup(2.0);  // past the 1.5 s duration + 1 s particle life, still standing inside: no restart
+        const bool stopped = count("mat_loop", 0) == 0;
+        pd.setViewer({0, 0, 500});
+        pd.setViewer({0, 1000, 10});  // walk out and back in: runs again
+        pd.warmup(0.5);
+        const bool again = count("mat_loop", 0) > 2;
+        pd.startGroup("boom");  // level notify("boom")
+        pd.update(1.0 / 30);
+        const bool boom = count("mat_burst", 500) == 5;
+        pd.warmup(1.0);
+        pd.startGroup("boom");  // once: no second burst
+        pd.update(1.0 / 30);
+        const bool onceOk = count("mat_burst", 500) == 0;
+        if (!(idle && started && stopped && again && boom && onceOk))
+            std::printf("  fx dynamic: idle %d started %d stopped %d again %d boom %d once %d\n", idle, started, stopped, again, boom, onceOk);
+        CHECK(idle && started && stopped && again && boom && onceOk);
+        CHECK(pd.groups() == std::set<std::string>({"boom", "fire"}));
+
+        // compiler: placements + the generated script
+        std::vector<std::string> w;
+        Sel bt = dd.addPointEntity("trigger_radius", {0, 0, 0});  // no radius/height: defaults
+        dd.ents[bt.ent].set("target", "boom");
+        dd.ents[bt.ent].set("script_noteworthy", "stop");
+        std::vector<FxPlacement> pl = fxPlacements(dd, {{"test/loop", true}, {"test/burst", false}}, &w);
+        CHECK(pl.size() == 3);
+        CHECK(pl[0].name == "fire" && pl[0].waitStart && pl[0].duration == 1.5f && pl[0].looping && pl[0].triggers.size() == 1);
+        CHECK(pl[1].name == "boom" && pl[1].waitStart && pl[1].once && !pl[1].looping && pl[1].delay == 0);
+        CHECK(pl[2].name.empty() && !pl[2].waitStart && pl[2].delay == 0);
+        CHECK(dd.ents[bt.ent].find("radius") && *dd.ents[bt.ent].find("radius") == "64" && w.size() == 2);
+        const std::string gsc = fxPlacementScript(pl);
+        auto has = [&](const char* t) { return gsc.find(t) != std::string::npos; };
+        CHECK(has("thread dynamic(0, (0, 0, 0), (0, 0, 1), (-1, 0, 0), 0, \"fire\", 1.5, 0, 1);"));
+        CHECK(has("thread dynamic(1, (500, 0, 0)") && has("\"boom\", 0, 1, 1);"));
+        CHECK(has("thread play(0, (-500, 0, 0)"));
+        CHECK(has("thread watch(\"fire\");") && has("thread watch(\"boom\");"));
+        CHECK(has("level._iw4r_fxloop[0] = true;") && has("level._iw4r_fxloop[1] = false;"));
+        CHECK(gsc.find("level._iw4r_fxloop = [];") < gsc.find("thread place();"));
+        // braces balance (a cheap syntax sanity check of the generated text)
+        int depth = 0, paren = 0;
+        bool neg = false;
+        for (char ch : gsc) {
+            depth += ch == '{' ? 1 : ch == '}' ? -1 : 0;
+            paren += ch == '(' ? 1 : ch == ')' ? -1 : 0;
+            neg |= depth < 0 || paren < 0;
+        }
+        CHECK(depth == 0 && paren == 0 && !neg);
+        // static-only maps keep the old short script
+        std::vector<FxPlacement> only = {pl[2]};
+        CHECK(fxPlacementScript(only).find("dynamic(") == std::string::npos);
+    }
+    fs::remove_all(zs.parent_path(), ec);
 }
 
 // Pen tool: outlines -> convex pieces (area preserved, each convex) -> valid brushes.
@@ -2068,6 +2391,7 @@ int main() {
     testFastfileRoundTripReal();
     testEntityString();
     testZoneCompile();
+    testBrushTriggers();
     testZoneCompileSp();
     testPathNodes();
     testEffects();
@@ -2083,6 +2407,7 @@ int main() {
     testShapes();
     testPenOutlines();
     testTerrain();
+    testFxPreview();
     testSkeletonConvert();
     testZoneSourceModel();
     testSkyCompile();

@@ -1086,12 +1086,22 @@ uint64_t writeMaterialRef(ZoneWriter& w, const std::string& name) {
 // withDefaultStage: one stage 0 (whole map, sun = primary light 1). SP needs it: its per-frame
 // stage lookup (iw4sp+0x46c20) returns 0 when the player is in no stage trigger and the caller
 // (iw4sp+0x85f8) then reads stages[0] with no null check. MP zones keep stages null.
+iw4::Bounds toGame(const clip::Bounds& b);
 void writeMapEnts(ZoneWriter& w, const std::string& name, const std::string& entityString,
-                  bool withDefaultStage = false) {
+                  bool withDefaultStage = false, const clip::ClipMapData* trig = nullptr) {
     iw4::MapEnts m{};
     m.name = follow<const char>();
     m.entityString = follow<char>();
     m.numEntityChars = static_cast<int>(entityString.size() + 1);  // incl. NUL
+    const bool triggers = trig && !trig->triggerModels.empty();
+    if (triggers) {  // brush triggers: entity "model" "?N" (clip::buildTriggers)
+        m.trigger.count = static_cast<unsigned>(trig->triggerModels.size());
+        m.trigger.models = follow<iw4::TriggerModel>();
+        m.trigger.hullCount = static_cast<unsigned>(trig->triggerHulls.size());
+        m.trigger.hulls = trig->triggerHulls.empty() ? nullptr : follow<iw4::TriggerHull>();
+        m.trigger.slabCount = static_cast<unsigned>(trig->triggerSlabs.size());
+        m.trigger.slabs = trig->triggerSlabs.empty() ? nullptr : follow<iw4::TriggerSlab>();
+    }
     if (withDefaultStage) {
         m.stages = follow<iw4::Stage>();
         m.stageCount = 1;
@@ -1101,6 +1111,37 @@ void writeMapEnts(ZoneWriter& w, const std::string& name, const std::string& ent
     w.xstring(name);
     w.align(zone::kAlign1);
     w.write(entityString.c_str(), entityString.size() + 1);
+    if (triggers) {  // Load_MapTriggers: models (8), hulls (32), slabs (20), each align 4
+        w.align(zone::kAlign4);
+        for (const clip::TriggerModel& t : trig->triggerModels) {
+            iw4::TriggerModel g{};
+            g.contents = static_cast<int>(t.contents);
+            g.hullCount = t.hullCount;
+            g.firstHull = t.firstHull;
+            w.writeStruct(g);
+        }
+        if (!trig->triggerHulls.empty()) {
+            w.align(zone::kAlign4);
+            for (const clip::TriggerHull& h : trig->triggerHulls) {
+                iw4::TriggerHull g{};
+                g.bounds = toGame(h.bounds);
+                g.contents = static_cast<int>(h.contents);
+                g.slabCount = h.slabCount;
+                g.firstSlab = h.firstSlab;
+                w.writeStruct(g);
+            }
+        }
+        if (!trig->triggerSlabs.empty()) {
+            w.align(zone::kAlign4);
+            for (const clip::TriggerSlab& sl : trig->triggerSlabs) {
+                iw4::TriggerSlab g{};
+                std::memcpy(g.dir, sl.dir, sizeof g.dir);
+                g.midPoint = sl.midPoint;
+                g.halfSize = sl.halfSize;
+                w.writeStruct(g);
+            }
+        }
+    }
     if (withDefaultStage) {
         w.align(zone::kAlign4);
         iw4::Stage st{};
@@ -1111,6 +1152,9 @@ void writeMapEnts(ZoneWriter& w, const std::string& name, const std::string& ent
     }
     w.pop();
 }
+static_assert(sizeof(iw4::TriggerModel) == 8 && sizeof(iw4::TriggerHull) == 32 && sizeof(iw4::TriggerSlab) == 20 &&
+                  offsetof(iw4::MapEnts, trigger) == 0x18,
+              "MapTriggers layout differs from Load_MapTriggers");
 static_assert(sizeof(iw4::Stage) == 24 && offsetof(iw4::MapEnts, stages) == 0x48 &&
                   offsetof(iw4::MapEnts, stageCount) == 0x50,
               "Stage/MapEnts layout differs from Load_MapEnts");
@@ -1404,7 +1448,7 @@ ZoneAsset buildClipMap(const std::string& name, const clip::ClipMapData& cm,
                 w.align(kAlign4);
                 w.writeStruct(iw4::SModelAabbNode{});
                 // Load_MapEntsPtr (0x11cd50), nested: the entity lump becomes its own asset.
-                loadAssetPtr(w, kPtrInsert, [&](ZoneWriter& ww) { writeMapEnts(ww, name, entityString, withDefaultStage); });
+                loadAssetPtr(w, kPtrInsert, [&](ZoneWriter& ww) { writeMapEnts(ww, name, entityString, withDefaultStage, &cm); });
                 // dynEnt def/pose/client/coll lists: none.
                 w.pop();
             }};
@@ -2402,6 +2446,46 @@ ZoneSourceEffects loadZoneSourceEffects(const std::string& zoneSourceDir, const 
 // Script for the map's fx_origin entities (fx, angles, delay): loads every effect in main() and,
 // once the level runs, spawns each: delay <= 0 -> spawnfx + triggerfx once (an effect with looping
 // elements keeps playing), else playfx every `delay` seconds.
+struct FxPreviewMaterials::Impl {
+    std::string zoneSourceDir;
+    std::map<std::string, std::pair<int, int>> stock;
+    bo1::Install bo;
+    std::map<std::string, FxPreviewMaterial> cache;
+    Impl(const std::string& zs, const std::string& gameDir, const std::string& cacheDir)
+        : zoneSourceDir(zs), stock(stockFxMaterials(gameDir, cacheDir, MapTarget::SP)), bo(bo1::defaultRoot(gameDir)) {}
+};
+
+FxPreviewMaterials::FxPreviewMaterials(const std::string& zoneSourceDir, const std::string& gameDir, const std::string& cacheDir)
+    : impl_(std::make_unique<Impl>(zoneSourceDir, gameDir, cacheDir)) {}
+FxPreviewMaterials::~FxPreviewMaterials() = default;
+
+const FxPreviewMaterial& FxPreviewMaterials::get(const std::string& name) {
+    auto it = impl_->cache.find(name);
+    if (it != impl_->cache.end()) return it->second;
+    FxPreviewMaterial out;
+    FxMaterialPlan p;
+    const std::string lname = zsrc::lower(name);
+    bool ours = planFxMaterial(impl_->zoneSourceDir, name, p, nullptr);
+    if (!ours && !impl_->stock.count(lname) && impl_->bo.valid()) ours = planBo1FxMaterial(impl_->bo, name, p, nullptr);
+    if (ours) {
+        out.found = true;
+        out.additive = p.additive;
+        out.rows = p.rows, out.cols = p.cols;
+        out.width = p.image.width, out.height = p.image.height;
+        out.format = p.image.format;
+        out.pixels = std::move(p.image.pixels);
+    } else if (auto s = impl_->stock.find(lname); s != impl_->stock.end()) {
+        out.found = out.stock = true;
+        out.rows = s->second.first, out.cols = s->second.second;
+        // stock effect materials: additive by the usual naming (glows, flashes, flares, sparks)
+        out.additive = lname.find("add") != std::string::npos || lname.find("glow") != std::string::npos ||
+                       lname.find("flash") != std::string::npos || lname.find("flare") != std::string::npos ||
+                       lname.find("spark") != std::string::npos || lname.find("fire") != std::string::npos;
+        if (lname.find("distortion") != std::string::npos) out.found = false;  // a screen warp: nothing to draw
+    }
+    return impl_->cache.emplace(name, std::move(out)).first->second;
+}
+
 std::string fxPlacementScript(const std::vector<FxPlacement>& fx) {
     std::vector<std::string> names;
     for (const FxPlacement& p : fx)
@@ -2417,13 +2501,177 @@ std::string fxPlacementScript(const std::vector<FxPlacement>& fx) {
         return std::string(b);
     };
     auto vec = [&](const float* v) { return "(" + num(v[0]) + ", " + num(v[1]) + ", " + num(v[2]) + ")"; };
+    auto quote = [](const std::string& t) {
+        std::string q = "\"";
+        for (char c : t)
+            if (c != '"' && c != '\\' && c >= 32) q += c;
+        return q + "\"";
+    };
+    std::vector<std::string> watched;  // fx groups with triggers
+    bool dynamic = false;
     for (const FxPlacement& p : fx) {
         const size_t id = static_cast<size_t>(std::find(names.begin(), names.end(), p.effect) - names.begin());
-        s += "\tthread play(" + std::to_string(id) + ", " + vec(p.origin) + ", " + vec(p.forward) + ", " + vec(p.up) + ", " + num(p.delay) + ");\n";
+        const std::string args = std::to_string(id) + ", " + vec(p.origin) + ", " + vec(p.forward) + ", " + vec(p.up) + ", " + num(p.delay);
+        if (p.name.empty() && p.duration <= 0) {
+            s += "\tthread play(" + args + ");\n";
+            continue;
+        }
+        dynamic = true;
+        s += "\tthread dynamic(" + args + ", " + quote(p.name) + ", " + num(p.duration) + ", " + (p.once ? "1" : "0") + ", " +
+             (p.waitStart ? "1" : "0") + ");\n";
+        if (!p.triggers.empty() && std::find(watched.begin(), watched.end(), p.name) == watched.end()) watched.push_back(p.name);
     }
-    s += "}\n\nplay(id, org, fwd, up, delay)\n{\n\tif (delay <= 0)\n\t{\n\t\tent = spawnfx(level._iw4r_fx[id], org, fwd, up);\n"
-         "\t\ttriggerfx(ent);\n\t\treturn;\n\t}\n\tfor (;;)\n\t{\n\t\tplayfx(level._iw4r_fx[id], org, fwd, up);\n\t\twait delay;\n\t}\n}\n";
+    for (const std::string& w : watched) s += "\tthread watch(" + quote(w) + ");\n";
+    s += "}\n\n"
+         "play(id, org, fwd, up, delay)\n{\n"
+         "\tif (delay <= 0)\n\t{\n"
+         "\t\tent = spawnfx(level._iw4r_fx[id], org, fwd, up);\n"
+         "\t\ttriggerfx(ent);\n"
+         "\t\treturn;\n\t}\n"
+         "\tfor (;;)\n\t{\n"
+         "\t\tplayfx(level._iw4r_fx[id], org, fwd, up);\n"
+         "\t\twait delay;\n\t}\n}\n";
+    if (!dynamic) return s;
+    // A dynamic fx_origin: waits for level notify(name) (unless it starts on), then runs until
+    // level notify(name + "_stop") or `duration` seconds; again on the next start unless `once`.
+    // Looping effects: spawnfx/triggerfx, deleted on stop. One-shot: playfx, every `delay` seconds
+    // while running (delay 0: once per start).
+    s += "\n"
+         "dynamic(id, org, fwd, up, delay, name, duration, once, waitstart)\n{\n"
+         "\tfirst = true;\n"
+         "\tfor (;;)\n\t{\n"
+         "\t\tif (!first || waitstart)\n"
+         "\t\t\tlevel waittill(name);\n"
+         "\t\tfirst = false;\n"
+         "\t\tif (level._iw4r_fxloop[id])\n\t\t{\n"
+         "\t\t\tent = spawnfx(level._iw4r_fx[id], org, fwd, up);\n"
+         "\t\t\ttriggerfx(ent);\n"
+         "\t\t\trun = spawnstruct();\n"
+         "\t\t\trun waitstop(name, duration);\n"
+         "\t\t\tent delete();\n\t\t}\n"
+         "\t\telse if (delay > 0)\n\t\t{\n"
+         "\t\t\trun = spawnstruct();\n"
+         "\t\t\trun thread repeat(id, org, fwd, up, delay);\n"
+         "\t\t\trun waitstop(name, duration);\n\t\t}\n"
+         "\t\telse\n"
+         "\t\t\tplayfx(level._iw4r_fx[id], org, fwd, up);\n"
+         "\t\tif (once)\n"
+         "\t\t\treturn;\n"
+         "\t\tif (name == \"\")\n"
+         "\t\t\treturn;\n"
+         "\t\twait 0.05;\n\t}\n}\n\n"
+         "repeat(id, org, fwd, up, delay)\n{\n"
+         "\tself endon(\"done\");\n"
+         "\tfor (;;)\n\t{\n"
+         "\t\tplayfx(level._iw4r_fx[id], org, fwd, up);\n"
+         "\t\twait delay;\n\t}\n}\n\n"
+         // returns on level notify(name + "_stop") or after duration (> 0), whichever comes first
+         "waitstop(name, duration)\n{\n"
+         "\tif (name != \"\")\n"
+         "\t\tself thread stopon(name + \"_stop\");\n"
+         "\tif (duration > 0)\n"
+         "\t\tself thread stopin(duration);\n"
+         "\tif (name != \"\" || duration > 0)\n"
+         "\t\tself waittill(\"stop\");\n"
+         "\telse\n"
+         "\t\tlevel waittill(\"_iw4r_never\");\n"
+         "\tself notify(\"done\");\n}\n\n"
+         "stopon(msg)\n{\n"
+         "\tself endon(\"done\");\n"
+         "\tlevel waittill(msg);\n"
+         "\tself notify(\"stop\");\n}\n\n"
+         "stopin(t)\n{\n"
+         "\tself endon(\"done\");\n"
+         "\twait t;\n"
+         "\tself notify(\"stop\");\n}\n\n"
+         // every trigger whose "target" is the group: walking in starts it (or stops it, with
+         // script_noteworthy "stop"); once per entry
+         "watch(name)\n{\n"
+         "\ttrigs = getentarray(name, \"target\");\n"
+         "\tfor (i = 0; i < trigs.size; i++)\n"
+         "\t\ttrigs[i] thread watchtrigger(name);\n}\n\n"
+         "watchtrigger(name)\n{\n"
+         "\tmsg = name;\n"
+         "\tif (isdefined(self.script_noteworthy) && self.script_noteworthy == \"stop\")\n"
+         "\t\tmsg = name + \"_stop\";\n"
+         "\tfor (;;)\n\t{\n"
+         "\t\tself waittill(\"trigger\", who);\n"
+         "\t\tlevel notify(msg);\n"
+         "\t\twhile (isdefined(who) && isdefined(self) && who istouching(self))\n"
+         "\t\t\twait 0.1;\n\t}\n}\n";
+    // which effects loop (spawnfx) vs one-shot (playfx), set in main()
+    std::string loops = "\tlevel._iw4r_fxloop = [];\n";
+    for (size_t i = 0; i < names.size(); i++) {
+        bool looping = false;
+        for (const FxPlacement& p : fx)
+            if (p.effect == names[i] && p.looping) looping = true;
+        loops += "\tlevel._iw4r_fxloop[" + std::to_string(i) + "] = " + (looping ? "true" : "false") + ";\n";
+    }
+    const std::string anchor = "\tthread place();\n";
+    s.insert(s.find(anchor), loops);
     return s;
+}
+
+std::vector<FxPlacement> fxPlacements(Document& doc, const std::map<std::string, bool>& looping, std::vector<std::string>* warnings) {
+    auto warn = [&](const std::string& m) {
+        if (warnings) warnings->push_back(m);
+    };
+    // fx groups: fx_origin targetnames
+    std::set<std::string> groups;
+    for (const Entity& e : doc.ents)
+        if (e.classname() == "fx_origin")
+            if (const std::string* t = e.find("targetname"); t && !t->empty()) groups.insert(*t);
+    // triggers pointing at a group
+    std::map<std::string, std::vector<std::string>> triggers;
+    for (Entity& e : doc.ents) {
+        const std::string* tp = e.find("target");
+        if (!tp || !groups.count(*tp) || e.classname() == "fx_origin") continue;
+        const std::string t = *tp, cls = e.classname();  // copies: set() below may move the keys
+        if (cls == "trigger_radius") {
+            if (!e.find("radius")) e.set("radius", "64"), warn("trigger_radius -> fx \"" + t + "\" has no radius; using 64");
+            if (!e.find("height")) e.set("height", "128"), warn("trigger_radius -> fx \"" + t + "\" has no height; using 128");
+            triggers[t].push_back(cls);
+        } else if (clip::isBrushTriggerClass(cls)) {
+            if (e.brushes.empty()) warn(cls + " -> fx \"" + t + "\" has no brushes: it can't be touched");
+            triggers[t].push_back(cls);  // a brush trigger (compiled by clip::buildTriggers)
+        } else {
+            triggers[t].push_back(cls);  // anything else that targets it: the script still listens
+        }
+    }
+    std::vector<FxPlacement> out;
+    for (const Entity& e : doc.ents) {
+        if (e.classname() != "fx_origin") continue;
+        const std::string* fxName = e.find("fx");
+        if (!fxName || fxName->empty()) {
+            warn("fx_origin without an \"fx\" key; ignored");
+            continue;
+        }
+        FxPlacement p{};
+        p.effect = zsrc::lower(*fxName);
+        Vec3 o;
+        if (e.origin(o)) p.origin[0] = static_cast<float>(o.x), p.origin[1] = static_cast<float>(o.y), p.origin[2] = static_cast<float>(o.z);
+        double pitch = 270, yaw = 0, roll = 0;  // default: pointing up, as createfx
+        if (const std::string* a = e.find("angles")) std::sscanf(a->c_str(), "%lf %lf %lf", &pitch, &yaw, &roll);
+        else if (const std::string* a1 = e.find("angle")) pitch = 0, yaw = std::atof(a1->c_str());
+        const double d2r = 3.14159265358979 / 180.0, sinP = std::sin(pitch * d2r), cp = std::cos(pitch * d2r), sy = std::sin(yaw * d2r),
+                     cy = std::cos(yaw * d2r), sr = std::sin(roll * d2r), cr = std::cos(roll * d2r);
+        const double fwd[3] = {cp * cy, cp * sy, -sinP}, up[3] = {cr * sinP * cy + sr * sy, cr * sinP * sy - sr * cy, cr * cp};
+        for (int k = 0; k < 3; k++) p.forward[k] = static_cast<float>(fwd[k]), p.up[k] = static_cast<float>(up[k]);
+        auto lp = looping.find(p.effect);
+        p.looping = lp == looping.end() || lp->second;
+        if (const std::string* t = e.find("targetname")) p.name = *t;
+        if (const std::string* du = e.find("duration")) p.duration = static_cast<float>(std::atof(du->c_str()));
+        if (const std::string* on = e.find("once")) p.once = std::atoi(on->c_str()) != 0;
+        const std::string* so = e.find("start_off");
+        if (auto tr = triggers.find(p.name); !p.name.empty() && tr != triggers.end()) p.triggers = tr->second;
+        p.waitStart = !p.name.empty() && (!p.triggers.empty() || (so && std::atoi(so->c_str()) != 0));
+        // one-shot effects repeat every 2 s unless told otherwise; a dynamic one plays once per start
+        const bool dyn = !p.name.empty() || p.duration > 0;
+        p.delay = !p.looping && !dyn ? 2.0f : 0.0f;
+        if (const std::string* dl = e.find("delay")) p.delay = static_cast<float>(std::atof(dl->c_str()));
+        out.push_back(p);
+    }
+    return out;
 }
 
 // Inserts `call` as the first statement of the script's main() (after its opening brace) unless the
@@ -2733,30 +2981,7 @@ bool compileMapToFastfile(const Document& doc, const std::string& mapName,
     ZoneSourceEffects zfx = loadZoneSourceEffects(options.zoneSourceDir, options.gameDir, options.cacheDir, target, fxWarnings);
     if (options.warnings)
         for (const std::string& x : fxWarnings) options.warnings->push_back(x);
-    std::vector<FxPlacement> placements;
-    for (const Entity& e : entDoc.ents) {
-        if (e.classname() != "fx_origin") continue;
-        const std::string* fxName = e.find("fx");
-        if (!fxName || fxName->empty()) {
-            if (options.warnings) options.warnings->push_back("fx_origin without an \"fx\" key; ignored");
-            continue;
-        }
-        FxPlacement p{};
-        p.effect = zsrc::lower(*fxName);
-        Vec3 o;
-        if (e.origin(o)) p.origin[0] = static_cast<float>(o.x), p.origin[1] = static_cast<float>(o.y), p.origin[2] = static_cast<float>(o.z);
-        double pitch = 270, yaw = 0, roll = 0;  // default: pointing up, as createfx
-        if (const std::string* a = e.find("angles")) std::sscanf(a->c_str(), "%lf %lf %lf", &pitch, &yaw, &roll);
-        else if (const std::string* a1 = e.find("angle")) pitch = 0, yaw = std::atof(a1->c_str());
-        const double d2r = 3.14159265358979 / 180.0, sinP = std::sin(pitch * d2r), cp = std::cos(pitch * d2r), sy = std::sin(yaw * d2r),
-                     cy = std::cos(yaw * d2r), sr = std::sin(roll * d2r), cr = std::cos(roll * d2r);
-        const double fwd[3] = {cp * cy, cp * sy, -sinP}, up[3] = {cr * sinP * cy + sr * sy, cr * sinP * sy - sr * cy, cr * cp};
-        for (int k = 0; k < 3; k++) p.forward[k] = static_cast<float>(fwd[k]), p.up[k] = static_cast<float>(up[k]);
-        auto lp = zfx.looping.find(p.effect);
-        p.delay = lp != zfx.looping.end() && !lp->second ? 2.0f : 0.0f;  // one-shot effects repeat unless told otherwise
-        if (const std::string* dl = e.find("delay")) p.delay = static_cast<float>(std::atof(dl->c_str()));
-        placements.push_back(p);
-    }
+    std::vector<FxPlacement> placements = fxPlacements(entDoc, zfx.looping, options.warnings);
     // fx_origin -> the generated script; iw4r_terrain is editor data (its brushes are world brushes).
     entDoc.ents.erase(std::remove_if(entDoc.ents.begin(), entDoc.ents.end(),
                                      [](const Entity& e) { return e.classname() == "fx_origin" || e.classname() == "iw4r_terrain"; }),
@@ -2799,6 +3024,11 @@ bool compileMapToFastfile(const Document& doc, const std::string& mapName,
             if (e.classname() == "misc_model")
                 if (const std::string* mdl = e.find("model"); mdl && custom.count(matdef::key(*mdl))) e.set("classname", "script_model");
     }
+    // brush triggers (trigger_multiple...): "?N" trigger models in the entity lump
+    clip::buildTriggers(entDoc, cm, options.warnings);
+    if (!cm.triggerModels.empty() && options.warnings)
+        options.warnings->push_back("triggers: " + std::to_string(cm.triggerModels.size()) + " brush trigger(s), " +
+                                    std::to_string(cm.triggerHulls.size()) + " hull(s)");
     if (gw.skyMaterial >= 0) customSkyImage(options.zoneSourceDir, gw.skyImage, gw.customSky, options.warnings);
     ZoneAsset clipMap = buildClipMap(bsp, cm, documentToEntityString(entDoc), shared, sp);
     if (sp) clipMap.type = IW4_CLIPMAP_SP;

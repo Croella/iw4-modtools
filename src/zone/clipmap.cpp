@@ -361,4 +361,82 @@ bool buildClipMapData(const Document& doc, ClipMapData& out, std::string& error,
     return true;
 }
 
+bool isBrushTriggerClass(const std::string& classname) {
+    return classname.rfind("trigger_", 0) == 0 || classname == "info_volume";
+}
+
+int addTriggerModel(ClipMapData& out, const std::vector<::Brush>& brushes, const Vec3& origin) {
+    TriggerModel m;
+    m.contents = kTriggerContents;
+    m.firstHull = static_cast<uint16_t>(out.triggerHulls.size());
+    for (const ::Brush& b : brushes) {
+        double mn[3] = {1e30, 1e30, 1e30}, mx[3] = {-1e30, -1e30, -1e30};
+        size_t verts = 0;
+        for (const Face& f : b.faces)
+            for (const Vec3& v : f.winding)
+                for (int k = 0; k < 3; k++, verts++) mn[k] = std::min(mn[k], v[k]), mx[k] = std::max(mx[k], v[k]);
+        if (!verts) continue;
+        TriggerHull h;
+        h.contents = kTriggerContents;
+        for (int k = 0; k < 3; k++) {
+            h.bounds.midPoint[k] = static_cast<float>((mn[k] + mx[k]) * 0.5 - origin[k]);
+            h.bounds.halfSize[k] = static_cast<float>((mx[k] - mn[k]) * 0.5);
+        }
+        h.firstSlab = static_cast<uint16_t>(out.triggerSlabs.size());
+        std::vector<Vec3> dirs;
+        for (const Face& f : b.faces) {
+            if (f.winding.size() < 3 || axialIndex(f.normal) >= 0) continue;
+            bool dup = false;
+            for (const Vec3& d : dirs) dup |= std::fabs(std::fabs(dot(d, f.normal)) - 1.0) < 1e-6;
+            if (dup) continue;
+            dirs.push_back(f.normal);
+            double lo = 1e30, hi = -1e30;
+            for (const Face& g : b.faces)
+                for (const Vec3& v : g.winding) {
+                    const double t = dot(v - origin, f.normal);
+                    lo = std::min(lo, t), hi = std::max(hi, t);
+                }
+            TriggerSlab sl{};
+            for (int k = 0; k < 3; k++) sl.dir[k] = static_cast<float>(f.normal[k]);
+            sl.midPoint = static_cast<float>((lo + hi) * 0.5);
+            sl.halfSize = static_cast<float>((hi - lo) * 0.5);
+            out.triggerSlabs.push_back(sl);
+            h.slabCount++;
+        }
+        out.triggerHulls.push_back(h);
+        m.hullCount++;
+    }
+    out.triggerModels.push_back(m);
+    return static_cast<int>(out.triggerModels.size()) - 1;
+}
+
+void buildTriggers(Document& doc, ClipMapData& out, std::vector<std::string>* warnings) {
+    int others = 0;
+    for (size_t i = 1; i < doc.ents.size(); i++) {
+        Entity& e = doc.ents[i];
+        if (e.brushes.empty()) continue;
+        const std::string cls = e.classname();
+        if (!isBrushTriggerClass(cls)) {
+            others++;
+            continue;
+        }
+        AABB all;
+        for (const ::Brush& b : e.brushes)
+            for (const Face& f : b.faces)
+                for (const Vec3& v : f.winding) all.add(v);
+        if (!all.valid()) continue;
+        Vec3 origin;
+        if (!e.origin(origin)) {
+            origin = all.center();
+            for (int k = 0; k < 3; k++) origin[k] = std::round(origin[k]);
+            e.setOrigin(origin);
+        }
+        const int n = addTriggerModel(out, e.brushes, origin);
+        e.set("model", "?" + std::to_string(n));
+    }
+    if (others && warnings)
+        warnings->push_back(std::to_string(others) +
+                            " brush entit(ies) other than triggers (script_brushmodel...) aren't compiled yet: left out of collision and rendering");
+}
+
 }  // namespace clip

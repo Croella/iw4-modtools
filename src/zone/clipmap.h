@@ -102,7 +102,29 @@ struct CModel {
     Leaf leaf;
 };
 
+// Brush triggers (MapEnts.trigger, from stock boneyard/favela): a trigger entity's "model" is
+// "?N" = triggerModels[N] (separate from the "*N" cmodels); one hull per brush with its AABB, and a
+// slab per non-axial face direction (the brush's extent along it, parallel faces sharing one), all
+// relative to the entity's origin. Contents 0x28000001 (the common stock value).
+struct TriggerSlab {
+    float dir[3];
+    float midPoint, halfSize;
+};
+struct TriggerHull {
+    Bounds bounds{};
+    uint32_t contents = 0;
+    uint16_t slabCount = 0, firstSlab = 0;
+};
+struct TriggerModel {
+    uint32_t contents = 0;
+    uint16_t hullCount = 0, firstHull = 0;
+};
+inline constexpr uint32_t kTriggerContents = 0x28000001;
+
 struct ClipMapData {
+    std::vector<TriggerModel> triggerModels;
+    std::vector<TriggerHull> triggerHulls;
+    std::vector<TriggerSlab> triggerSlabs;
     std::vector<Plane> planes;
     std::vector<Material> materials;
     std::vector<Side> sides;
@@ -124,5 +146,14 @@ uint32_t contentsForMaterial(const std::string& name);
 // as atmos_particles_dust, which stock maps use as nonsolid sheets/volumes).
 bool buildClipMapData(const Document& doc, ClipMapData& out, std::string& error,
                       const std::set<std::string>* nonSolid = nullptr);
+
+// True for brush entity classes the game links as brush triggers ("?N" models).
+bool isBrushTriggerClass(const std::string& classname);
+// Adds a trigger model for these brushes (relative to origin); returns its index.
+int addTriggerModel(ClipMapData& out, const std::vector<::Brush>& brushes, const Vec3& origin);
+// Every brush trigger entity in doc (isBrushTriggerClass, with brushes) gets a trigger model:
+// "model" "?N", and an "origin" (its brushes' centre) when it has none. Other brush entities
+// (script_brushmodel...) aren't compiled yet: warned about.
+void buildTriggers(Document& doc, ClipMapData& out, std::vector<std::string>* warnings);
 
 }  // namespace clip

@@ -434,6 +434,49 @@ int fxProbe(int argc, char** argv) {
     Fastfile zf;
     std::string err;
     if (!readFastfile(bytes, zf, err)) { std::printf("%s\n", err.c_str()); return 1; }
+    if (argc >= 2 && std::string(argv[1]) == "--loops") {
+        // Raw scan for looping FxElemDefs (the sim stops early in most stock zones): the spawn
+        // count at +8 of each element, after a plausible interval at +4 and life span at +48.
+        std::map<int32_t, int> counts;
+        const std::vector<uint8_t>& z = zf.zone;
+        auto rd = [&](size_t o) { int32_t v; std::memcpy(&v, z.data() + o, 4); return v; };
+        for (size_t o = 0; o + 288 <= z.size(); o += 4) {
+            const int32_t flags = rd(o), interval = rd(o + 4), count = rd(o + 8), life = rd(o + 48);
+            if (interval < 10 || interval > 20000 || life < 50 || life > 60000) continue;
+            float cull, rangeLo;
+            std::memcpy(&rangeLo, z.data() + o + 12, 4);
+            std::memcpy(&cull, z.data() + o + 36, 4);
+            if (!(cull >= 0 && cull < 100000) || !(rangeLo >= 0 && rangeLo < 100000)) continue;
+            if ((static_cast<uint32_t>(flags) & 0xFF000000u) == 0 || (static_cast<uint32_t>(flags) >> 28) > 7) continue;
+            if (count == 0x7FFFFFFF || count == 0 || (count > 0 && count < 1000)) counts[count]++;
+        }
+        (void)counts;
+        // Exact: an inline FxEffectDef is 40 bytes (name -1, flags, totalSize, msecLoopingLife,
+        // looping/oneShot/emission counts, elemDefs -1), then its name, then its elemDefs (288 each).
+        int shown = 0;
+        for (size_t o = 0; o + 48 <= z.size() && shown < 40; o += 1) {
+            uint64_t np, ep;
+            std::memcpy(&np, z.data() + o, 8);
+            std::memcpy(&ep, z.data() + o + 32, 8);
+            if (np != ~0ull || ep != ~0ull) continue;
+            const int32_t loop = rd(o + 20), one = rd(o + 24), emis = rd(o + 28);
+            if (loop <= 0 || loop > 32 || one < 0 || one > 64 || emis < 0 || emis > 64) continue;
+            const char* nm = reinterpret_cast<const char*>(z.data() + o + 40);
+            size_t len = strnlen(nm, 128);
+            if (len < 4 || len >= 128 || std::memchr(nm, '/', len) == nullptr) continue;
+            bool ok = true;
+            for (size_t k = 0; k < len; k++) ok &= nm[k] >= 0x20 && nm[k] < 0x7f;
+            if (!ok) continue;
+            const size_t elems = o + 40 + len + 1;  // align 4
+            const size_t e0 = (elems + 3) & ~size_t(3);
+            std::printf("%-44s msecLoopingLife %d looping %d:", nm, rd(o + 16), loop);
+            for (int k = 0; k < loop && e0 + 288 * (k + 1) <= z.size(); k++)
+                std::printf(" [interval %d count %d]", rd(e0 + 288 * k + 4), rd(e0 + 288 * k + 8));
+            std::printf("\n");
+            shown++;
+        }
+        return 0;
+    }
     zone::SimulatedZone sim;
     size_t loaded = 0;
     std::string stopped;

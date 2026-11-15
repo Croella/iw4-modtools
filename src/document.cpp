@@ -73,6 +73,13 @@ AABB pointEntityBounds(const Entity& e) {
         mn = c->mins;
         mx = c->maxs;
     }
+    if (e.classname() == "trigger_radius") {  // the game's volume: a cylinder of radius/height up from the origin
+        const std::string* r = e.find("radius");
+        const std::string* h = e.find("height");
+        const double rad = r ? std::max(1.0, std::atof(r->c_str())) : 64, ht = h ? std::max(1.0, std::atof(h->c_str())) : 128;
+        mn = {-rad, -rad, 0};
+        mx = {rad, rad, ht};
+    }
     AABB b;
     b.add(o + mn);
     b.add(o + mx);

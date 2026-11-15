@@ -1,12 +1,15 @@
 """Generates the zone_source animation demo: a 4-bone skinned column (demo_tail.xmodel_export)
-and a looping sway (demo_tail_loop.xanim_export), written next to maps/modeltest.map.
+and a looping sway (demo_tail_loop.xanim_export), written into a map's zone_source
+(maps/<map>/zone_source; default zm_test).
 
-    python tools/demo_tail.py
+    python tools/demo_tail.py [map]
 """
 import math
 import os
+import sys
 
-ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'maps', 'zone_source')
+ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'maps', sys.argv[1] if len(sys.argv) > 1 else 'zm_test',
+                    'zone_source')
 SEG = 24.0    # bone spacing
 HALF = 8.0    # column half width
 NSEG = 4

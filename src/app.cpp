@@ -42,10 +42,11 @@ constexpr char kMapFilter[] = "IW map (*.map)\0*.map\0All files\0*.*\0";
 constexpr char kFastfileFilter[] = "Fastfile (*.ff)\0*.ff\0All files\0*.*\0";
 
 std::string fileDialog(HWND owner, bool saving, const std::string& current, const char* filter = kMapFilter,
-                       const char* defExt = "map", const char* title = nullptr) {
+                       const char* defExt = "map", const char* title = nullptr, const std::string& initialDir = "") {
     char file[MAX_PATH] = "";
     if (!current.empty()) strncpy_s(file, current.c_str(), _TRUNCATE);
     OPENFILENAMEA ofn{};
+    if (current.empty() && !initialDir.empty()) ofn.lpstrInitialDir = initialDir.c_str();
     ofn.lStructSize = sizeof ofn;
     ofn.hwndOwner = owner;
     ofn.lpstrFilter = filter;
@@ -63,6 +64,35 @@ std::string exeDir() {
     char buf[MAX_PATH] = "";
     GetModuleFileNameA(nullptr, buf, MAX_PATH);
     return std::filesystem::path(buf).parent_path().string();
+}
+
+// Map layout: maps/<map>/<map>.map, with its <map>.gsc, zone_source/ and compiled .ff beside it.
+// The maps folder: the current map's (maps/<map>/<map>.map -> maps), else a "maps" folder at or
+// above the exe (the repo's maps/ for build/Release), else "" (the dialog's own default).
+std::string mapsRoot(const std::string& mapPath) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (!mapPath.empty()) {
+        const fs::path dir = fs::path(mapPath).parent_path();
+        if (dir.filename() == fs::path(mapPath).stem()) return dir.parent_path().string();
+        return dir.string();
+    }
+    for (fs::path p = exeDir(); !p.empty(); p = p.parent_path()) {
+        if (fs::is_directory(p / "maps", ec)) return (p / "maps").string();
+        if (p == p.parent_path()) break;
+    }
+    return "";
+}
+
+// A map saved straight into a folder named "maps" goes into its own folder: maps/foo.map ->
+// maps/foo/foo.map.
+std::string mapFolderPath(const std::string& chosen) {
+    namespace fs = std::filesystem;
+    const fs::path p(chosen);
+    std::string parent = p.parent_path().filename().string();
+    for (char& c : parent) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (parent != "maps" || p.stem().empty()) return chosen;
+    return (p.parent_path() / p.stem() / p.filename()).string();
 }
 
 // Loads dllPath into the target process (CreateRemoteThread -> LoadLibraryA). The editor and the
@@ -184,6 +214,7 @@ void App::pollBake() {
                   bakeResult->faces.size(), bakeResult->width, bakeResult->height, bakeResult->luxelSize,
                   bakeResult->env.hasSun ? "" : " (no sun)");
     log(line);
+    startFxPreview("after the bake");
 }
 
 // Effect materials (additive falloff sheets) in the map: the baker lets light through them.
@@ -445,14 +476,32 @@ bool App::openMap(const std::string& path) {
 
 void App::openDialog() {
     if (!confirmDiscard()) return;
-    std::string p = fileDialog(hwnd, false, doc.path);
+    std::string p = fileDialog(hwnd, false, doc.path, kMapFilter, "map", nullptr, mapsRoot(""));
     if (!p.empty()) openMap(p);
 }
 
 void App::save(bool forceDialog) {
+    namespace fs = std::filesystem;
     std::string path = doc.path;
-    if (forceDialog || path.empty()) path = fileDialog(hwnd, true, path);
+    if (forceDialog || path.empty()) {
+        path = fileDialog(hwnd, true, path, kMapFilter, "map", nullptr, mapsRoot(doc.path));
+        if (path.empty()) return;
+        path = mapFolderPath(path);  // maps/foo.map -> maps/foo/foo.map
+    }
     if (path.empty()) return;
+    std::error_code ec;
+    fs::create_directories(fs::path(path).parent_path(), ec);
+    // Save As into a new folder: the map's custom assets and script come along.
+    if (!doc.path.empty() && fs::path(doc.path).parent_path() != fs::path(path).parent_path()) {
+        const fs::path oldZs = zoneSourcePath(doc.path), newZs = zoneSourcePath(path);
+        if (fs::is_directory(oldZs, ec) && !fs::exists(newZs, ec)) {
+            fs::copy(oldZs, newZs, fs::copy_options::recursive, ec);
+            log(ec ? "  couldn't copy zone_source: " + ec.message() : "  copied zone_source to " + newZs.string());
+        }
+        const fs::path oldGsc = mapScriptPath(doc.path), newGsc = mapScriptPath(path);
+        if (fs::exists(oldGsc, ec) && !fs::exists(newGsc, ec) && fs::copy_file(oldGsc, newGsc, ec))
+            log("  copied the map script to " + newGsc.string());
+    }
     std::string err;
     if (saveMap(path, doc, err)) {
         doc.path = path;
@@ -643,7 +692,68 @@ bool App::compileCurrentMap(const std::string& mapName, MapTarget target, std::v
         err = "loader check failed: " + err;
         return false;
     }
+    startFxPreview("after the compile");
     return true;
+}
+
+// Loads zone_source/fx and the effect materials (textures handed to the renderer), places an emitter
+// on every fx_origin, and pre-runs a few seconds so the preview starts populated.
+void App::startFxPreview(const char* why) {
+    if (doc.path.empty()) return;
+    const std::string zs = zoneSourcePath(doc.path);
+    bool anyFx = false;
+    for (const Entity& e : doc.ents) anyFx |= e.classname() == "fx_origin";
+    if (!anyFx && !showEffects) return;
+    FxPreviewMaterials mats(zs, gameInput, cacheDir);
+    auto lookup = [&](const std::string& name) {
+        fxpreview::MaterialInfo mi;
+        const FxPreviewMaterial& m = mats.get(name);
+        mi.found = m.found;
+        mi.additive = m.additive;
+        mi.rows = std::max(1, m.rows);
+        mi.cols = std::max(1, m.cols);
+        if (m.found && !m.pixels.empty() && m.width > 0 && m.height > 0) {
+            IwiImage img;
+            IwiLevel lvl;
+            lvl.width = m.width;
+            lvl.height = m.height;
+            if (m.format == 0x31545844u) img.format = IwiFormat::Dxt1, lvl.rowPitch = std::max(1, (m.width + 3) / 4) * 8;
+            else if (m.format == 0x33545844u) img.format = IwiFormat::Dxt3, lvl.rowPitch = std::max(1, (m.width + 3) / 4) * 16;
+            else if (m.format == 0x35545844u) img.format = IwiFormat::Dxt5, lvl.rowPitch = std::max(1, (m.width + 3) / 4) * 16;
+            else img.format = IwiFormat::Rgba, lvl.rowPitch = m.width * 4;
+            lvl.data = m.pixels;
+            img.levels.push_back(std::move(lvl));
+            renderer.setTextureImage(name, img);
+        }
+        return mi;
+    };
+    std::vector<std::string> warnings;
+    fxPreview.load(zs, lookup, warnings);
+    for (const std::string& w : warnings) log("  " + w);
+    fxPreview.sync(doc);
+    fxRevision = doc.revision;
+    fxPreview.warmup(8.0);  // long enough for most effects to reach a steady state
+    showEffects = true;
+    std::string line = "Effects preview " + std::string(why) + ": " + std::to_string(fxPreview.emitterCount()) + " fx_origin(s) playing, " +
+                       std::to_string(fxPreview.effectCount()) + " effect(s) in zone_source/fx (View > Effects Preview)";
+    log(line);
+    for (const std::string& m : fxPreview.missing()) log("  fx_origin effect not in zone_source/fx: " + m);
+}
+
+void App::updateFxPreview() {
+    if (!showEffects || !fxPreview.loaded()) {
+        renderer.setSprites({});
+        return;
+    }
+    if (fxRevision != doc.revision) {
+        fxPreview.sync(doc);  // moved / added / removed fx_origins
+        fxRevision = doc.revision;
+    }
+    fxPreview.setViewer(camera.pos);  // the camera walks into trigger_radius volumes like a player
+    fxPreview.update(ImGui::GetIO().DeltaTime);
+    std::vector<fxpreview::Sprite> sprites;
+    fxPreview.sprites(camera.pos, camera.forward(), camera.right(), camera.up(), sprites);
+    renderer.setSprites(std::move(sprites));
 }
 
 void App::loadLaunchConfig() {
@@ -1098,6 +1208,7 @@ void App::frame() {
     }
     renderer.pumpTextures(8);
     pollBake();
+    updateFxPreview();
     refreshMaterials();
     handleShortcuts();
     drawMenu();
@@ -1204,6 +1315,31 @@ void App::drawMenu() {
         if (ImGui::MenuItem("Cancel Bake", nullptr, false, running)) bakeProgress.cancel = true;
         if (ImGui::MenuItem("Show Lighting", nullptr, &renderer.showLighting, renderer.hasLighting())) meshRevision = 0;
         ImGui::MenuItem("Show Volumetrics (shafts, fog)", nullptr, &renderer.showVolumetrics, renderer.hasLighting());
+        if (ImGui::MenuItem("Effects Preview", nullptr, showEffects)) {
+            showEffects = !showEffects;
+            if (showEffects) startFxPreview("turned on");
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Plays the fx_origin effects (zone_source/fx) in the 3D view.\nStarts by itself after a bake (F9) or a compile.");
+        if (ImGui::MenuItem("Reload Effects", nullptr, false, showEffects)) startFxPreview("reloaded");
+        {
+            const std::set<std::string> groups = showEffects ? fxPreview.groups() : std::set<std::string>{};
+            if (ImGui::BeginMenu("Effect Groups", !groups.empty())) {
+                // fx_origins with a targetname: what level notify("<name>") / ("<name>_stop") do in game
+                for (const std::string& g : groups) {
+                    ImGui::PushID(g.c_str());
+                    ImGui::TextUnformatted(g.c_str());
+                    ImGui::SameLine(160);
+                    if (ImGui::SmallButton("Start")) fxPreview.startGroup(g);
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Stop")) fxPreview.stopGroup(g);
+                    ImGui::PopID();
+                }
+                ImGui::EndMenu();
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("fx_origins with a targetname. They also start when the camera enters a\ntrigger_radius whose target is the name.");
+        }
         if (ImGui::MenuItem("Add Light at Camera")) addLightAtCamera();
         ImGui::Separator();
         float lux = static_cast<float>(lightSettings.luxelSize);

@@ -10,6 +10,7 @@
 #include "document.h"
 #include "live/liveimport.h"
 #include "light/lightbake.h"
+#include "fxpreview.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -44,6 +45,10 @@ public:
     void clearTextures();
     // A texture loaded from an image file (png/tga) for a material name, e.g. a zone_source model's.
     void setTextureFile(const std::string& material, const std::string& path);
+    // A texture given directly (e.g. an effect material's image), replacing any loaded one.
+    void setTextureImage(const std::string& material, const IwiImage& image);
+    // Effect preview sprites drawn this frame (fxpreview.h): depth-tested, sorted back to front.
+    void setSprites(std::vector<fxpreview::Sprite> s) { sprites = std::move(s); }
 
     // A square preview of a model (textured, the editor's default shading, framed on its bounds
     // from the front-left at `yawDeg`), cached per key. Re-rendered when the yaw changes (hover
@@ -130,6 +135,11 @@ private:
     UINT triCapacity = 0, lineCapacity = 0, lineCount = 0;
     UINT occFirst = 0, occCount = 0;  // player clip faces in triBuffer: invisible sun occluders for the volumetric preview
     std::vector<Batch> batches;
+    std::vector<fxpreview::Sprite> sprites;
+    ComPtr<ID3D11Buffer> spriteBuffer;
+    UINT spriteCapacity = 0;
+    ComPtr<ID3D11BlendState> blendSpriteAdd, blendSpriteBlend;
+    void drawSprites(void* constants);  // the frame's Constants (renderer.cpp)
 
     struct Thumb {
         ComPtr<ID3D11Texture2D> tex;

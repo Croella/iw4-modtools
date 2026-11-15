@@ -169,13 +169,52 @@ struct ZoneSourceEffects {
 };
 ZoneSourceEffects loadZoneSourceEffects(const std::string& zoneSourceDir, const std::string& gameDir, const std::string& cacheDir,
                                         MapTarget target, std::vector<std::string>& warnings);
-// fx_origin entities ("fx" effect name, "angles", "delay" seconds) -> the generated map fx script.
+// The editor's effect preview: a sprite material's blend mode, atlas and texture, found the way the
+// compiler finds it (zone_source, then the game's common zone by name, then Black Ops). `stock`:
+// only the game has it (no pixels here; the editor loads its image from the game like any material).
+struct FxPreviewMaterial {
+    bool found = false, stock = false, additive = true;
+    int rows = 1, cols = 1, width = 0, height = 0;
+    uint32_t format = 0;          // D3DFORMAT: A8R8G8B8 (BGRA bytes) or DXT1/3/5 FourCC
+    std::vector<uint8_t> pixels;  // top level only
+};
+class FxPreviewMaterials {
+public:
+    FxPreviewMaterials(const std::string& zoneSourceDir, const std::string& gameDir, const std::string& cacheDir);
+    ~FxPreviewMaterials();
+    const FxPreviewMaterial& get(const std::string& name);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+// fx_origin entities -> the generated map fx script. Keys: "fx" effect name, "angles", "delay"
+// (one-shot effects: repeat every `delay` seconds, 0 = play once), and for dynamic effects:
+//   targetname  names the effect's group: `level notify("<name>")` starts it, `level notify("<name>_stop")`
+//               stops it (from any script, or from triggers below)
+//   (triggers)  a trigger_radius or brush trigger (trigger_multiple...) with "target" = the name
+//               starts the group when a player walks in
+//               (each entry starts it once); with script_noteworthy "stop" it stops the group instead.
+//               A targeted fx_origin, or one with "start_off" "1", waits for its first start.
+//   duration    seconds it runs once started, then stops by itself (0 = until stopped)
+//   once        "1": can only be started one time
 struct FxPlacement {
     std::string effect;
     float origin[3], forward[3], up[3];
     float delay;
+    bool looping = true;   // the effect has looping elements (spawnfx) vs one-shot (playfx)
+    std::string name;      // targetname ("" = not controllable)
+    bool waitStart = false;  // targeted or start_off: wait for the first start
+    float duration = 0;
+    bool once = false;
+    std::vector<std::string> triggers;  // classnames of what targets the group (the script finds them by "target")
 };
 std::string fxPlacementScript(const std::vector<FxPlacement>& fx);
+// Reads the fx_origin entities of a map into placements (see FxPlacement): `looping` says which
+// effects have looping elements (one-shot ones default to delay 2 unless dynamic). Also gives
+// trigger_radius entities that target an fx group a radius/height when they have none. Brush
+// triggers (trigger_multiple... with brushes) work too.
+std::vector<FxPlacement> fxPlacements(Document& doc, const std::map<std::string, bool>& looping, std::vector<std::string>* warnings);
 std::string injectIntoMain(const std::string& script, const std::string& call);
 // Loads every zone_source/xmodels/*.xmodel_export (warnings for skipped ones).
 // hints: per-model build options by asset name (from loadZoneSourceWeapons).

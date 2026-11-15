@@ -39,6 +39,7 @@ add_library(iw4r_core STATIC
   src/brush.cpp
   src/brushshapes.cpp
   src/terrain.cpp
+  src/fxpreview.cpp
   src/document.cpp
   src/mapio.cpp
   src/iwi.cpp

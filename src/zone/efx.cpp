@@ -354,7 +354,9 @@ bool compile(const Effect& fx, const std::string& name, const MaterialLookup& ma
         if (e.editorFlags.count("looping")) {
             const int interval = static_cast<int>(e.num("spawnLooping", 0, 200)), count = static_cast<int>(e.num("spawnLooping", 1, 0));
             putI(d + 4, interval);
-            putI(d + 8, count);
+            // count 0 in the .efx = forever, which the game stores as INT_MAX (stock
+            // fire/propane_small_fire, fire/firelp_med_pm...): a 0 count spawns nothing more
+            putI(d + 8, count <= 0 ? 0x7FFFFFFF : count);
             if (count <= 0)
                 infiniteLoop = true;
             else
@@ -601,7 +603,7 @@ bool compile(const Effect& fx, const std::string& name, const MaterialLookup& ma
         return false;
     }
     out.flags = needsLighting ? 1 : 0;
-    out.msecLoopingLife = infiniteLoop ? 0 : loopLife;
+    out.msecLoopingLife = infiniteLoop ? 0x7FFFFFFF : loopLife;  // stock: INT_MAX for effects that loop forever
     out.totalSize = static_cast<int32_t>(40 + 288 * out.elems.size() + name.size() + 1 + samplesBytes + visualBytes);
     return true;
 }
