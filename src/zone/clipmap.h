@@ -42,6 +42,7 @@ struct Material {
     std::string name;
     uint32_t surfaceFlags = 0;
     uint32_t contents = 0;
+    int surfaceType = -1;  // a brush's surface type override (surfaceTypeNames index), -1 = the material's
 };
 
 struct Side {

@@ -2,7 +2,7 @@
 enabled 1
 sun 0.568164 0.653598 0.500000
 color 0.6200 0.7200 1.0000
-intensity .85
+intensity 0.45
 density 0.9
 decay 0.97
 threshold 0.12

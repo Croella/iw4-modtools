@@ -9,6 +9,8 @@
 #include "gfxworld.h"
 #include "document.h"
 #include "zonewriter.h"
+#include "pathnodes.h"
+#include <array>
 #include "light/lightbake.h"
 #include "zone/skysource.h"
 #include "zone/matdefs.h"
@@ -42,6 +44,8 @@ enum IW4AssetType : uint32_t {
     IW4_XMODEL = 0x04,
     IW4_XANIMPARTS = 0x02,
     IW4_WEAPON = 0x1C,
+    IW4_MATERIAL = 0x05,
+    IW4_FX = 0x1E,
 };
 
 struct ZoneAsset {
@@ -58,12 +62,14 @@ std::string documentToEntityString(const Document& doc);
 
 // Individual asset builders (exposed for testing).
 ZoneAsset buildMapEnts(const std::string& name, const std::string& entityString);
+ZoneAsset buildAddonMapEnts(const std::string& name, const std::string& entityString);
 // withSun: primary lights {0: empty, 1: sun}, matching GfxWorld's primaryLightCount 2.
 // env: the baked map's sun (direction + linear colour) for primary light 1; nullptr = default.
 ZoneAsset buildComWorld(const std::string& name, bool withSun = false, const light::Environment* env = nullptr);
 ZoneAsset buildGameWorldMp(const std::string& name);
-// Singleplayer game world: no pathnodes, vehicle tracks or glass (every pointer null).
-ZoneAsset buildGameWorldSp(const std::string& name);
+// Singleplayer game world: path nodes (zone/pathnodes), no vehicle tracks or glass.
+ZoneAsset buildGameWorldSp(const std::string& name, std::shared_ptr<const pathnodes::Graph> path = nullptr,
+                           std::vector<std::array<uint16_t, 4>> nodeStrings = {});
 ZoneAsset buildFxWorld(const std::string& name);
 
 // State shared between world assets written into the same zone (in load order).
@@ -120,8 +126,9 @@ struct CompileOptions {
     // load with the map. The game loads add-on zones for levels named so_<mission>_<base>
     // (world = <base>.ff, add-on = so_<mission>_<base>.ff; Com_GetBspFilename / iw4sp+0x25e650),
     // so with addonLevel set (weaponPackLevel(mapName)), the zone also gets that level's script
-    // maps/<addonLevel>.gsc and an empty add-on entity lump maps/<addonLevel>.mapents; the stock
-    // pack is then deployed as <addonLevel>.ff (deployWeaponPack) and played with devmap <addonLevel>.
+    // maps/<addonLevel>.gsc; the stock pack is then deployed as <addonLevel>.ff (deployWeaponPack,
+    // which renames its add-on entity lump to maps/<addonLevel>.mapents) and played with
+    // devmap <addonLevel>.
     std::string addonLevel;
     // Custom content: <map folder>/zone_source. zone_source/xmodels/*.xmodel_export compile into
     // XModels (asset name = file stem), textures come from zone_source/images (png/tga, embedded)
@@ -141,12 +148,35 @@ struct WeaponPack {
 const std::vector<WeaponPack>& weaponPacks();
 // The level name that loads <mapName>.ff plus the pack: "so_w_<mapName>".
 std::string weaponPackLevel(const std::string& mapName);
-// Copies <gameDir>/zone/english/<pack>.ff to <deployDir>/<weaponPackLevel(mapName)>.ff.
+// Copies <gameDir>/zone/english/<pack>.ff to <deployDir>/<weaponPackLevel(mapName)>.ff, with its
+// add-on entity lump renamed to the new level's and emptied (retargetAddonMapEnts).
+bool retargetAddonMapEnts(std::vector<uint8_t>& zone, const std::string& oldName, const std::string& newName,
+                          std::string& error);
 bool deployWeaponPack(const std::string& gameDir, const std::string& deployDir, const std::string& pack,
                       const std::string& mapName, std::string& error);
 
 // zone_source next to a .map.
 std::string zoneSourcePath(const std::string& mapPath);
+
+// zone_source/fx/**/*.efx (IW EffectsEd text, see zone/efx.h) -> FxEffectDef assets named by their
+// path under fx/ without the extension ("fx/muzzleflashes/my_flash.efx" -> "muzzleflashes/my_flash"),
+// preceded by the sprite materials they need from zone_source (zone_source/images/<material>.png,
+// optional settings in zone_source/fx/materials/<material>.txt). Materials not in zone_source are
+// by-name references (common.ff's resolve; their atlas sizes are read from the game's common zone).
+struct ZoneSourceEffects {
+    std::vector<ZoneAsset> assets;
+    std::map<std::string, bool> looping;  // effect -> has looping elements
+};
+ZoneSourceEffects loadZoneSourceEffects(const std::string& zoneSourceDir, const std::string& gameDir, const std::string& cacheDir,
+                                        MapTarget target, std::vector<std::string>& warnings);
+// fx_origin entities ("fx" effect name, "angles", "delay" seconds) -> the generated map fx script.
+struct FxPlacement {
+    std::string effect;
+    float origin[3], forward[3], up[3];
+    float delay;
+};
+std::string fxPlacementScript(const std::vector<FxPlacement>& fx);
+std::string injectIntoMain(const std::string& script, const std::string& call);
 // Loads every zone_source/xmodels/*.xmodel_export (warnings for skipped ones).
 // hints: per-model build options by asset name (from loadZoneSourceWeapons).
 std::vector<modelbuild::Model> loadZoneSourceModels(const std::string& zoneSourceDir, std::vector<std::string>& warnings,

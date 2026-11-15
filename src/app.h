@@ -10,6 +10,8 @@
 #include <vector>
 #include "assets.h"
 #include "document.h"
+#include "brushshapes.h"
+#include "terrain.h"
 #include "renderer.h"
 #include "zone/zonebuild.h"
 #include "light/lightbake.h"
@@ -27,6 +29,7 @@ public:
     void init(ID3D11Device* device, ID3D11DeviceContext* context, const std::string& gamePath);
     void shutdown();
     void frame();  // builds the UI for one frame
+    std::string focusWindow;  // --focus: window/tab brought to the front once the layout exists
 
     bool confirmDiscard();  // asks about unsaved changes; false means cancel
     bool openMap(const std::string& path);
@@ -47,6 +50,7 @@ public:
         ImVec2 pos, size;
     };
     ImVec2 gridToScreen(int view, double u, double v) const;
+    friend class UiTest;  // the scripted UI test reads tool state (pen points, ...)
     ViewRect cameraRect;
     ImVec2 thumbCenters[2];
     FlyCamera camera;
@@ -67,6 +71,38 @@ private:
     void drawCamera();
     void drawInspector();
     void drawTextures();
+    void drawModelBrowser();  // "Models": zone_source xmodels as thumbnails; click/drag to place
+    void drawToolbar();       // the button bar under the menu: converters + shaped brushes
+    void convertTgaToPng();   // zone_source/**/*.tga -> .png next to them
+    void convertSkeletons();  // zone_source/xmodels: BO1 / CoD4 skeletons -> IW4 (skeleton::convertForIw4)
+    void addShape(int shape); // shapes::Shape, fitted to the selected brushes (replacing them) or at the camera
+    shapes::Params shapeParams;
+    // Pen tool: click points in a grid view; Enter / clicking the first point extrudes the outline
+    // through the work area's depth (convex pieces, see shapes::fromOutline).
+    // Terrain (terrain.h): the Terrain panel, sculpting in the camera / top view while terrainSculpt.
+    void drawTerrainPanel();
+    int activeTerrain();
+    void drawTerrainPaint(int te, terrain::Field& f);  // the "Paint by slope" section                         // entity index of the terrain being edited, or -1
+    bool terrainRayHit(const Vec3& dir, double& x, double& y);  // camera ray vs the active terrain
+    void terrainStrokeAt(double x, double y);    // one sculpt step (starts a stroke on the first)
+    void endTerrainStroke();
+    bool terrainSculpt = false, terrainStroking = false;
+    int terrainEnt = -1;
+    terrain::Field terrainField;                 // the active field during a stroke
+    terrain::Stroke terrainBrush;
+    int terrainNew[2] = {32, 32};
+    float terrainCell = 64, terrainDepth = 64, terrainMountain = 768;
+    int terrainOctaves = 5;
+    unsigned terrainSeed = 1;
+    double terrainCursor[2] = {0, 0};
+    bool terrainCursorValid = false;
+    bool penActive = false;
+    int penView = -1;
+    std::vector<shapes::Point2> penPoints;
+    void finishPen();
+    bool deleteTgaAfterConvert = false;
+    void placeModel(const std::string& model, const Vec3& at);
+    bool cameraRayHit(const Vec3& dir, Vec3& hit);  // nearest brush along a camera ray
     void drawConsole();
     void drawSettings();
     void handleShortcuts();
@@ -116,6 +152,17 @@ private:
     std::string lastCompilePath, lastDumpPath, lastImportPath;
     std::string deployDir;  // where "Compile & Run" copies mp_<name>.ff (the game's custom-zone folder)
     live::LiveModelLibrary liveModels;  // XModels read from the running game, drawn on their entities
+    // zone_source models for the Models browser (filled by loadZoneSourcePreview).
+    struct BrowserModel {
+        std::string name;
+        size_t tris = 0, verts = 0, bones = 0, surfaces = 0;
+        Vec3 size;
+        std::vector<std::string> textures;
+    };
+    std::vector<BrowserModel> browserModels;
+    std::string currentModel;
+    char modelFilter[64] = "";
+    float modelThumbSize = 112;
 
     GridView views[3] = {{"Top (XY)", 0, 1, 2}, {"Front (XZ)", 0, 2, 1}, {"Side (YZ)", 1, 2, 0}};
     ViewRect gridRects[3];

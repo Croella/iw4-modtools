@@ -7,6 +7,7 @@
 #include <cstring>
 #include <map>
 #include <fstream>
+#include <iterator>
 #include <filesystem>
 #include <stdexcept>
 #include <miniz.h>
@@ -17,6 +18,12 @@
 #include "model/xanimexport.h"
 #include "zone/animbuild.h"
 #include "zone/weapondef.h"
+#include "zone/pathnodes.h"
+#include "zone/efx.h"
+#include "zone/bo1fx.h"
+#include "zone/zonesim.h"
+#include <sstream>
+#include <set>
 
 #include "iw4.h"
 
@@ -1183,11 +1190,60 @@ bool deployWeaponPack(const std::string& gameDir, const std::string& deployDir, 
         error = "weapon pack zone not found: " + src.string();
         return false;
     }
-    fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ec);
-    if (ec) {
-        error = "can't copy the weapon pack to " + dst.string() + ": " + ec.message();
+    std::vector<uint8_t> file;
+    {
+        std::ifstream in(src, std::ios::binary);
+        file.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    Fastfile ff;
+    if (!readFastfile(file, ff, error)) {
+        error = "can't read the weapon pack " + src.string() + ": " + error;
         return false;
     }
+    if (!retargetAddonMapEnts(ff.zone, "maps/" + pack + ".mapents", "maps/" + weaponPackLevel(mapName) + ".mapents", error))
+        return false;
+    std::vector<uint8_t> out;
+    if (!writeFastfile(ff, out, error)) return false;
+    std::ofstream o(dst, std::ios::binary);
+    o.write(reinterpret_cast<const char*>(out.data()), static_cast<std::streamsize>(out.size()));
+    if (!o) {
+        error = "can't write the weapon pack to " + dst.string();
+        return false;
+    }
+    return true;
+}
+
+// The add-on lump is AddonMapEnts (0x48: name -1, entityString -1, numEntityChars, triggers)
+// followed by the name and numEntityChars bytes of entity string, both align 1. Rewriting name +
+// string in the same number of bytes keeps every later offset in the zone valid; the stock
+// mission entities are dropped (blank padding), the trigger data after them is kept.
+bool retargetAddonMapEnts(std::vector<uint8_t>& zone, const std::string& oldName, const std::string& newName,
+                          std::string& error) {
+    const std::string key = oldName + std::string(1, '\0');
+    auto it = std::search(zone.begin(), zone.end(), key.begin(), key.end());
+    const size_t at = static_cast<size_t>(it - zone.begin());
+    const size_t head = 0x48;
+    if (it == zone.end() || at < head) {
+        error = "weapon pack has no add-on entity lump " + oldName;
+        return false;
+    }
+    uint64_t namePtr, entPtr;
+    int32_t chars;
+    std::memcpy(&namePtr, &zone[at - head], 8);
+    std::memcpy(&entPtr, &zone[at - head + 8], 8);
+    std::memcpy(&chars, &zone[at - head + 16], 4);
+    const size_t total = key.size() + static_cast<size_t>(chars);
+    if (namePtr != ~0ull || entPtr != ~0ull || chars < 1 || at + total > zone.size() || newName.size() + 2 > total) {
+        error = "weapon pack's add-on entity lump " + oldName + " isn't laid out as expected";
+        return false;
+    }
+    uint8_t* p = &zone[at];
+    std::memcpy(p, newName.c_str(), newName.size() + 1);
+    const size_t n = total - (newName.size() + 1);
+    std::memset(p + newName.size() + 1, '\n', n - 1);
+    p[total - 1] = 0;
+    const int32_t newChars = static_cast<int32_t>(n);
+    std::memcpy(&zone[at - head + 16], &newChars, 4);
     return true;
 }
 
@@ -1724,19 +1780,100 @@ ZoneAsset buildGameWorldMp(const std::string& name) {
 // g_glassData must NOT be null: SP's glass init (iw4sp+0x16ad40) reads ->pieceCount and memsets
 // ->glassPieces unconditionally (MP checks for null). So emit an empty one: Load_G_GlassData
 // (SP 0xdda40) = struct 0x90, align 4, then glassPieces (+0) and glassNames (+0x18) only if non-null.
-ZoneAsset buildGameWorldSp(const std::string& name) {
-    return {IW4_GAMEWORLD_SP, [name](ZoneWriter& w) {
+// Path data (Load_PathData MP 0x11e110, written in its order): nodes (align 4, 168 each; then
+// per node its links, align 4, 12 each), basenodes in RUNTIME (align 16, 16 each), the chain
+// arrays (none), pathVis (align 1), nodeTree (align 4, 24 each; then per leaf its node list,
+// align 2; children are back-references into the array). See zone/pathnodes.h for the format.
+ZoneAsset buildGameWorldSp(const std::string& name, std::shared_ptr<const pathnodes::Graph> path,
+                           std::vector<std::array<uint16_t, 4>> nodeStrings) {
+    return {IW4_GAMEWORLD_SP, [name, path, nodeStrings](ZoneWriter& w) {
                 iw4::GameWorldSp g{};
                 g.name = follow<const char>();
                 g.g_glassData = follow<iw4::G_GlassData>();
+                const size_t n = path ? path->nodes.size() : 0;
+                if (n) {
+                    g.path.nodeCount = static_cast<unsigned>(n);
+                    g.path.nodes = follow<iw4::pathnode_t>();
+                    g.path.basenodes = follow<iw4::pathbasenode_t>();
+                    g.path.visBytes = static_cast<int>(path->vis.size());
+                    g.path.pathVis = path->vis.empty() ? nullptr : follow<char>();
+                    g.path.nodeTreeCount = static_cast<int>(path->tree.size());
+                    g.path.nodeTree = follow<iw4::pathnode_tree_t>();
+                }
                 w.writeStruct(g);
                 w.push(zone::BLOCK_VIRTUAL);
                 w.xstring(name);
+                if (n) {
+                    w.align(zone::kAlign4);
+                    for (size_t i = 0; i < n; i++) {
+                        const pathnodes::Node& s = path->nodes[i];
+                        iw4::pathnode_t p{};
+                        p.constant.type = static_cast<iw4::nodeType>(s.type);
+                        p.constant.spawnflags = s.spawnflags;
+                        p.constant.targetname = nodeStrings[i][0];
+                        p.constant.script_linkName = nodeStrings[i][1];
+                        p.constant.script_noteworthy = nodeStrings[i][2];
+                        p.constant.target = nodeStrings[i][3];
+                        for (int k = 0; k < 3; k++) p.constant.vOrigin[k] = s.origin[k];
+                        p.constant.fAngle = s.angle;
+                        const double yaw = s.angle * 3.14159265358979323846 / 180;
+                        p.constant.forward[0] = static_cast<float>(std::cos(yaw));
+                        p.constant.forward[1] = static_cast<float>(std::sin(yaw));
+                        p.constant.wOverlapNode[0] = p.constant.wOverlapNode[1] = -1;
+                        p.constant.totalLinkCount = static_cast<uint16_t>(path->links[i].size());
+                        p.constant.Links = path->links[i].empty() ? nullptr : follow<iw4::pathlink_s>();
+                        w.writeStruct(p);
+                    }
+                    for (size_t i = 0; i < n; i++) {
+                        if (path->links[i].empty()) continue;
+                        w.align(zone::kAlign4);
+                        for (const auto& [to, dist] : path->links[i]) {
+                            iw4::pathlink_s l{};
+                            l.fDist = dist;
+                            l.nodeNum = to;
+                            w.writeStruct(l);
+                        }
+                    }
+                    w.push(zone::BLOCK_RUNTIME);
+                    w.align(zone::kAlign16);
+                    w.zeros(16 * n);
+                    w.pop();
+                    if (!path->vis.empty()) {
+                        w.align(zone::kAlign1);
+                        w.write(path->vis.data(), path->vis.size());
+                    }
+                    w.align(zone::kAlign4);
+                    const uint32_t treeAt = w.pos();
+                    for (const pathnodes::TreeNode& t : path->tree) {
+                        iw4::pathnode_tree_t e{};
+                        e.axis = t.axis;
+                        e.dist = t.dist;
+                        if (t.axis < 0) {
+                            e.u.s.nodeCount = static_cast<int>(t.nodes.size());
+                            e.u.s.nodes = t.nodes.empty() ? nullptr : follow<unsigned short>();
+                        } else {
+                            for (int c = 0; c < 2; c++)
+                                e.u.child[c] = reinterpret_cast<iw4::pathnode_tree_t*>(
+                                    zone::offsetPointer(zone::BLOCK_VIRTUAL, treeAt + 24u * static_cast<uint32_t>(t.child[c])));
+                        }
+                        w.writeStruct(e);
+                    }
+                    for (const pathnodes::TreeNode& t : path->tree) {
+                        if (t.axis >= 0 || t.nodes.empty()) continue;
+                        w.align(zone::kAlign2);
+                        w.write(t.nodes.data(), 2 * t.nodes.size());
+                    }
+                }
                 w.align(zone::kAlign4);
                 w.writeStruct(iw4::G_GlassData{});  // no pieces, no names
                 w.pop();
             }};
 }
+static_assert(sizeof(iw4::pathnode_t) == 168 && sizeof(iw4::pathnode_constant_t) == 72 &&
+                  offsetof(iw4::pathnode_constant_t, totalLinkCount) == 56 && offsetof(iw4::pathnode_constant_t, Links) == 64 &&
+                  sizeof(iw4::pathlink_s) == 12 && sizeof(iw4::pathnode_tree_t) == 24 && sizeof(iw4::PathData) == 80 &&
+                  offsetof(iw4::PathData, pathVis) == 56 && offsetof(iw4::PathData, nodeTree) == 72,
+              "path structs differ from Load_PathData / trainer.ff");
 static_assert(sizeof(iw4::G_GlassData) == 0x90 && offsetof(iw4::G_GlassData, glassNames) == 0x18,
               "G_GlassData layout differs from Load_G_GlassData");
 static_assert(sizeof(iw4::GameWorldSp) == 0x70 && offsetof(iw4::GameWorldSp, vehicleTrack) == 0x58 &&
@@ -1865,6 +2002,442 @@ std::string resolve(const std::string& ref, const std::vector<std::string>& name
     return best;
 }
 }  // namespace zsrc
+
+// ---- effects (zone_source/fx/**/*.efx -> FxEffectDef; see zone/efx.h) ----
+namespace {
+
+// A sprite material built for an effect: a stock effect technique set from common.ff by name (the
+// sets every stock effect material uses: effect_[zfeather_]add|blend[_nofog]) with the material
+// layout, state bits and constants copied from common.ff's own effect materials (gfx_smk_white_atlas,
+// gfx_muzflash_m16, gfx_glow_hs ...), and the texture embedded from zone_source.
+struct FxMaterialPlan {
+    std::string name;
+    bool additive = false;
+    bool fog = true;
+    bool cloud = false;  // particle_cloud set (cloud elements), laid out as common.ff's cloud_outdoor
+    float feather = 0;   // soft-particle depth (zfeather sets); 0 = hard edges
+    int rows = 1, cols = 1;
+    gfx::Image image;
+    std::string techset() const {
+        if (cloud) return "particle_cloud";
+        return std::string(feather > 0 ? "effect_zfeather_" : "effect_") + (additive ? "add" : "blend") + (fog ? "" : "_nofog");
+    }
+};
+
+// A BO1 effect material (bo1::Install) as a plan: its blend/fog/feather/atlas and its image (DXT
+// as stored, top level).
+bool planBo1FxMaterial(bo1::Install& bo, const std::string& name, FxMaterialPlan& p, std::vector<std::string>* warnings) {
+    bo1::EffectMaterial m;
+    if (!bo.material(name, m)) return false;
+    bo1::Image im;
+    std::string err;
+    if (!bo.image(m.image, im, err)) {
+        if (warnings) warnings->push_back("fx material " + name + " (Black Ops): " + err);
+        return false;
+    }
+    p = FxMaterialPlan{};
+    p.name = name;
+    p.additive = m.additive;
+    p.fog = m.fog;
+    p.cloud = m.cloud;
+    p.feather = m.feather;
+    p.rows = m.rows;
+    p.cols = m.cols;
+    p.image.name = "iw4r_bo1_" + zsrc::lower(m.image);
+    p.image.mapType = 3;
+    p.image.semantic = 2;
+    p.image.category = 2;
+    p.image.width = static_cast<uint16_t>(im.width);
+    p.image.height = static_cast<uint16_t>(im.height);
+    p.image.levelCount = 1;
+    p.image.loadFlags = 2;
+    p.image.format = im.format;
+    p.image.pixels = std::move(im.pixels);
+    return true;
+}
+
+// zone_source/fx/materials/<name>.txt (optional): "image <file>", "blend add|blend", "feather <depth>",
+// "fog on|off", "atlas <rows> <cols>". Without it: the texture is zone_source/images/<name> (or the
+// name without its gfx_ prefix), blend mode additive when the name has "add"/"glow"/"flash", else
+// alpha blend; no feathering; one frame.
+bool planFxMaterial(const std::string& zoneSourceDir, const std::string& name, FxMaterialPlan& p, std::vector<std::string>* warnings) {
+    namespace fs = std::filesystem;
+    if (zoneSourceDir.empty()) return false;
+    p = FxMaterialPlan{};
+    p.name = name;
+    const std::string lname = zsrc::lower(name);
+    p.additive = lname.find("add") != std::string::npos || lname.find("glow") != std::string::npos ||
+                 lname.find("flash") != std::string::npos;
+    std::string imageFile;
+    const fs::path settings = fs::path(zoneSourceDir) / "fx" / "materials" / (name + ".txt");
+    std::error_code ec;
+    const bool hasSettings = fs::is_regular_file(settings, ec);
+    if (hasSettings) {
+        std::ifstream in(settings);
+        std::string line;
+        while (std::getline(in, line)) {
+            std::istringstream ls(line);
+            std::string k;
+            ls >> k;
+            k = zsrc::lower(k);
+            if (k == "image") std::getline(ls >> std::ws, imageFile);
+            else if (k == "blend") {
+                std::string v;
+                ls >> v;
+                p.additive = zsrc::lower(v) == "add";
+            } else if (k == "feather") ls >> p.feather;
+            else if (k == "fog") {
+                std::string v;
+                ls >> v;
+                p.fog = zsrc::lower(v) != "off";
+            } else if (k == "atlas") ls >> p.rows >> p.cols;
+        }
+    }
+    p.rows = std::clamp(p.rows, 1, 64);
+    p.cols = std::clamp(p.cols, 1, 64);
+    std::vector<fs::path> cands;
+    const fs::path img = fs::path(zoneSourceDir) / "images";
+    if (!imageFile.empty()) cands.push_back(img / imageFile), cands.push_back(fs::path(zoneSourceDir) / "fx" / "materials" / imageFile);
+    std::string bare = lname.rfind("gfx_", 0) == 0 ? name.substr(4) : name;
+    for (const std::string& st : {name, bare})
+        for (const char* ext : {".png", ".tga", ".PNG", ".TGA"}) cands.push_back(img / (st + ext));
+    std::string found;
+    for (const fs::path& c : cands)
+        if (fs::is_regular_file(c, ec)) {
+            found = c.string();
+            break;
+        }
+    if (found.empty()) {
+        if (hasSettings && warnings) warnings->push_back("fx material " + name + ": image '" + imageFile + "' not found");
+        return false;
+    }
+    imageio::Rgba rgba;
+    std::string err;
+    if (!imageio::load(found, rgba, err)) {
+        if (warnings) warnings->push_back("fx material " + name + ": " + err);
+        return false;
+    }
+    imageio::toPowerOfTwo(rgba);
+    p.image.name = "iw4r_fx_" + lname;
+    p.image.mapType = 3;
+    p.image.semantic = 2;
+    p.image.category = 2;
+    p.image.width = static_cast<uint16_t>(rgba.width);
+    p.image.height = static_cast<uint16_t>(rgba.height);
+    p.image.levelCount = 1;
+    p.image.loadFlags = 2;
+    p.image.format = 0x15;  // A8R8G8B8
+    int levels = 0;
+    std::vector<uint8_t> chain = imageio::bgraMipChain(rgba, levels);
+    p.image.pixels.assign(chain.begin(), chain.begin() + static_cast<std::ptrdiff_t>(4ull * rgba.width * rgba.height));
+    return true;
+}
+
+// Load_Material order (zonesim materialPtr): struct 0x78; name; technique set by name; texture
+// table (colorMap) + the image inline; constants (align 16); state bits. Layout as common.ff's
+// effect materials: sortKey 48, atlas rows/cols at +10/+11, techniques 4..8 -> state bits 0 and
+// 44 -> 1, textureCount 1, stateFlags 0x13, cameraRegion 2.
+void writeFxMaterial(ZoneWriter& w, const FxMaterialPlan& p) {
+    using namespace zone;
+    std::vector<uint8_t> m(0x78, 0);
+    put64(m, 0, kPtrFollow);
+    m[9] = p.cloud ? 47 : 48;
+    m[10] = static_cast<uint8_t>(p.rows);
+    m[11] = static_cast<uint8_t>(p.cols);
+    for (int i = 0; i < 48; i++) m[32 + i] = 0xFF;
+    for (int i = 4; i <= 8; i++) m[32 + i] = 0;
+    if (!p.cloud) m[32 + 44] = 1;  // cloud_outdoor has no technique-44 state
+    struct Const {
+        uint32_t hash;
+        char name[12];
+        float v[4];
+    };
+    std::vector<Const> consts;
+    if (p.feather > 0) consts.push_back({0x4D7EA234u, {'f', 'e', 'a', 't', 'h', 'e', 'r', 'P', 'a', 'r', 'm', 's'}, {1.0f / p.feather, p.feather, 0, 0}});
+    consts.push_back({0xB60C3B3Au, {'c', 'o', 'l', 'o', 'r', 'T', 'i', 'n', 't', 0, 0, 0}, {1, 1, 1, 1}});
+    static_assert(sizeof(Const) == 32, "MaterialConstantDef");
+    if (p.cloud) consts.clear();  // as cloud_outdoor
+    m[80] = 1;
+    m[81] = static_cast<uint8_t>(consts.size());
+    m[82] = p.cloud ? 1 : 2;
+    m[83] = 0x13;
+    m[84] = 2;
+    put64(m, 88, kPtrFollow);
+    put64(m, 96, kPtrFollow);
+    put64(m, 104, consts.empty() ? 0 : kPtrFollow);
+    put64(m, 112, kPtrFollow);
+    w.write(m.data(), m.size());
+    w.push(BLOCK_VIRTUAL);
+    w.xstring(p.name);
+    loadAssetPtr(w, kPtrFollow, [&](ZoneWriter& w2) {  // technique set by name (common.ff)
+        std::vector<uint8_t> ts(0x198, 0);
+        put64(ts, 0, kPtrFollow);
+        w2.write(ts.data(), ts.size());
+        w2.push(BLOCK_VIRTUAL);
+        w2.xstring("," + p.techset());
+        w2.pop();
+    });
+    w.align(kAlign4);
+    uint8_t tex[16] = {0x41, 0x10, 0xAB, 0xA0, 'c', 'p', 0x0B, 2};  // colorMap, sampler 0x0b, semantic 2
+    const uint64_t ins = kPtrInsert;
+    std::memcpy(tex + 8, &ins, 8);
+    w.write(tex, sizeof tex);
+    writeImage(w, p.image);
+    if (!consts.empty()) {
+        w.align(kAlign16);
+        w.write(consts.data(), sizeof(Const) * consts.size());
+    }
+    w.align(kAlign4);
+    const uint32_t sb[4] = {p.additive ? (p.feather > 0 ? 0x09218922u : 0x19218922u) : 0x19289165u, 0x0000000Cu, 0x88128812u, 0xE49E492Cu};
+    w.write(sb, p.cloud ? 8 : sizeof sb);
+    w.pop();
+}
+
+// Load_FxEffectDefHandle order (zonesim fxPtrAt / fxElemDef): struct 40; name; elemDefs (288
+// each, align 4); per element velSamples, visSamples (align 4), visuals (array or inline),
+// effectOnImpact/Death/Emitted names, extended (trail).
+void writeFx(ZoneWriter& w, const efx::Compiled& c) {
+    using namespace zone;
+    uint8_t fx[40] = {};
+    const uint64_t F = kPtrFollow, I = kPtrInsert;
+    std::memcpy(fx, &F, 8);
+    const int32_t h[6] = {c.flags, c.totalSize, c.msecLoopingLife, c.countLooping, c.countOneShot, c.countEmission};
+    std::memcpy(fx + 8, h, 24);
+    std::memcpy(fx + 32, &F, 8);
+    w.write(fx, sizeof fx);
+    w.push(BLOCK_VIRTUAL);
+    w.xstring(c.name);
+    w.align(kAlign4);
+    for (const efx::ElemOut& e : c.elems) {
+        std::array<uint8_t, 288> d = e.def;
+        std::memcpy(d.data() + 184, &F, 8);
+        std::memcpy(d.data() + 192, &F, 8);
+        const bool decal = e.type == 11, light = e.type == 8 || e.type == 9;
+        const size_t count = decal ? e.visuals.size() / 2 : e.visuals.size();
+        if (!light && !e.visuals.empty()) {
+            if (decal || count > 1) {
+                std::memcpy(d.data() + 200, &F, 8);
+            } else {
+                const efx::Visual& v = e.visuals[0];
+                std::memcpy(d.data() + 200, v.kind == efx::Visual::Name ? &F : &I, 8);
+            }
+        }
+        if (!e.onImpact.empty()) std::memcpy(d.data() + 232, &F, 8);
+        if (!e.onDeath.empty()) std::memcpy(d.data() + 240, &F, 8);
+        if (!e.emitted.empty()) std::memcpy(d.data() + 248, &F, 8);
+        if (!e.trail.empty()) std::memcpy(d.data() + 272, &F, 8);
+        w.write(d.data(), d.size());
+    }
+    auto visual = [&](const efx::Visual& v) {
+        switch (v.kind) {
+            case efx::Visual::Material: writeMaterialRef(w, v.name); break;
+            case efx::Visual::Model: writeXModelRef(w, v.name); break;
+            case efx::Visual::Name: w.xstring(v.name); break;
+            default: break;
+        }
+    };
+    for (const efx::ElemOut& e : c.elems) {
+        w.align(kAlign4);
+        w.write(e.velSamples.data(), e.velSamples.size());
+        w.align(kAlign4);
+        w.write(e.visSamples.data(), e.visSamples.size());
+        const bool decal = e.type == 11, light = e.type == 8 || e.type == 9;
+        const size_t count = decal ? e.visuals.size() / 2 : e.visuals.size();
+        if (!light && !e.visuals.empty()) {
+            if (decal || count > 1) {
+                w.align(kAlign4);
+                for (const efx::Visual& v : e.visuals) w.u64(v.kind == efx::Visual::Name ? F : I);
+                for (const efx::Visual& v : e.visuals) visual(v);
+            } else {
+                visual(e.visuals[0]);
+            }
+        }
+        if (!e.onImpact.empty()) w.xstring(e.onImpact);
+        if (!e.onDeath.empty()) w.xstring(e.onDeath);
+        if (!e.emitted.empty()) w.xstring(e.emitted);
+        if (!e.trail.empty()) {
+            std::vector<uint8_t> t = e.trail;
+            put64(t, 24, F);
+            put64(t, 40, F);
+            w.align(kAlign4);
+            w.write(t.data(), t.size());
+            w.align(kAlign4);
+            w.write(e.trailVerts.data(), e.trailVerts.size());
+            w.align(kAlign2);
+            w.write(e.trailInds.data(), 2 * e.trailInds.size());
+        }
+    }
+    w.pop();
+}
+
+// Atlas sizes of the stock materials common.ff (SP) / common_mp.ff (MP) carry, which effects may
+// name without supplying them (gfx_smk_white_atlas, ...). Read once from the game's zone, cached.
+std::map<std::string, std::pair<int, int>> stockFxMaterials(const std::string& gameDir, const std::string& cacheDir, MapTarget target) {
+    namespace fs = std::filesystem;
+    std::map<std::string, std::pair<int, int>> out;
+    const std::string zoneName = target == MapTarget::SP ? "common" : "common_mp";
+    const fs::path cache = cacheDir.empty() ? fs::path() : fs::path(cacheDir) / ("fxmaterials_" + zoneName + ".txt");
+    std::error_code ec;
+    if (!cache.empty() && fs::is_regular_file(cache, ec)) {
+        std::ifstream in(cache);
+        std::string n;
+        int r, c;
+        while (in >> n >> r >> c) out[n] = {r, c};
+        return out;
+    }
+    if (gameDir.empty()) return out;
+    std::ifstream in(fs::path(gameDir) / "zone" / "english" / (zoneName + ".ff"), std::ios::binary);
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    Fastfile zf;
+    std::string err;
+    if (bytes.empty() || !readFastfile(bytes, zf, err)) return out;
+    zone::SimulatedZone sim;
+    size_t loaded = 0;
+    std::string stopped;
+    zone::simulatePrefix(zf.zone, sim, loaded, stopped);
+    for (const zone::LoadedAsset& a : sim.assets) {
+        if (a.type != 5 || a.reference) continue;
+        const uint8_t* m = static_cast<const uint8_t*>(a.header);
+        const char* n;
+        std::memcpy(&n, m, 8);
+        if (n && *n) out[zsrc::lower(n)] = {std::max<int>(1, m[10]), std::max<int>(1, m[11])};
+    }
+    if (!cache.empty()) {
+        std::ofstream o(cache);
+        for (const auto& [n, rc] : out) o << n << " " << rc.first << " " << rc.second << "\n";
+    }
+    return out;
+}
+
+}  // namespace
+
+ZoneSourceEffects loadZoneSourceEffects(const std::string& zoneSourceDir, const std::string& gameDir, const std::string& cacheDir,
+                                        MapTarget target, std::vector<std::string>& warnings) {
+    namespace fs = std::filesystem;
+    ZoneSourceEffects out;
+    const fs::path dir = fs::path(zoneSourceDir) / "fx";
+    std::error_code ec;
+    if (zoneSourceDir.empty() || !fs::is_directory(dir, ec)) return out;
+    std::vector<fs::path> files;
+    for (fs::recursive_directory_iterator it(dir, ec), end; it != end && !ec; it.increment(ec))
+        if (it->is_regular_file(ec) && zsrc::lower(it->path().extension().string()) == ".efx") files.push_back(it->path());
+    std::sort(files.begin(), files.end());
+    if (files.empty()) return out;
+    const auto stock = stockFxMaterials(gameDir, cacheDir, target);
+    bo1::Install bo(bo1::defaultRoot(gameDir));
+    // Material name -> the plan this zone builds (null: referenced by name). zone_source first; then
+    // a stock material the game's common zone has; then a Black Ops effect material.
+    std::map<std::string, std::shared_ptr<FxMaterialPlan>> plans;
+    size_t fromBo1 = 0;
+    auto lookup = [&](const std::string& name) {
+        efx::MaterialInfo mi;
+        auto it = plans.find(name);
+        if (it == plans.end()) {
+            auto p = std::make_shared<FxMaterialPlan>();
+            bool ours = planFxMaterial(zoneSourceDir, name, *p, &warnings);
+            if (!ours && !stock.count(zsrc::lower(name)) && bo.valid() && planBo1FxMaterial(bo, name, *p, &warnings)) {
+                ours = true;
+                fromBo1++;
+            }
+            it = plans.emplace(name, ours ? p : nullptr).first;
+        }
+        if (it->second) {
+            mi.known = true;
+            mi.rows = it->second->rows;
+            mi.cols = it->second->cols;
+        } else if (auto s = stock.find(zsrc::lower(name)); s != stock.end()) {
+            mi.known = true;
+            mi.rows = s->second.first;
+            mi.cols = s->second.second;
+        } else if (bo1::EffectMaterial bm; bo.valid() && bo.materialTechset(name, bm.techset) &&
+                   zsrc::lower(bm.techset).rfind("distortion", 0) == 0 && stock.count("gfx_distortion_heat_far")) {
+            mi.known = true;  // BO1 heat distortion -> the stock one (common.ff)
+            mi.replacement = "gfx_distortion_heat_far";
+        } else if (stock.empty()) {
+            mi.known = true;  // no game zone to check against: trust the name
+        }
+        return mi;
+    };
+    std::vector<efx::Compiled> compiled;
+    for (const fs::path& f : files) {
+        std::string rel = zsrc::lower(fs::relative(f, dir, ec).replace_extension().generic_string());
+        if (rel.rfind("materials/", 0) == 0) continue;
+        std::ifstream in(f, std::ios::binary);
+        std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        efx::Effect fx;
+        std::string err;
+        efx::Compiled c;
+        if (!efx::parse(text, fx, err) || !efx::compile(fx, rel, lookup, c, warnings, err)) {
+            warnings.push_back("fx " + rel + ": " + err);
+            continue;
+        }
+        compiled.push_back(std::move(c));
+    }
+    // Effects that reference others (runners, impacts, emission) load after them.
+    std::set<std::string> names, placed;
+    for (const efx::Compiled& c : compiled) names.insert(c.name);
+    std::vector<const efx::Compiled*> ordered;
+    for (size_t pass = 0; pass <= compiled.size() && ordered.size() < compiled.size(); pass++)
+        for (const efx::Compiled& c : compiled) {
+            if (placed.count(c.name)) continue;
+            bool ready = true;
+            for (const std::string& d : c.dependencies) ready &= !names.count(zsrc::lower(d)) || placed.count(zsrc::lower(d)) != 0;
+            if (ready || pass == compiled.size()) {
+                ordered.push_back(&c);
+                placed.insert(c.name);
+            }
+        }
+    if (fromBo1) warnings.push_back("fx: " + std::to_string(fromBo1) + " material(s) built from Black Ops (" + bo.root() + ")");
+    // Materials first (the effects reference them by name), then the effects.
+    for (const auto& [n, p] : plans)
+        if (p) out.assets.push_back({IW4_MATERIAL, [plan = *p](ZoneWriter& w) { writeFxMaterial(w, plan); }});
+    for (const efx::Compiled* c : ordered) {
+        out.assets.push_back({IW4_FX, [cc = *c](ZoneWriter& w) { writeFx(w, cc); }});
+        out.looping[c->name] = c->countLooping > 0;
+        warnings.push_back("fx " + c->name + ": " + std::to_string(c->elems.size()) + " element(s)");
+    }
+    return out;
+}
+
+// Script for the map's fx_origin entities (fx, angles, delay): loads every effect in main() and,
+// once the level runs, spawns each: delay <= 0 -> spawnfx + triggerfx once (an effect with looping
+// elements keeps playing), else playfx every `delay` seconds.
+std::string fxPlacementScript(const std::vector<FxPlacement>& fx) {
+    std::vector<std::string> names;
+    for (const FxPlacement& p : fx)
+        if (std::find(names.begin(), names.end(), p.effect) == names.end()) names.push_back(p.effect);
+    std::string s = "// Generated by iw4-radiant from the map's fx_origin entities. Do not edit.\nmain()\n{\n\tlevel._iw4r_fx = [];\n";
+    for (size_t i = 0; i < names.size(); i++) s += "\tlevel._iw4r_fx[" + std::to_string(i) + "] = loadfx(\"" + names[i] + "\");\n";
+    s += "\tthread place();\n}\n\nplace()\n{\n\twaittillframeend;\n\twait 0.05;\n";
+    auto num = [](float v) {  // 4 decimals, no -0 / 1e-15 noise
+        double r = std::round(static_cast<double>(v) * 10000.0) / 10000.0;
+        if (r == 0) r = 0;
+        char b[32];
+        std::snprintf(b, sizeof b, "%g", r);
+        return std::string(b);
+    };
+    auto vec = [&](const float* v) { return "(" + num(v[0]) + ", " + num(v[1]) + ", " + num(v[2]) + ")"; };
+    for (const FxPlacement& p : fx) {
+        const size_t id = static_cast<size_t>(std::find(names.begin(), names.end(), p.effect) - names.begin());
+        s += "\tthread play(" + std::to_string(id) + ", " + vec(p.origin) + ", " + vec(p.forward) + ", " + vec(p.up) + ", " + num(p.delay) + ");\n";
+    }
+    s += "}\n\nplay(id, org, fwd, up, delay)\n{\n\tif (delay <= 0)\n\t{\n\t\tent = spawnfx(level._iw4r_fx[id], org, fwd, up);\n"
+         "\t\ttriggerfx(ent);\n\t\treturn;\n\t}\n\tfor (;;)\n\t{\n\t\tplayfx(level._iw4r_fx[id], org, fwd, up);\n\t\twait delay;\n\t}\n}\n";
+    return s;
+}
+
+// Inserts `call` as the first statement of the script's main() (after its opening brace) unless the
+// script already mentions it.
+std::string injectIntoMain(const std::string& script, const std::string& call) {
+    if (script.find(call) != std::string::npos) return script;
+    size_t m = script.find("main(");
+    while (m != std::string::npos && m > 0 && (std::isalnum(static_cast<unsigned char>(script[m - 1])) || script[m - 1] == '_'))
+        m = script.find("main(", m + 1);
+    if (m == std::string::npos) return script;
+    size_t brace = script.find('{', m);
+    if (brace == std::string::npos) return script;
+    return script.substr(0, brace + 1) + "\n\t" + call + "\n" + script.substr(brace + 1);
+}
 
 std::vector<modelbuild::Model> loadZoneSourceModels(const std::string& zoneSourceDir, std::vector<std::string>& warnings,
                                                     const std::map<std::string, modelbuild::BuildOptions>* hints) {
@@ -2049,6 +2622,26 @@ bool compileMapToFastfile(const Document& doc, const std::string& mapName,
             }
     clip::ClipMapData cm;  // effect materials are nonsolid
     if (!clip::buildClipMapData(doc, cm, error, &unlit)) return false;
+    // Surface types (footstep sounds, impact effects, bullettrace "surfacetype", AI groundtype):
+    // stock clipMap materials carry type << 20 in surfaceFlags (trainer: asphalt 22, concrete 5,
+    // plaster 16, metal 13, wood 21); the type is the stock material's MaterialInfo.surfaceTypeBits
+    // (+24) = 1 << (type - 1).
+    for (clip::Material& m : cm.materials) {
+        if (m.surfaceType >= 0) {  // the brush's own (editor: Brush > Surface type)
+            m.surfaceFlags = (m.surfaceFlags & ~0x3F00000u) | (static_cast<uint32_t>(m.surfaceType) << 20);
+            continue;
+        }
+        if (materials) {
+            auto it = materials->find(matdef::key(worldMaterialAssetName(m.name)));
+            if (it == materials->end() || it->second.header.size() < 28) continue;
+            uint32_t bits;
+            std::memcpy(&bits, it->second.header.data() + 24, 4);
+            if (!bits) continue;
+            uint32_t type = 1;
+            while (!(bits & 1)) bits >>= 1, type++;
+            m.surfaceFlags = (m.surfaceFlags & ~0x3F00000u) | (type << 20);
+        }
+    }
     // Lighting: reuse the caller's bake, bake now, or (bakeLighting off) uniform placeholder light.
     light::Bake localBake;
     const light::Bake* bake = options.prebaked;
@@ -2128,6 +2721,76 @@ bool compileMapToFastfile(const Document& doc, const std::string& mapName,
     // misc_models are compile-time static models, which this compiler doesn't bake yet).
     Document entDoc;
     entDoc.ents = doc.ents;
+    // SP path nodes go into the GameWorldSp path data, not the entity lump.
+    std::shared_ptr<const pathnodes::Graph> pathGraph;
+    if (sp) pathGraph = std::make_shared<const pathnodes::Graph>(pathnodes::build(doc, cm, options.warnings));
+    entDoc.ents.erase(std::remove_if(entDoc.ents.begin(), entDoc.ents.end(),
+                                     [](const Entity& e) { return pathnodes::isPathNodeClass(e.classname()); }),
+                      entDoc.ents.end());
+    // Effects: zone_source/fx compiled into the zone; fx_origin entities become a generated script
+    // (maps/[mp/]<map>_fx.gsc) that the map script's main() calls first.
+    std::vector<std::string> fxWarnings;
+    ZoneSourceEffects zfx = loadZoneSourceEffects(options.zoneSourceDir, options.gameDir, options.cacheDir, target, fxWarnings);
+    if (options.warnings)
+        for (const std::string& x : fxWarnings) options.warnings->push_back(x);
+    std::vector<FxPlacement> placements;
+    for (const Entity& e : entDoc.ents) {
+        if (e.classname() != "fx_origin") continue;
+        const std::string* fxName = e.find("fx");
+        if (!fxName || fxName->empty()) {
+            if (options.warnings) options.warnings->push_back("fx_origin without an \"fx\" key; ignored");
+            continue;
+        }
+        FxPlacement p{};
+        p.effect = zsrc::lower(*fxName);
+        Vec3 o;
+        if (e.origin(o)) p.origin[0] = static_cast<float>(o.x), p.origin[1] = static_cast<float>(o.y), p.origin[2] = static_cast<float>(o.z);
+        double pitch = 270, yaw = 0, roll = 0;  // default: pointing up, as createfx
+        if (const std::string* a = e.find("angles")) std::sscanf(a->c_str(), "%lf %lf %lf", &pitch, &yaw, &roll);
+        else if (const std::string* a1 = e.find("angle")) pitch = 0, yaw = std::atof(a1->c_str());
+        const double d2r = 3.14159265358979 / 180.0, sinP = std::sin(pitch * d2r), cp = std::cos(pitch * d2r), sy = std::sin(yaw * d2r),
+                     cy = std::cos(yaw * d2r), sr = std::sin(roll * d2r), cr = std::cos(roll * d2r);
+        const double fwd[3] = {cp * cy, cp * sy, -sinP}, up[3] = {cr * sinP * cy + sr * sy, cr * sinP * sy - sr * cy, cr * cp};
+        for (int k = 0; k < 3; k++) p.forward[k] = static_cast<float>(fwd[k]), p.up[k] = static_cast<float>(up[k]);
+        auto lp = zfx.looping.find(p.effect);
+        p.delay = lp != zfx.looping.end() && !lp->second ? 2.0f : 0.0f;  // one-shot effects repeat unless told otherwise
+        if (const std::string* dl = e.find("delay")) p.delay = static_cast<float>(std::atof(dl->c_str()));
+        placements.push_back(p);
+    }
+    // fx_origin -> the generated script; iw4r_terrain is editor data (its brushes are world brushes).
+    entDoc.ents.erase(std::remove_if(entDoc.ents.begin(), entDoc.ents.end(),
+                                     [](const Entity& e) { return e.classname() == "fx_origin" || e.classname() == "iw4r_terrain"; }),
+                      entDoc.ents.end());
+    const std::string fxScriptName = mapAssetDir(target) + mapName + "_fx";
+    std::string fxCall;
+    if (!placements.empty()) {
+        std::string module = fxScriptName;
+        std::replace(module.begin(), module.end(), '/', '\\');
+        fxCall = module + "::main();";
+    }
+    auto mapScriptFor = [&](const std::string& level) {
+        std::string s = options.mapScript.empty() ? mapScriptSource(level, target) : options.mapScript;
+        if (!fxCall.empty()) {
+            std::string withFx = injectIntoMain(s, fxCall);
+            if (withFx == s && s.find(fxCall) == std::string::npos && options.warnings)
+                options.warnings->push_back("fx: couldn't find main() in the map script; call " + fxCall + " yourself");
+            s = withFx;
+        }
+        return s;
+    };
+    // Script strings (bone names, notetracks, node names, ...); index 0 is the null string.
+    std::vector<std::string> scriptStrings;
+    auto scriptIndex = [&](const std::string& str) {
+        auto at = std::find(scriptStrings.begin(), scriptStrings.end(), str);
+        if (at == scriptStrings.end()) at = scriptStrings.insert(scriptStrings.end(), str);
+        return static_cast<uint16_t>(1 + (at - scriptStrings.begin()));
+    };
+    std::vector<std::array<uint16_t, 4>> nodeStrings;
+    if (pathGraph)
+        for (const pathnodes::Node& nd : pathGraph->nodes) {
+            auto idx = [&](const std::string& s) { return s.empty() ? uint16_t(0) : scriptIndex(s); };
+            nodeStrings.push_back({idx(nd.targetname), idx(nd.linkname), idx(nd.noteworthy), idx(nd.target)});
+        }
     {
         std::vector<std::string> unused;
         std::set<std::string> custom;
@@ -2143,32 +2806,49 @@ bool compileMapToFastfile(const Document& doc, const std::string& mapName,
         buildComWorld(bsp, true, bake ? &bake->env : nullptr),
         buildFxWorld(bsp),
         buildGfxWorld(bsp, mapName, gw, cm, shared, skySrc, materials),
-        sp ? buildGameWorldSp(bsp) : buildGameWorldMp(bsp),
+        sp ? buildGameWorldSp(bsp, pathGraph, nodeStrings) : buildGameWorldMp(bsp),
         std::move(clipMap),
-        buildCompressedRawFile(mapAssetDir(target) + mapName + ".gsc",
-                               options.mapScript.empty() ? mapScriptSource(mapName, target) : options.mapScript),
+        buildCompressedRawFile(mapAssetDir(target) + mapName + ".gsc", mapScriptFor(mapName)),
     };
+    if (!placements.empty()) {
+        assets.push_back(buildCompressedRawFile(fxScriptName + ".gsc", fxPlacementScript(placements)));
+        if (options.warnings)
+            options.warnings->push_back("fx: " + std::to_string(placements.size()) + " fx_origin(s) -> " + fxScriptName +
+                                        ".gsc (called first in the map script's main())");
+    }
     if (!options.addonLevel.empty() && sp) {
-        // Weapon-pack level so_w_<map>: its script (same source as the map's) and an empty add-on
-        // entity lump, which the game looks up for add-on levels (iw4sp+0x1f01c0).
+        // Weapon-pack level so_w_<map>: its script (same source as the map's).
         const std::string& level = options.addonLevel;
-        assets.push_back(buildCompressedRawFile("maps/" + level + ".gsc",
-                                                options.mapScript.empty() ? mapScriptSource(level, target) : options.mapScript));
-        assets.push_back(buildAddonMapEnts("maps/" + level + ".mapents", ""));
+        // No add-on entity lump here: the pack carries one (pool size 1, a second is fatal), and
+        // deployWeaponPack renames it to maps/<level>.mapents.
+        assets.push_back(buildCompressedRawFile("maps/" + level + ".gsc", mapScriptFor(level)));
+    }
+    // zone_source/scripts/<path>.gsc|.csv -> rawfile <path> (scripts/maps/_zombies.gsc ->
+    // maps/_zombies.gsc; scripts/aitype/zombie.gsc is what an actor_zombie spawner loads).
+    if (!options.zoneSourceDir.empty()) {
+        namespace fs = std::filesystem;
+        const fs::path dir = fs::path(options.zoneSourceDir) / "scripts";
+        std::error_code ec;
+        if (fs::is_directory(dir, ec))
+            for (fs::recursive_directory_iterator it(dir, ec), end; it != end && !ec; it.increment(ec)) {
+                if (!it->is_regular_file(ec)) continue;
+                const std::string ext = zsrc::lower(it->path().extension().string());
+                if (ext != ".gsc" && ext != ".csv") continue;
+                const std::string rel = zsrc::lower(fs::relative(it->path(), dir, ec).generic_string());
+                if (rel == mapAssetDir(target) + mapName + ".gsc") continue;  // the map script has its own slot
+                std::ifstream in(it->path(), std::ios::binary);
+                std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                assets.push_back(buildCompressedRawFile(rel, text));
+                if (options.warnings) options.warnings->push_back("script " + rel + " (zone_source)");
+            }
     }
     // zone_source models: XModel assets (bone names go in the zone's script strings).
-    std::vector<std::string> scriptStrings;
     {
         std::vector<std::string> mw;
         ZoneSourceWeapons zw = loadZoneSourceWeapons(options.zoneSourceDir, mw);
         std::vector<modelbuild::Model> models = loadZoneSourceModels(options.zoneSourceDir, mw, &zw.hints);
         if (options.warnings)
             for (const std::string& x : mw) options.warnings->push_back(x);
-        auto scriptIndex = [&](const std::string& str) {
-            auto at = std::find(scriptStrings.begin(), scriptStrings.end(), str);
-            if (at == scriptStrings.end()) at = scriptStrings.insert(scriptStrings.end(), str);
-            return static_cast<uint16_t>(1 + (at - scriptStrings.begin()));  // entry 0 is the null string
-        };
         std::vector<ZoneAsset> modelAssets;
         for (const modelbuild::Model& md : models) {
             std::vector<uint16_t> boneIdx;
@@ -2215,6 +2895,8 @@ bool compileMapToFastfile(const Document& doc, const std::string& mapName,
             modelAssets.push_back(buildXAnimParts(an, nameIdx, noteIdx));
             animNames.push_back(stem);
         }
+        // Effects (after the models they may use, before the weapons that name them).
+        modelAssets.insert(modelAssets.end(), zfx.assets.begin(), zfx.assets.end());
         // zone_source/weapons/<name> -> WeaponCompleteDef (after the models it references).
         for (const weapondef::Weapon& w : zw.weapons) {
             std::vector<uint16_t> hide;

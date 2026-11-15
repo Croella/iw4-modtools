@@ -7,6 +7,7 @@
 #include <cstring>
 #include <thread>
 
+#include "zone/clipmap.h"
 #include "zone/gfxworld.h"
 
 namespace light {
@@ -464,14 +465,14 @@ std::string volumetricConfig(const Document& doc) {
                   v.fog ? 1 : 0, v.fogDensity, v.fogFalloff, v.fogHeight, v.fogSun, v.fogG, v.fogStart, v.fogMax, v.fogSky, v.fogSkyDist,
                   v.fogColor.x, v.fogColor.y, v.fogColor.z);
     out += buf;
-    // full_clip brushes stop the sun's shafts (the game doesn't draw them, so the DLL draws these
+    // Player clip brushes (full_clip, clip_player, ...) stop the sun's shafts (the game doesn't draw them, so the DLL draws these
     // triangles into its sky mask).
     size_t tris = 0;
     for (const Entity& e : doc.ents)
         for (const Brush& br : e.brushes)
             for (const Face& f : br.faces) {
                 if (f.winding.size() < 3 || !blocksVolumetricSun(f.material)) continue;
-                if (!tris) out += "// sun occluders (full_clip faces): world-space triangles\n";
+                if (!tris) out += "// sun occluders (player clip faces): world-space triangles\n";
                 for (size_t i = 1; i + 1 < f.winding.size(); i++, tris++) {
                     const Vec3 &a = f.winding[0], &b = f.winding[i], &c = f.winding[i + 1];
                     std::snprintf(buf, sizeof buf, "occluder %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f\n", a.x, a.y, a.z, b.x, b.y, b.z,
@@ -508,9 +509,8 @@ bool isSkyMaterial(const std::string& raw) {
 }
 
 bool blocksVolumetricSun(const std::string& raw) {
-    std::string n = lower(raw);
-    if (n.rfind("wc/", 0) == 0) n = n.substr(3);
-    return n.find("clip") != std::string::npos && n.find("full") != std::string::npos;  // clip_full / full_clip
+    // Anything with player clip contents (0x10000): full_clip, clip_player, clip_ai/monster, ...
+    return (clip::contentsForMaterial(raw) & 0x10000u) != 0;
 }
 
 bool blocksLight(const std::string& raw) {

@@ -36,9 +36,19 @@ struct Brush {
     // as the brush attribute line kTwoSidedAttr, which .map files keep verbatim.
     bool twoSided() const;
     void setTwoSided(bool on);
+
+    // Surface type override (footsteps, bullet impacts, bullettrace "surfacetype", AI groundtype):
+    // one of surfaceTypeNames(), or "" to use the material's own (the stock material's type, else
+    // "default"). Stored as the brush attribute line "iw4r_surface <name>;".
+    std::string surfaceType() const;
+    void setSurfaceType(const std::string& name);
 };
 
 inline constexpr const char* kTwoSidedAttr = "iw4r_twosided;";
+// IW4's surface types in game order (index = the type in clipMap surfaceFlags >> 20).
+const std::vector<std::string>& surfaceTypeNames();
+// Index of a surface type name, or -1 for "" / unknown.
+int surfaceTypeIndex(const std::string& name);
 // The face seen from behind: winding reversed, normal and plane flipped.
 Face mirroredFace(const Face& f);
 

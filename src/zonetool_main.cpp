@@ -26,6 +26,9 @@
 #include "zone/zonedump.h"
 #include "zone/zonesim.h"
 #include "zone/matdefs.h"
+#include "zone/efx.h"
+#include "brush.h"
+#include <map>
 
 namespace {
 bool readFile(const std::string& path, std::vector<uint8_t>& out) {
@@ -164,6 +167,9 @@ int compile(const std::string& mapPath, const std::string& outPath) {
     std::vector<uint8_t> ff;
     CompileOptions options;
     if (const char* la = std::getenv("LOCALAPPDATA")) options.cacheDir = std::string(la) + "\\iw4-radiant";
+    // Game folder (weapon packs): IW4R_GAME, else the default Steam install.
+    const char* game = std::getenv("IW4R_GAME");
+    options.gameDir = game ? game : "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Call of Duty Modern Warfare 2";
     const std::string* pack = doc.ents.empty() ? nullptr : doc.ents[0].find("weaponpack");
     if (pack && !pack->empty() && target == MapTarget::SP) options.addonLevel = weaponPackLevel(mapName);
     if (readMapScript(mapPath, options.mapScript))
@@ -373,6 +379,275 @@ int refProbe(int argc, char** argv) {
 }
 
 // modelprobe <zone.ff> : prefix-loads a stock zone and prints the XModels it reaches.
+// fxprobe <zone.ff> [name-substring] [--samples]: loads the zone's leading assets the sim supports
+// and prints each effect (FxEffectDef/FxElemDef, x64 layout) and the materials its sprites use.
+namespace {
+const char* matTechset(const uint8_t* m) {
+    const uint8_t* ts;
+    std::memcpy(&ts, m + 88, 8);
+    if (!ts) return "-";
+    const char* n;
+    std::memcpy(&n, ts, 8);
+    return n ? n : "?";
+}
+void printMaterial(const uint8_t* m) {
+    const char* name;
+    std::memcpy(&name, m, 8);
+    std::printf("      material %s techset %s sortKey %u gameFlags 0x%02x atlas %ux%u stateFlags 0x%02x camRegion %u tex %u const %u sb %u\n",
+                name ? name : "?", matTechset(m), m[9], m[8], m[10], m[11], m[83], m[84], m[80], m[81], m[82]);
+    std::printf("        stateBitsEntry:");
+    for (int i = 0; i < 48; i++) std::printf(" %d", static_cast<int8_t>(m[32 + i]));
+    std::printf("\n");
+    const uint8_t* sb;
+    std::memcpy(&sb, m + 112, 8);
+    for (int i = 0; sb && i < m[82]; i++) {
+        uint32_t a, b;
+        std::memcpy(&a, sb + 8 * i, 4);
+        std::memcpy(&b, sb + 8 * i + 4, 4);
+        std::printf("        stateBits[%d] %08x %08x\n", i, a, b);
+    }
+    const uint8_t* tt;
+    std::memcpy(&tt, m + 96, 8);
+    for (int i = 0; tt && i < m[80]; i++) {
+        const uint8_t* img;
+        std::memcpy(&img, tt + 16 * i + 8, 8);
+        const char* in = nullptr;
+        if (img) std::memcpy(&in, img + 32, 8);
+        uint32_t hash;
+        std::memcpy(&hash, tt + 16 * i, 4);
+        std::printf("        texture hash %08x %c..%c sampler 0x%02x semantic %u image %s\n", hash, tt[16 * i + 4], tt[16 * i + 5],
+                    tt[16 * i + 6], tt[16 * i + 7], in ? in : "-");
+    }
+    const uint8_t* ct;
+    std::memcpy(&ct, m + 104, 8);
+    for (int i = 0; ct && i < m[81]; i++) {
+        float v[4];
+        std::memcpy(v, ct + 32 * i + 16, 16);
+        std::printf("        constant %.12s = %g %g %g %g\n", reinterpret_cast<const char*>(ct + 32 * i + 4), v[0], v[1], v[2], v[3]);
+    }
+}
+}  // namespace
+
+int fxProbe(int argc, char** argv) {
+    std::ifstream in(argv[0], std::ios::binary);
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    Fastfile zf;
+    std::string err;
+    if (!readFastfile(bytes, zf, err)) { std::printf("%s\n", err.c_str()); return 1; }
+    zone::SimulatedZone sim;
+    size_t loaded = 0;
+    std::string stopped;
+    if (!zone::simulatePrefix(zf.zone, sim, loaded, stopped)) {
+        std::string e;  // a complete zone (our own): load it fully
+        zone::simulateLoad(zf.zone, sim, e);
+    }
+    std::string filter;
+    bool samples = false, mats = false;
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "--samples") samples = true;
+        else if (a == "--materials") mats = true;
+        else filter = a;
+    }
+    std::printf("loaded %zu assets; stopped: %s\n", loaded, stopped.c_str());
+    if (mats) {
+        for (const auto& a : sim.assets)
+            if (a.type == 5 && !a.reference) {
+                const uint8_t* m = static_cast<const uint8_t*>(a.header);
+                const char* n;
+                std::memcpy(&n, m, 8);
+                if (n && std::string(n).find(filter) != std::string::npos) printMaterial(m);
+            }
+        return 0;
+    }
+    static const char* kTypes[] = {"billboard", "oriented", "tail", "trail", "cloud", "sparkcloud", "sparkfountain",
+                                   "model", "omnilight", "spotlight", "sound", "decal", "runner"};
+    for (const auto& a : sim.assets) {
+        if (a.type != 30 || a.reference) continue;
+        const uint8_t* fx = static_cast<const uint8_t*>(a.header);
+        const char* name;
+        std::memcpy(&name, fx, 8);
+        if (!name || std::string(name).find(filter) == std::string::npos) continue;
+        int32_t h[6];
+        std::memcpy(h, fx + 8, 24);
+        std::printf("fx %s: flags 0x%x totalSize %d msecLoopingLife %d elems looping %d oneShot %d emission %d\n", name, h[0], h[1], h[2],
+                    h[3], h[4], h[5]);
+        const uint8_t* elems;
+        std::memcpy(&elems, fx + 32, 8);
+        for (int i = 0; elems && i < h[3] + h[4] + h[5]; i++) {
+            const uint8_t* e = elems + 288 * i;
+            auto f = [&](int o) { float v; std::memcpy(&v, e + o, 4); return v; };
+            auto n = [&](int o) { int32_t v; std::memcpy(&v, e + o, 4); return v; };
+            std::printf("  elem %d %s flags 0x%08x spawn %d %d range %g %g fadeIn %g %g fadeOut %g %g cull %g delay %d %d life %d %d\n", i,
+                        e[176] <= 12 ? kTypes[e[176]] : "?", static_cast<uint32_t>(n(0)), n(4), n(8), f(12), f(16), f(20), f(24), f(28),
+                        f(32), f(36), n(40), n(44), n(48), n(52));
+            std::printf("    org %g %g / %g %g / %g %g offRadius %g %g offHeight %g %g angles %g %g / %g %g / %g %g\n", f(56), f(60), f(64),
+                        f(68), f(72), f(76), f(80), f(84), f(88), f(92), f(96), f(100), f(104), f(108), f(112), f(116));
+            std::printf("    angVel %g %g / %g %g / %g %g initialRot %g %g gravity %g %g reflection %g %g\n", f(120), f(124), f(128), f(132),
+                        f(136), f(140), f(144), f(148), f(152), f(156), f(160), f(164));
+            std::printf("    atlas behavior %d index %d fps %d loops %d colBits %d rowBits %d entries %d | visuals %d velN %d visN %d\n", e[168],
+                        e[169], e[170], e[171], e[172], e[173], e[174] | (e[175] << 8), e[177], e[178], e[179]);
+            float cb[6];
+            std::memcpy(cb, e + 208, 24);
+            const char *imp, *death, *emit;
+            std::memcpy(&imp, e + 232, 8);
+            std::memcpy(&death, e + 240, 8);
+            std::memcpy(&emit, e + 248, 8);
+            std::printf("    collBounds %g %g %g / %g %g %g impact %s death %s emitted %s emitDist %g %g var %g %g\n", cb[0], cb[1], cb[2], cb[3],
+                        cb[4], cb[5], imp ? imp : "-", death ? death : "-", emit ? emit : "-", f(256), f(260), f(264), f(268));
+            const uint8_t* ext;
+            std::memcpy(&ext, e + 272, 8);
+            std::printf("    sortOrder %d lightingFrac %d useItemClip %d fadeInfo %d extended %s\n", e[280], e[281], e[282], e[283],
+                        ext ? "yes" : "-");
+            const uint8_t* vis;
+            std::memcpy(&vis, e + 200, 8);
+            auto visual = [&](const uint8_t* p) {
+                if (!p) { std::printf("      (null)\n"); return; }
+                const uint8_t t = e[176];
+                if (t == 8 || t == 9) return;
+                if (t == 10 || t == 12) { std::printf("      %s\n", reinterpret_cast<const char*>(p)); return; }
+                if (t == 7) {
+                    const char* mn;
+                    std::memcpy(&mn, p, 8);
+                    std::printf("      model %s\n", mn ? mn : "?");
+                    return;
+                }
+                printMaterial(p);
+            };
+            if (e[176] == 11) {
+                for (int k = 0; vis && k < 2 * e[177]; k++) {
+                    const uint8_t* m;
+                    std::memcpy(&m, vis + 8 * k, 8);
+                    visual(m);
+                }
+            } else if (e[177] > 1) {
+                for (int k = 0; vis && k < e[177]; k++) {
+                    const uint8_t* p;
+                    std::memcpy(&p, vis + 8 * k, 8);
+                    visual(p);
+                }
+            } else if (e[177] == 1) {
+                visual(vis);
+            }
+            if (samples) {
+                const float* vs;
+                std::memcpy(&vs, e + 184, 8);
+                for (int k = 0; vs && k <= e[178]; k++) {
+                    const float* s = vs + 24 * k;
+                    std::printf("    vel[%d] local v %g %g %g +%g %g %g  d %g %g %g +%g %g %g | world v %g %g %g +%g %g %g  d %g %g %g +%g %g %g\n", k,
+                                s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16],
+                                s[17], s[18], s[19], s[20], s[21], s[22], s[23]);
+                }
+                const uint8_t* ss;
+                std::memcpy(&ss, e + 192, 8);
+                for (int k = 0; ss && k <= e[179]; k++) {
+                    const uint8_t* s = ss + 48 * k;
+                    float b[5], am[5];
+                    std::memcpy(b, s + 4, 20);
+                    std::memcpy(am, s + 28, 20);
+                    std::printf("    vis[%d] color %u %u %u %u / %u %u %u %u rotDelta %g +%g rotTotal %g +%g size %g %g +%g %g scale %g +%g\n", k,
+                                s[0], s[1], s[2], s[3], s[24], s[25], s[26], s[27], b[0], am[0], b[1], am[1], b[2], b[3], am[2], am[3], b[4],
+                                am[4]);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+// efxcheck <dir> [zoneCount]: parses + compiles every .efx under <dir> (e.g. BO1's raw/fx), then
+// compiles the first zoneCount of them (default 300) into one SP zone and runs the loader on it.
+int efxCheck(int argc, char** argv) {
+    namespace fs = std::filesystem;
+    const fs::path root = argv[0];
+    const size_t zoneCount = argc >= 2 ? static_cast<size_t>(std::atoi(argv[1])) : 300;
+    std::vector<fs::path> files;
+    std::error_code ec;
+    for (fs::recursive_directory_iterator it(root, ec), end; it != end && !ec; it.increment(ec))
+        if (it->is_regular_file(ec) && it->path().extension() == ".efx") files.push_back(it->path());
+    std::sort(files.begin(), files.end());
+    size_t parsed = 0, compiled = 0, elems = 0;
+    std::map<std::string, size_t> failures, warnKinds;
+    std::map<int, size_t> types;
+    auto lookup = [](const std::string&) { efx::MaterialInfo m; m.known = true; return m; };
+    for (const fs::path& f : files) {
+        std::ifstream in(f, std::ios::binary);
+        std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        efx::Effect fx;
+        std::string err;
+        if (!efx::parse(text, fx, err)) {
+            failures["parse: " + err]++;
+            continue;
+        }
+        parsed++;
+        efx::Compiled c;
+        std::vector<std::string> warnings;
+        if (!efx::compile(fx, f.stem().string(), lookup, c, warnings, err)) {
+            failures["compile: " + err.substr(err.find(':') + 2)]++;
+            continue;
+        }
+        compiled++;
+        elems += c.elems.size();
+        for (const efx::ElemOut& e : c.elems) types[e.type]++;
+        for (const std::string& w : warnings) {
+            std::string k = w.substr(w.find(':') + 2);
+            if (k.find("material '") != std::string::npos) k = "material not in zone_source";
+            else if (k.find("element '") == 0) k = "element " + k.substr(k.find("' ") + 2);
+            else if (k.find("' ") != std::string::npos) k = k.substr(k.find("' ") + 2);
+            warnKinds[k]++;
+        }
+    }
+    static const char* kTypes[] = {"billboard", "oriented", "tail", "trail", "cloud", "sparkcloud", "sparkfountain",
+                                   "model", "omnilight", "spotlight", "sound", "decal", "runner"};
+    std::printf("%zu files: %zu parsed, %zu compiled, %zu elements\n", files.size(), parsed, compiled, elems);
+    for (const auto& [t, n] : types) std::printf("  %-13s %zu\n", kTypes[t], n);
+    for (const auto& [k, n] : failures) std::printf("  FAIL %zu x %s\n", n, k.c_str());
+    for (const auto& [k, n] : warnKinds) std::printf("  warn %zu x %s\n", n, k.c_str());
+    // zone + loader
+    const fs::path tmp = fs::temp_directory_path() / "iw4r_efxcheck";
+    fs::remove_all(tmp, ec);
+    fs::create_directories(tmp / "zone_source" / "fx", ec);
+    size_t copied = 0;
+    for (const fs::path& f : files) {
+        if (copied >= zoneCount) break;
+        fs::path rel = fs::relative(f, root, ec);
+        fs::create_directories((tmp / "zone_source" / "fx" / rel).parent_path(), ec);
+        fs::copy_file(f, tmp / "zone_source" / "fx" / rel, fs::copy_options::overwrite_existing, ec);
+        copied++;
+    }
+    Document d;
+    d.addBrush(makeBox({-128, -128, -16}, {128, 128, 0}, "wc/me_concrete"));
+    CompileOptions o;
+    o.bakeLighting = false;
+    o.zoneSourceDir = (tmp / "zone_source").string();
+    const char* game = std::getenv("IW4R_GAME");
+    o.gameDir = game ? game : "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Call of Duty Modern Warfare 2";
+    if (const char* la = std::getenv("LOCALAPPDATA")) o.cacheDir = std::string(la) + "\\iw4-radiant";
+    std::vector<std::string> warnings;
+    o.warnings = &warnings;
+    std::vector<uint8_t> ff;
+    std::string err;
+    if (!compileMapToFastfile(d, "efxcheck", ff, err, MapTarget::SP, o)) {
+        std::printf("zone compile failed: %s\n", err.c_str());
+        return 1;
+    }
+    Fastfile zf;
+    readFastfile(ff, zf, err);
+    zone::SimulatedZone sim;
+    const bool ok = zone::simulateLoad(zf.zone, sim, err);
+    std::map<std::string, size_t> zw;
+    for (const std::string& w : warnings) {
+        if (w.find("built from Black Ops") != std::string::npos) std::printf("  %s\n", w.c_str());
+        else if (w.rfind("fx material ", 0) == 0) zw[w.substr(w.find(": ") + 2, 40)]++;
+    }
+    for (const auto& [k, n] : zw) std::printf("  material warn %zu x %s\n", n, k.c_str());
+    std::printf("zone: %zu effects copied, %zu fx assets, %zu materials, %zu bytes, loader %s %s\n", copied, sim.count(30, false),
+                sim.count(5, false), zf.zone.size(),
+                ok ? "ok" : "FAILED:", ok ? "" : err.c_str());
+    fs::remove_all(tmp, ec);
+    return ok ? 0 : 2;
+}
+
 int modelProbe(const char* path) {
     std::ifstream in(path, std::ios::binary);
     std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
@@ -599,6 +874,8 @@ int main(int argc, char** argv) {
     if (argc >= 3 && std::string(argv[1]) == "matdefs") return matDefs(argc - 2, argv + 2);
     if (argc >= 4 && std::string(argv[1]) == "refprobe") return refProbe(argc - 2, argv + 2);
     if (argc >= 3 && std::string(argv[1]) == "modelprobe") return modelProbe(argv[2]);
+    if (argc >= 3 && std::string(argv[1]) == "fxprobe") return fxProbe(argc - 2, argv + 2);
+    if (argc >= 3 && std::string(argv[1]) == "efxcheck") return efxCheck(argc - 2, argv + 2);
     if (argc >= 3 && std::string(argv[1]) == "animprobe") return animProbe(argv[2]);
     if (argc >= 3 && std::string(argv[1]) == "livemodels") return liveModels(argc - 2, argv + 2);
     std::printf("usage:\n"

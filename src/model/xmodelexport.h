@@ -44,4 +44,10 @@ struct Model {
 bool load(const std::string& path, Model& out, std::string& error);
 bool parse(const std::string& text, Model& out, std::string& error);
 
+// Writes a model back out as a version 6 xmodel_export (what this reader and the stock tools
+// read): bones (absolute bind pose), weighted vertices, faces, objects, materials. `header` lines
+// are written first as // comments.
+std::string format(const Model& m, const std::vector<std::string>& header = {});
+bool save(const Model& m, const std::string& path, std::string& error, const std::vector<std::string>& header = {});
+
 }  // namespace xmodelexport

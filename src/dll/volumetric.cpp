@@ -52,7 +52,7 @@ struct Settings {
     float fogMax = 0.9f;           // max opacity
     float fogSky = 1;              // multiplier on the sky
     float fogSkyDist = 8000;       // distance the sky counts as
-    // Sun occluders: world-space triangles (9 floats each) from the map's full_clip brushes, drawn
+    // Sun occluders: world-space triangles (9 floats each) from the map's player clip brushes, drawn
     // black into the shaft mask (the game doesn't draw them, so the sky shows through).
     std::shared_ptr<const std::vector<float>> occ;
 };

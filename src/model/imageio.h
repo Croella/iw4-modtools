@@ -13,6 +13,8 @@ struct Rgba {
 };
 
 bool load(const std::string& path, Rgba& out, std::string& error);
+// RGBA PNG (keeps the alpha channel).
+bool savePng(const std::string& path, const Rgba& img, std::string& error);
 
 // Nearest-neighbour resize to the next power of two on each side (no-op if already).
 void toPowerOfTwo(Rgba& img);

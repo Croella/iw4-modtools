@@ -49,6 +49,12 @@ const std::vector<EntityClass>& entityClasses() {
         {"trigger_multiple", 0.9f, 0.5f, 0.1f, {}, {}, true},
         {"trigger_radius", 0.9f, 0.5f, 0.1f, {-16, -16, 0}, {16, 16, 64}, false},
         {"script_brushmodel", 0.3f, 0.7f, 0.9f, {}, {}, true},
+        // SP AI: path nodes compile into the GameWorldSp path data (links, visibility, node tree);
+        // actor spawners stay in the entity lump.
+        {"node_pathnode", 0.2f, 0.9f, 0.9f, {-8, -8, 0}, {8, 8, 16}, false},
+        {"fx_origin", 1.0f, 0.45f, 0.1f, {-6, -6, -6}, {6, 6, 6}, false},
+        {"iw4r_terrain", 0.4f, 0.85f, 0.35f, {-12, -12, -12}, {12, 12, 12}, false},  // terrain/terrain.h: sculptable height field
+        {"actor_zombie", 0.5f, 0.9f, 0.2f, pm, px, false},
     };
     return list;
 }

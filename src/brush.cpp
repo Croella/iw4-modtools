@@ -1,5 +1,6 @@
 #include "brush.h"
 #include <algorithm>
+#include <cstring>
 
 namespace {
 constexpr double kOnPlane = 1e-3;
@@ -175,6 +176,43 @@ bool Brush::twoSided() const {
 void Brush::setTwoSided(bool on) {
     attrs.erase(std::remove(attrs.begin(), attrs.end(), std::string(kTwoSidedAttr)), attrs.end());
     if (on) attrs.push_back(kTwoSidedAttr);
+}
+
+namespace {
+constexpr const char* kSurfaceAttr = "iw4r_surface ";
+}
+
+std::string Brush::surfaceType() const {
+    for (const std::string& a : attrs)
+        if (a.rfind(kSurfaceAttr, 0) == 0) {
+            std::string v = a.substr(std::strlen(kSurfaceAttr));
+            while (!v.empty() && (v.back() == ';' || v.back() == ' ')) v.pop_back();
+            return v;
+        }
+    return {};
+}
+
+void Brush::setSurfaceType(const std::string& name) {
+    attrs.erase(std::remove_if(attrs.begin(), attrs.end(), [](const std::string& a) { return a.rfind(kSurfaceAttr, 0) == 0; }),
+                attrs.end());
+    if (!name.empty()) attrs.push_back(kSurfaceAttr + name + ";");
+}
+
+const std::vector<std::string>& surfaceTypeNames() {
+    // Order confirmed against stock materials' surfaceTypeBits (1 << (type - 1)): metal 13,
+    // brick 2, dirt 6, gravel 11, water 20, wood 21, asphalt 22, slush 30, ...
+    static const std::vector<std::string> names = {
+        "default", "bark",  "brick", "carpet", "cloth",   "concrete", "dirt",    "flesh", "foliage", "glass",  "grass",
+        "gravel",  "ice",   "metal", "mud",    "paper",   "plaster",  "rock",    "sand",  "snow",    "water",  "wood",
+        "asphalt", "ceramic", "plastic", "rubber", "cushion", "fruit", "paintedmetal", "riotshield", "slush"};
+    return names;
+}
+
+int surfaceTypeIndex(const std::string& name) {
+    const auto& n = surfaceTypeNames();
+    for (size_t i = 0; i < n.size(); i++)
+        if (n[i] == name) return static_cast<int>(i);
+    return -1;
 }
 
 Face mirroredFace(const Face& f) {

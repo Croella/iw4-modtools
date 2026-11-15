@@ -44,6 +44,12 @@ public:
     void clearTextures();
     // A texture loaded from an image file (png/tga) for a material name, e.g. a zone_source model's.
     void setTextureFile(const std::string& material, const std::string& path);
+
+    // A square preview of a model (textured, the editor's default shading, framed on its bounds
+    // from the front-left at `yawDeg`), cached per key. Re-rendered when the yaw changes (hover
+    // spin) and until every texture it uses has loaded.
+    ID3D11ShaderResourceView* modelThumbnail(const std::string& key, const live::LiveModel& model, int size, float yawDeg);
+    void clearThumbnails() { thumbs.clear(); }
     int pendingTextures() const { return static_cast<int>(queue.size()); }
     double aspect() const { return viewHeight ? static_cast<double>(viewWidth) / viewHeight : 1.0; }
 
@@ -122,8 +128,23 @@ private:
 
     ComPtr<ID3D11Buffer> triBuffer, lineBuffer;
     UINT triCapacity = 0, lineCapacity = 0, lineCount = 0;
-    UINT occFirst = 0, occCount = 0;  // full_clip faces in triBuffer: invisible sun occluders for the volumetric preview
+    UINT occFirst = 0, occCount = 0;  // player clip faces in triBuffer: invisible sun occluders for the volumetric preview
     std::vector<Batch> batches;
+
+    struct Thumb {
+        ComPtr<ID3D11Texture2D> tex;
+        ComPtr<ID3D11RenderTargetView> rtv;
+        ComPtr<ID3D11ShaderResourceView> srv;
+        int size = 0;
+        float yaw = 0;
+        bool complete = false;  // all textures were loaded when it was drawn
+    };
+    std::unordered_map<std::string, Thumb> thumbs;
+    ComPtr<ID3D11Texture2D> thumbDepth;
+    ComPtr<ID3D11DepthStencilView> thumbDsv;
+    int thumbDepthSize = 0;
+    ComPtr<ID3D11Buffer> thumbVb;
+    UINT thumbCapacity = 0;
 
     std::unordered_map<std::string, ComPtr<ID3D11ShaderResourceView>> textures;
     std::unordered_set<std::string> queued;

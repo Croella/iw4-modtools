@@ -431,6 +431,115 @@ void Renderer::clearTextures() {
     queue.clear();
 }
 
+ID3D11ShaderResourceView* Renderer::modelThumbnail(const std::string& key, const live::LiveModel& model, int size, float yawDeg) {
+    if (!dev || size <= 0) return white.Get();
+    Thumb& th = thumbs[key];
+    if (th.srv && th.size == size && th.complete && th.yaw == yawDeg) return th.srv.Get();
+    if (!th.srv || th.size != size) {
+        th = Thumb{};
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = td.Height = static_cast<UINT>(size);
+        td.MipLevels = td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(dev->CreateTexture2D(&td, nullptr, &th.tex)) || FAILED(dev->CreateRenderTargetView(th.tex.Get(), nullptr, &th.rtv)) ||
+            FAILED(dev->CreateShaderResourceView(th.tex.Get(), nullptr, &th.srv)))
+            return white.Get();
+        th.size = size;
+    }
+    if (thumbDepthSize < size) {
+        thumbDepth.Reset();
+        thumbDsv.Reset();
+        D3D11_TEXTURE2D_DESC dd{};
+        dd.Width = dd.Height = static_cast<UINT>(size);
+        dd.MipLevels = dd.ArraySize = 1;
+        dd.Format = DXGI_FORMAT_D32_FLOAT;
+        dd.SampleDesc.Count = 1;
+        dd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+        if (FAILED(dev->CreateTexture2D(&dd, nullptr, &thumbDepth)) || FAILED(dev->CreateDepthStencilView(thumbDepth.Get(), nullptr, &thumbDsv)))
+            return th.srv.Get();
+        thumbDepthSize = size;
+    }
+    // Geometry (model space: x forward, y left, z up), batched per material.
+    std::vector<Vertex> verts;
+    std::vector<std::pair<std::string, std::pair<UINT, UINT>>> runs;
+    bool complete = true;
+    for (const live::LiveModelSurf& s : model.surfs) {
+        UINT first = static_cast<UINT>(verts.size());
+        for (size_t t = 0; t + 2 < s.idx.size(); t += 3)
+            for (size_t k = 0; k < 3; k++) {
+                size_t vi = s.idx[t + k];
+                if (3 * vi + 2 >= s.pos.size()) continue;
+                Vertex v{};
+                std::memcpy(v.pos, &s.pos[3 * vi], 12);
+                std::memcpy(v.normal, &s.nrm[3 * vi], 12);
+                v.uv[0] = s.uv[2 * vi];
+                v.uv[1] = s.uv[2 * vi + 1];
+                v.color[0] = v.color[1] = v.color[2] = v.color[3] = 1;
+                verts.push_back(v);
+            }
+        runs.push_back({s.material, {first, static_cast<UINT>(verts.size()) - first}});
+        texture(s.material);  // queue it
+        complete &= textures.count(s.material) != 0;
+    }
+    // Camera: on the bounds' centre, from the front-left and a little above, distance to fit.
+    const Vec3 c = (model.bounds.mins + model.bounds.maxs) * 0.5;
+    const double radius = std::max(1.0, length(model.bounds.maxs - model.bounds.mins) * 0.5);
+    const double fov = 40.0 * kPi / 180.0, yaw = yawDeg * kPi / 180.0, pitch = 20.0 * kPi / 180.0;
+    const double dist = radius / std::sin(fov * 0.5) * 1.02;
+    const Vec3 dir{std::cos(pitch) * std::cos(yaw), std::cos(pitch) * std::sin(yaw), std::sin(pitch)};
+    const Vec3 eye = c + dir * dist;
+    const Vec3 f = normalize(c - eye);
+    const Vec3 r = normalize(cross(f, Vec3{0, 0, 1}));
+    const Vec3 u = cross(r, f);
+    float view[16] = {(float)r.x, (float)r.y, (float)r.z, (float)-dot(r, eye), (float)u.x, (float)u.y, (float)u.z, (float)-dot(u, eye),
+                      (float)-f.x, (float)-f.y, (float)-f.z, (float)dot(f, eye), 0, 0, 0, 1};
+    const double nearZ = std::max(0.5, dist - radius * 1.5), farZ = dist + radius * 1.5;
+    const float ys = (float)(1.0 / std::tan(fov * 0.5));
+    float proj[16] = {ys, 0, 0, 0, 0, ys, 0, 0, 0, 0, (float)(farZ / (nearZ - farZ)), (float)(nearZ * farZ / (nearZ - farZ)), 0, 0, -1, 0};
+    Constants cb{};
+    multiply(proj, view, cb.viewProj);
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (SUCCEEDED(ctx->Map(constants.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        std::memcpy(m.pData, &cb, sizeof cb);
+        ctx->Unmap(constants.Get(), 0);
+    }
+    const float clear[4] = {0.11f, 0.12f, 0.14f, 1};
+    ctx->ClearRenderTargetView(th.rtv.Get(), clear);
+    ctx->ClearDepthStencilView(thumbDsv.Get(), D3D11_CLEAR_DEPTH, 1, 0);
+    if (!verts.empty()) {
+        uploadVertices(thumbVb, thumbCapacity, verts);
+        ID3D11RenderTargetView* rtv = th.rtv.Get();
+        ctx->OMSetRenderTargets(1, &rtv, thumbDsv.Get());
+        ctx->OMSetDepthStencilState(depthOn.Get(), 0);
+        ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+        D3D11_VIEWPORT vp{0, 0, (float)size, (float)size, 0, 1};
+        ctx->RSSetViewports(1, &vp);
+        ctx->RSSetState(rasterFill.Get());
+        ctx->IASetInputLayout(layout.Get());
+        ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        UINT stride = sizeof(Vertex), offset = 0;
+        ctx->IASetVertexBuffers(0, 1, thumbVb.GetAddressOf(), &stride, &offset);
+        ctx->VSSetShader(vs.Get(), nullptr, 0);
+        ctx->PSSetShader(ps.Get(), nullptr, 0);
+        ctx->VSSetConstantBuffers(0, 1, constants.GetAddressOf());
+        ctx->PSSetConstantBuffers(0, 1, constants.GetAddressOf());
+        ctx->PSSetSamplers(0, 1, sampler.GetAddressOf());
+        for (const auto& [mat, range] : runs) {
+            if (!range.second) continue;
+            ID3D11ShaderResourceView* srv = texture(mat);
+            ctx->PSSetShaderResources(0, 1, &srv);
+            ctx->Draw(range.second, range.first);
+        }
+        ID3D11RenderTargetView* none = nullptr;
+        ctx->OMSetRenderTargets(1, &none, nullptr);
+    }
+    th.yaw = yawDeg;
+    th.complete = complete;
+    return th.srv.Get();
+}
+
 void Renderer::uploadVertices(ComPtr<ID3D11Buffer>& buffer, UINT& capacity, const std::vector<Vertex>& data) {
     if (data.empty()) return;
     if (data.size() > capacity) {
@@ -490,7 +599,7 @@ void Renderer::setLighting(std::shared_ptr<const light::Bake> bake) {
 void Renderer::rebuild(const Document& doc) {
     std::map<std::string, std::vector<Vertex>> byMaterial;
     std::vector<Vertex> lines;
-    std::vector<Vertex> occluders;  // full_clip faces (drawn or not): block the volumetric sun
+    std::vector<Vertex> occluders;  // player clip faces (full_clip, clip_player, ...; drawn or not): block the volumetric sun
 
     auto vertex = [](const Vec3& p, const Vec3& n, float u, float v, float r, float g, float b) {
         return Vertex{{(float)p.x, (float)p.y, (float)p.z}, {(float)n.x, (float)n.y, (float)n.z}, {u, v}, {r, g, b, 1}};
@@ -814,7 +923,7 @@ void Renderer::render(const FlyCamera& cam, int width, int height) {
     }
     // Volumetric preview with the baked lighting, then make the view opaque (sky alpha was a marker).
     if (lit && showVolumetrics && vol.enabled) {
-        // full_clip faces: mark them "not sky" (alpha 1) where they're in front, so the sun's shafts
+        // player clip faces: mark them "not sky" (alpha 1) where they're in front, so the sun's shafts
         // stop at them like in the game, whether they're shown or not.
         if (occCount && vol.shafts) {
             setOptions(0);

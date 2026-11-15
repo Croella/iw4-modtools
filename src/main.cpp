@@ -98,10 +98,11 @@ bool writeScreenshot(const std::string& path) {
 //   --import <map.ff>      imports a compiled map (File > Import Map from .ff)
 //   --bake                 bakes lighting (F9) before showing / screenshotting
 //   --cull                 back-face culling on in the 3D view (View > Back-Face Culling)
+//   --focus <window>       brings a window/tab to the front (e.g. "Models"), for screenshots
 //   --hide-tools           tool brushes (caulk, clip...) hidden in the 3D view
 //   --camera x y z yaw pitch   starts the 3D camera there (degrees)
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
-    std::string mapPath, screenshot, uiTestReport, importPath, game = kDefaultGame;
+    std::string mapPath, screenshot, uiTestReport, importPath, focusWindow, game = kDefaultGame;
     bool demo = false, selectAll = false, bakeLight = false, cull = false, hideTools = false;
     int frames = 240;
     bool setCam = false;
@@ -118,6 +119,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
         else if (a == "--select-all") selectAll = true;
         else if (a == "--bake") bakeLight = true;
         else if (a == "--cull") cull = true;
+        else if (a == "--focus" && hasNext) focusWindow = __argv[++i];
         else if (a == "--hide-tools") hideTools = true;
         else if (a == "--camera" && i + 5 < __argc) {
             for (double& c : cam) c = std::atof(__argv[++i]);
@@ -160,6 +162,13 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     // A screenshot run always uses the default layout and never overwrites the user's.
     if (!screenshot.empty() || !uiTestReport.empty()) io.IniFilename = nullptr;
     ImGui::StyleColorsDark();
+    // Pink instead of the dark theme's blue: every saturated blue-ish colour gets a pink hue,
+    // keeping its brightness and alpha (so hover/active/selected stay distinct).
+    for (ImVec4& c : ImGui::GetStyle().Colors) {
+        float h, s, v;
+        ImGui::ColorConvertRGBtoHSV(c.x, c.y, c.z, h, s, v);
+        if (s > 0.15f && h > 0.45f && h < 0.78f) ImGui::ColorConvertHSVtoRGB(0.925f, s, v, c.x, c.y, c.z);
+    }
     ImGui::GetStyle().WindowRounding = 0;
     ImGui::GetStyle().FrameRounding = 2;
     ImGui_ImplWin32_Init(hwnd);
@@ -175,6 +184,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     if (selectAll) app.selectAll();
     if (bakeLight) app.bakeLightingNow();
     app.renderer.cullBackFaces = cull;
+    app.focusWindow = focusWindow;
     if (hideTools) app.renderer.showToolFaces = false;
     if (setCam) {
         app.camera.pos = {cam[0], cam[1], cam[2]};

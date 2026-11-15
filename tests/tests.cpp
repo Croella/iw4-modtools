@@ -19,6 +19,13 @@
 #include "model/imageio.h"
 #include "model/xmodelexport.h"
 #include "zone/modelbuild.h"
+#include "zone/pathnodes.h"
+#include "zone/efx.h"
+#include "brushshapes.h"
+#include "terrain.h"
+#include "model/skeleton.h"
+#include <map>
+#include "zone/clipmap.h"
 
 static int failures = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
@@ -449,6 +456,63 @@ static void testZoneCompileSp() {
         std::string src(text.begin(), text.end());
         CHECK(src == mapScriptSource("sp_test", MapTarget::SP) && src.find("maps\\_load::main();") != std::string::npos);
     }
+}
+
+// Path nodes: an 8x8 grid (128 apart) on a floor, split by a wall with a gap at y 256..512.
+// Links reach 256 units (2D): 306 grid pairs, 30 of them cross the wall outside the gap.
+static void testPathNodes() {
+    Document d;
+    d.addBrush(makeBox({-512, -512, -16}, {512, 512, 0}, "caulk"));
+    d.addBrush(makeBox({-8, -512, 0}, {8, 256, 128}, "caulk"));
+    d.addPointEntity("info_player_start", {-300, 0, 16});
+    for (int x = -448; x <= 448; x += 128)
+        for (int y = -448; y <= 448; y += 128) {
+            d.addPointEntity("node_pathnode", {double(x), double(y), 24});
+            d.ents.back().set("targetname", "n");
+        }
+    clip::ClipMapData cm;
+    std::string err;
+    CHECK(clip::buildClipMapData(d, cm, err));
+    pathnodes::Graph g = pathnodes::build(d, cm, nullptr);
+    CHECK(g.nodes.size() == 64);
+    size_t links = 0;
+    for (const auto& l : g.links) links += l.size();
+    CHECK(links == 2 * 276);
+    CHECK(g.nodes.size() == 64 && g.nodes[0].origin[2] == 0);  // dropped to the floor
+    // visibility: across the wall (no), along a column (yes); bit = hi + lo * n
+    auto vis = [&](size_t a, size_t b) {
+        const size_t lo = std::min(a, b), hi = std::max(a, b), bit = hi + lo * g.nodes.size();
+        return (g.vis[bit >> 3] >> (bit & 7)) & 1;
+    };
+    CHECK(g.vis.size() == (64 * 63 + 7) / 8);
+    CHECK(vis(3 * 8 + 0, 4 * 8 + 0) == 0 && vis(0, 7) == 1);
+    // every node in exactly one tree leaf, leaves small, children below/above the split
+    std::vector<int> seen(64, 0);
+    for (const pathnodes::TreeNode& t : g.tree) {
+        if (t.axis >= 0) continue;
+        CHECK(t.nodes.size() <= 4);
+        for (uint16_t i : t.nodes) seen[i]++;
+    }
+    CHECK(std::all_of(seen.begin(), seen.end(), [](int s) { return s == 1; }));
+
+    std::vector<uint8_t> ff;
+    CHECK(compileMapToFastfile(d, "sp_nodes", ff, err, MapTarget::SP, kNoBake));
+    Fastfile zf;
+    CHECK(readFastfile(ff, zf, err));
+    zone::SimulatedZone sim;
+    CHECK(zone::simulateLoad(zf.zone, sim, err));
+    if (!err.empty()) std::printf("  simulateLoad (nodes): %s\n", err.c_str());
+    auto* gw = static_cast<const iw4::GameWorldSp*>(sim.find(IW4_GAMEWORLD_SP));
+    CHECK(gw && gw->path.nodeCount == 64 && gw->path.nodes && gw->path.nodeTree && gw->path.pathVis);
+    if (gw && gw->path.nodes) {
+        CHECK(gw->path.nodes[0].constant.totalLinkCount == g.links[0].size());
+        CHECK(gw->path.nodes[0].constant.Links[0].nodeNum == g.links[0][0].first);
+        CHECK(gw->path.nodes[0].constant.targetname != 0);  // a script string
+        const iw4::pathnode_tree_t* root = gw->path.nodeTree;
+        CHECK(root->axis >= 0 && root->u.child[0] >= gw->path.nodeTree && root->u.child[0] < gw->path.nodeTree + gw->path.nodeTreeCount);
+    }
+    auto* me = static_cast<const iw4::MapEnts*>(sim.find(IW4_MAPENTS));
+    CHECK(me && std::string(me->entityString).find("node_pathnode") == std::string::npos);
 }
 
 static void testZoneCompile() {
@@ -915,8 +979,598 @@ static void testMaterialEmbed() {
     CHECK(ecm && ecm->numBrushes == 1);
 }
 
+// Effects: an .efx with the values of BO1's raw/fx/muzzleflashes/saw_flshview_c.efx must compile to
+// what MW2's common.ff carries for muzzleflashes/saw_flshview_c (numbers from iw4r_zone fxprobe).
+static const char* kTestEfx = R"(iwfx 2
+
+{
+	name "smoke 2";
+	editorFlags useRandVel0 useBackCompatVel;
+	flags spawnRelative spawnOffsetNone runRelToSpawn;
+	spawnRange 0 0;
+	spawnLooping 200 0;
+	spawnOneShot 1 0;
+	spawnDelayMsec 0 0;
+	lifeSpanMsec 500 0;
+	spawnOrgX 5 0;
+	initialRot 0 360;
+	gravity 0 0;
+	elasticity 0 0;
+	atlasBehavior startRandom;
+	atlasIndex 0;
+	atlasFps 45;
+	atlasLoopCount 0;
+	velGraph0X 10 { { 0 0.5 1 0.5 } { 0 0.5 1 0.5 } };
+	velGraph0Y 0 { { 0 0.5 1 0.5 } { 0 -0.5 1 -0.5 } };
+	velGraph0Z 0 { { 0 0.5 1 0.5 } { 0 -0.5 1 -0.5 } };
+	velGraph1X 0 { { 0 0 1 0 } { 0 0 1 0 } };
+	velGraph1Y 0 { { 0 0 1 0 } { 0 0 1 0 } };
+	velGraph1Z 0 { { 0 0 1 0 } { 0 0 1 0 } };
+	rotGraph 10 { { 0 0.351852 1 0.5 } { 0 0 1 0 } };
+	sizeGraph0 50 { { 0 0.194805 1 1 } { 0 1 1 0 } };
+	sizeGraph1 0 { { 0 1 1 0 } { 0 1 1 0 } };
+	scaleGraph 0 { { 0 1 1 0 } { 0 1 1 0 } };
+	colorGraph 1 { { 0 1 1 1  1 0.72549 0.72549 0.72549 } { 0 1 1 1  1 0 0 0 } };
+	alphaGraph 1 { { 0 0.157895 1 0 } { 0 1 1 0 } };
+	lightingFrac 0.25;
+	collOffset 0 0 0;
+	collRadius 0;
+	fxOnImpact "";
+	fxOnDeath "";
+	sortOrder 0;
+	emission "";
+	emitDist 0 0;
+	emitDistVariance 0 0;
+	billboardSprite
+	{
+		"gfx_smk_white_atlas"
+	};
+}
+{
+	name "light";
+	editorFlags modColorByAlpha useBackCompatVel;
+	flags spawnRelative spawnOffsetNone runRelToSpawn;
+	spawnOneShot 1 0;
+	lifeSpanMsec 200 0;
+	spawnOrgX 5 5;
+	atlasBehavior startFixed;
+	velGraph0X 0 { { 0 0 1 0 } { 0 0 1 0 } };
+	sizeGraph0 200 { { 0 1 1 1 } { 0 1 1 0 } };
+	scaleGraph 0 { { 0 1 1 0 } { 0 1 1 0 } };
+	colorGraph 1 { { 0 1 1 0.501961  0.18314 1 1 0.501961  0.22093 1 0.501961 0.25098  1 0 0 0 } { 0 1 1 1  1 0 0 0 } };
+	alphaGraph 1 { { 0 0.397129 1 0.373206 } { 0 1 1 0 } };
+	lightingFrac 0;
+	sortOrder 15;
+	light;
+}
+)";
+
+static std::vector<uint8_t> tinyPng();
+static void testEffects() {
+    namespace fs = std::filesystem;
+    efx::Effect fx;
+    std::string err;
+    CHECK(efx::parse(kTestEfx, fx, err));
+    CHECK(fx.version == 2 && fx.elems.size() == 2 && fx.elems[0].visuals.size() == 1 && fx.elems[1].visualType == "light");
+    auto lookup = [](const std::string& n) {
+        efx::MaterialInfo m;
+        if (n == "gfx_smk_white_atlas") m.known = true, m.rows = 4, m.cols = 8;
+        return m;
+    };
+    efx::Compiled c;
+    std::vector<std::string> warnings;
+    CHECK(efx::compile(fx, "muzzleflashes/saw_flshview_c", lookup, c, warnings, err));
+    CHECK(c.elems.size() == 2 && c.countOneShot == 2 && c.countLooping == 0 && c.flags == 1);
+    auto f32 = [](const uint8_t* p) { float v; std::memcpy(&v, p, 4); return v; };
+    auto i32 = [](const uint8_t* p) { int32_t v; std::memcpy(&v, p, 4); return v; };
+    auto near = [](float a, float b) { return std::fabs(a - b) <= 1e-5f + 1e-4f * std::fabs(b); };
+    if (c.elems.size() == 2) {
+        const efx::ElemOut& s = c.elems[0];
+        const uint8_t* d = s.def.data();
+        CHECK(static_cast<uint32_t>(i32(d)) == 0x01000042u);  // local velocity, runRelToSpawn, spawnRelative
+        CHECK(i32(d + 4) == 1 && i32(d + 8) == 0 && i32(d + 48) == 500 && near(f32(d + 56), 5));
+        CHECK(near(f32(d + 144), 0) && near(f32(d + 148), 6.28319f));                       // initialRot 0..360 deg
+        CHECK(d[168] == 1 && d[170] == 45 && d[171] == 1 && d[172] == 3 && d[173] == 2 && d[174] == 32);  // atlas 4x8
+        CHECK(d[176] == 0 && d[177] == 1 && d[178] == 1 && d[179] == 1 && d[280] == 0 && d[281] == 63);
+        const uint8_t* v0 = s.velSamples.data();
+        CHECK(s.velSamples.size() == 192 && near(f32(v0), 0.005f) && near(f32(v0 + 96 + 24), 0.005f));  // v, then totalDelta
+        const uint8_t* vs = s.visSamples.data();
+        CHECK(s.visSamples.size() == 96);
+        CHECK(vs[0] == 255 && vs[1] == 255 && vs[2] == 255 && vs[3] == 40);
+        CHECK(near(f32(vs + 4), 6.14098e-05f) && near(f32(vs + 12), 4.87012f) && near(f32(vs + 16), 4.87012f));
+        CHECK(vs[48] == 185 && vs[51] == 0 && near(f32(vs + 52), 8.72665e-05f) && near(f32(vs + 56), 7.43381e-05f) &&
+              near(f32(vs + 60), 25));
+        const efx::ElemOut& l = c.elems[1];
+        const uint8_t* ld = l.def.data();
+        CHECK(l.type == 8 && static_cast<uint32_t>(i32(ld)) == 0x42u && i32(ld + 48) == 200 && near(f32(ld + 56), 5) &&
+              near(f32(ld + 60), 5) && ld[280] == 15);
+        const uint8_t* lv = l.visSamples.data();
+        CHECK(lv[0] == 51 && lv[1] == 101 && lv[2] == 101 && lv[3] == 255);  // B G R A: rgb * alpha, alpha 255 (modColorByAlpha)
+        CHECK(near(f32(lv + 12), 100) && near(f32(lv + 20), 1.5f));
+        size_t samples = 0;
+        for (const efx::ElemOut& e : c.elems) samples += e.velSamples.size() + e.visSamples.size();
+        CHECK(c.totalSize == static_cast<int32_t>(40 + 2 * 288 + std::strlen("muzzleflashes/saw_flshview_c") + 1 + samples));
+    }
+
+    // Full compile: zone_source/fx with an embedded material, a runner effect, an fx_origin.
+    fs::path dir = fs::temp_directory_path() / "iw4r_fx_test";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "zone_source" / "fx" / "test");
+    fs::create_directories(dir / "zone_source" / "fx" / "materials");
+    fs::create_directories(dir / "zone_source" / "images");
+    std::string flash = kTestEfx;
+    flash.replace(flash.find("gfx_smk_white_atlas"), std::strlen("gfx_smk_white_atlas"), "iw4r_test_glow");
+    { std::ofstream(dir / "zone_source" / "fx" / "test" / "flash.efx") << flash; }
+    {
+        std::ofstream(dir / "zone_source" / "fx" / "test" / "runner.efx")
+            << "iwfx 2\n{\n\tname \"r\";\n\teditorFlags looping;\n\tspawnLooping 500 0;\n\tlifeSpanMsec 100 0;\n\trunner\n\t{\n\t\t\"test/flash\"\n\t};\n}\n";
+    }
+    { std::ofstream(dir / "zone_source" / "fx" / "materials" / "iw4r_test_glow.txt") << "blend add\nfeather 10\natlas 2 2\n"; }
+    { auto png = tinyPng(); std::ofstream(dir / "zone_source" / "images" / "iw4r_test_glow.png", std::ios::binary).write(reinterpret_cast<const char*>(png.data()), png.size()); }
+    Document d;
+    d.addBrush(makeBox({-128, -128, -16}, {128, 128, 0}, "wc/me_concrete"));
+    Sel e = d.addPointEntity("fx_origin", {0, 0, 16});
+    d.ents[e.ent].set("fx", "test/runner");
+    CompileOptions o = kNoBake;
+    o.zoneSourceDir = (dir / "zone_source").string();
+    warnings.clear();
+    o.warnings = &warnings;
+    std::vector<uint8_t> ff;
+    CHECK(compileMapToFastfile(d, "fxtest", ff, err, MapTarget::SP, o));
+    Fastfile zf;
+    CHECK(readFastfile(ff, zf, err));
+    zone::SimulatedZone sim;
+    CHECK(zone::simulateLoad(zf.zone, sim, err));
+    if (!err.empty()) std::printf("  simulateLoad (fx): %s\n", err.c_str());
+    std::vector<std::string> fxNames, matNames, raw;
+    for (const auto& a : sim.assets) {
+        const char* n;
+        std::memcpy(&n, a.header, 8);
+        if (a.type == IW4_FX && !a.reference) fxNames.push_back(n);
+        if (a.type == IW4_MATERIAL && !a.reference) matNames.push_back(n);
+        if (a.type == IW4_RAWFILE) raw.push_back(n);
+    }
+    CHECK(fxNames.size() == 2 && fxNames[0] == "test/flash" && fxNames[1] == "test/runner");  // dependency first
+    CHECK(std::find(matNames.begin(), matNames.end(), "iw4r_test_glow") != matNames.end());
+    CHECK(std::find(raw.begin(), raw.end(), "maps/fxtest_fx.gsc") != raw.end());
+    for (const auto& a : sim.assets)
+        if (a.type == IW4_FX && !a.reference) {
+            const uint8_t* h = static_cast<const uint8_t*>(a.header);
+            const uint8_t* elems;
+            std::memcpy(&elems, h + 32, 8);
+            CHECK(elems != nullptr);
+            const char* n;
+            std::memcpy(&n, h, 8);
+            if (elems && std::string(n) == "test/runner") {
+                const char* runnerOf;
+                std::memcpy(&runnerOf, elems + 200, 8);
+                CHECK(elems[176] == 12 && runnerOf && std::string(runnerOf) == "test/flash");
+            }
+            if (elems && std::string(n) == "test/flash") {
+                const uint8_t* mat;
+                std::memcpy(&mat, elems + 200, 8);
+                const char* mn = nullptr;
+                if (mat) std::memcpy(&mn, mat, 8);
+                CHECK(mn && std::string(mn) == ",iw4r_test_glow" && elems[172] == 1 && elems[173] == 1 && elems[174] == 4);
+            }
+        }
+    std::printf("effects: saw_flshview_c matches stock, %zu effects + %zu materials compiled, fx script generated\n", fxNames.size(),
+                matNames.size());
+    fs::remove_all(dir);
+}
+
+// Shaped brushes: every shape gives valid convex brushes inside its box.
+static void testShapes() {
+    const Vec3 mins{-64, -32, 0}, maxs{64, 32, 96};
+    shapes::Params p;
+    p.sides = 12;
+    p.steps = 6;
+    p.thickness = 8;
+    const std::map<shapes::Shape, size_t> expect = {{shapes::Shape::Cylinder, 1}, {shapes::Shape::Cone, 1}, {shapes::Shape::Pyramid, 1},
+                                                    {shapes::Shape::Wedge, 1},    {shapes::Shape::Sphere, 1}, {shapes::Shape::Stairs, 6},
+                                                    {shapes::Shape::Arch, 12},    {shapes::Shape::Pipe, 12}, {shapes::Shape::Room, 6}};
+    for (shapes::Shape s : shapes::kAll) {
+        std::vector<Brush> bs = shapes::make(s, mins, maxs, p, "caulk");
+        bool ok = bs.size() == expect.at(s);
+        for (Brush& b : bs) {
+            ok &= b.rebuild();
+            for (int k = 0; k < 3; k++) ok &= b.bounds.mins[k] >= mins[k] - 1.5 && b.bounds.maxs[k] <= maxs[k] + 1.5;
+        }
+        if (!ok) std::printf("  shape %s: %zu brushes\n", shapes::name(s), bs.size());
+        CHECK(ok);
+    }
+    CHECK(shapes::make(shapes::Shape::Room, mins, maxs, {8, 8, 40}, "caulk").empty());  // walls thicker than the box
+    // IW4R_SHAPES_MAP=<path>: also writes every shape side by side into a .map (for a screenshot)
+    if (const char* out = std::getenv("IW4R_SHAPES_MAP")) {
+        Document d;
+        double x = 0;
+        for (shapes::Shape s : shapes::kAll) {
+            for (Brush& b : shapes::make(s, {x, 0, 0}, {x + 128, 128, 128}, p, "wc/me_concrete")) d.addBrush(std::move(b));
+            x += 192;
+        }
+        std::string err;
+        CHECK(saveMap(out, d, err));
+    }
+}
+
+// Terrain: a height field of brush cells; sculpt tools; mountains; compiles like any world brushes.
+static void testTerrain() {
+    Document d;
+    terrain::Field f;
+    f.nx = 8, f.ny = 6, f.cell = 64, f.depth = 64;
+    f.origin = {-256, -192, 0};
+    f.material = "wc/me_concrete";
+    const int te = terrain::create(d, f);
+    CHECK(d.ents[te].classname() == terrain::kClass && d.ents[0].brushes.size() == 8 * 6 * 2);
+    terrain::Field r;
+    CHECK(terrain::read(d.ents[te], r) && r.nx == 8 && r.ny == 6 && r.h.size() == 9 * 7 && !r.id.empty());
+    // raise in the middle: the centre corner goes up most, a far corner doesn't move
+    terrain::Stroke s;
+    s.tool = terrain::Tool::Raise;
+    s.radius = 160;
+    s.strength = 100;
+    int i0, j0, i1, j1;
+    CHECK(terrain::apply(r, s, 0, 0, 1.0, i0, j0, i1, j1));
+    CHECK(r.at(4, 3) > 99 && r.at(0, 0) == 0 && r.at(4, 3) > r.at(5, 3));
+    terrain::rebuildCells(d, r, i0, j0, i1, j1);
+    CHECK(d.ents[0].brushes.size() == 8 * 6 * 2);  // rebuilt in place
+    double top = -1e9;
+    for (const Brush& b : d.ents[0].brushes) top = std::max(top, b.bounds.maxs.z);
+    CHECK(std::fabs(top - r.at(4, 3)) < 0.01);
+    // smooth lowers the peak, melt moves material off a steep spike, flatten levels
+    const double peak = r.at(4, 3);
+    s.tool = terrain::Tool::Smooth;
+    terrain::apply(r, s, 0, 0, 1.0, i0, j0, i1, j1);
+    CHECK(r.at(4, 3) < peak);
+    terrain::Field spike = r;
+    std::fill(spike.h.begin(), spike.h.end(), 0.0);
+    spike.at(4, 3) = 400;
+    s.tool = terrain::Tool::Melt;
+    double before = 0, after = 0;
+    for (double h : spike.h) before += h;
+    terrain::apply(spike, s, 0, 0, 1.0, i0, j0, i1, j1);
+    for (double h : spike.h) after += h;
+    CHECK(spike.at(4, 3) < 400 && std::fabs(before - after) < 1e-6);  // material is moved, not lost
+    s.tool = terrain::Tool::Flatten;
+    s.flattenTo = 10;
+    s.strength = 1000;
+    for (int k = 0; k < 20; k++) terrain::apply(r, s, 0, 0, 1.0, i0, j0, i1, j1);
+    CHECK(std::fabs(r.at(4, 3) - 10) < 1);
+    // mountains: every brush valid, heights in range
+    terrain::mountains(r, 512, 5, 7);
+    double hi = 0;
+    for (double h : r.h) hi = std::max(hi, h);
+    CHECK(hi > 500 && hi <= 512.001);
+    terrain::write(r, d.ents[te]);
+    terrain::rebuildCells(d, r, 0, 0, r.nx, r.ny);
+    bool valid = true;
+    for (Brush& b : d.ents[0].brushes) valid &= b.rebuild();
+    CHECK(valid && d.ents[0].brushes.size() == 8 * 6 * 2);
+    // saved and loaded, then compiled: the terrain entity isn't in the map's entities
+    std::string err;
+    Document back;
+    CHECK(parseMapText(writeMapText(d), back, err) && back.ents[0].brushes.size() == d.ents[0].brushes.size());
+    terrain::Field rb;
+    CHECK(terrain::read(back.ents[te], rb) && std::fabs(rb.at(4, 3) - r.at(4, 3)) < 0.01);
+    std::vector<uint8_t> ff;
+    CHECK(compileMapToFastfile(d, "terrain", ff, err, MapTarget::SP, kNoBake));
+    Fastfile zf;
+    CHECK(readFastfile(ff, zf, err));
+    zone::SimulatedZone sim;
+    CHECK(zone::simulateLoad(zf.zone, sim, err));
+    auto* me = static_cast<const iw4::clipMap_t*>(sim.find(IW4_CLIPMAP_SP));
+    CHECK(me && me->mapEnts && std::string(me->mapEnts->entityString).find("iw4r_terrain") == std::string::npos);
+    // Paint by slope: flat -> grass, steep -> rock; rules round-trip; hand textures survive a
+    // repaint and sculpting, and "force" replaces them.
+    {
+        terrain::Field p = r;
+        p.paint = {{"ch_grass_01", 0, 20}, {"ch_cliff01", 20, 90}};
+        p.paintJitter = 0;
+        terrain::write(p, d.ents[te]);
+        terrain::Field pr;
+        CHECK(terrain::read(d.ents[te], pr) && pr.paint.size() == 2 && pr.paint[1].material == "ch_cliff01" && pr.paint[0].maxSlope == 20);
+        CHECK(terrain::repaint(d, p, &r, false) > 0);
+        int grass = 0, rock = 0, wrong = 0, walls = 0;
+        Brush* hand = nullptr;
+        for (Brush& b : d.ents[0].brushes) {
+            const double slope = std::acos(std::fabs(b.faces[0].normal.z)) * 180 / 3.14159265358979;
+            const std::string& m = b.faces[0].material;
+            (m == "ch_grass_01" ? grass : rock)++;
+            wrong += (slope < 19.9 && m != "ch_grass_01") || (slope > 20.1 && m != "ch_cliff01");
+            for (size_t k = 1; k < b.faces.size(); k++)
+                if (b.faces[k].material != "caulk") walls++, wrong += b.faces[k].material != "ch_cliff01";
+            if (!hand) hand = &b;
+        }
+        CHECK(grass > 0 && rock > 0 && walls > 0 && wrong == 0);
+        hand->faces[0].material = "hand_set";
+        std::string hid;
+        int hi_, hj, ht;
+        terrain::parseTag(*hand, hid, hi_, hj, ht);
+        terrain::repaint(d, p, nullptr, false);
+        CHECK(hand->faces[0].material == "hand_set");
+        terrain::rebuildCells(d, p, 0, 0, p.nx, p.ny);  // as sculpting does
+        bool kept = false;
+        for (const Brush& b : d.ents[0].brushes) {
+            std::string id;
+            int i, j, t;
+            if (terrain::parseTag(b, id, i, j, t) && i == hi_ && j == hj && t == ht) kept = b.faces[0].material == "hand_set";
+        }
+        CHECK(kept);
+        // renaming a rule's material repaints its cells (old name is "automatic" via prev)
+        terrain::Field p2 = p;
+        p2.paint[1].material = "ch_cliff02";
+        terrain::repaint(d, p2, &p, false);
+        int oldRock = 0, newRock = 0;
+        for (const Brush& b : d.ents[0].brushes) oldRock += b.faces[0].material == "ch_cliff01", newRock += b.faces[0].material == "ch_cliff02";
+        CHECK(oldRock == 0 && newRock >= rock - 1 && newRock > 0);  // less the hand-set one
+        terrain::repaint(d, p2, nullptr, true);
+        int handLeft = 0;
+        for (const Brush& b : d.ents[0].brushes) handLeft += b.faces[0].material == "hand_set";
+        CHECK(handLeft == 0);
+        // jitter only moves borders a little; a height rule paints peaks
+        p2.paintJitter = 6;
+        p2.paint.insert(p2.paint.begin(), terrain::PaintRule{"peak", 0, 90, 400, 1e6});
+        terrain::repaint(d, p2, nullptr, true);
+        int peaks = 0;
+        bool peaksHigh = true;
+        for (const Brush& b : d.ents[0].brushes)
+            if (b.faces[0].material == "peak") {
+                peaks++;
+                double z = 0;
+                for (const Vec3& q : b.faces[0].winding) z += q.z;
+                peaksHigh &= z / b.faces[0].winding.size() - p2.origin.z >= 400 - 1e-6;
+            }
+        CHECK(peaks > 0 && peaksHigh);
+        terrain::Field none = p2;  // clearing the rules removes the keys
+        none.paint.clear();
+        terrain::write(none, d.ents[te]);
+        CHECK(!d.ents[te].find("paint"));
+        terrain::write(r, d.ents[te]);
+        terrain::repaint(d, r, &p2, true);
+    }
+    // Paint brush: paints inside the radius only, marks the brushes, survives slope repaint and
+    // sculpting (with the surface attribute too), honours the slope filter, Ctrl-erase restores.
+    {
+        terrain::Field p = r;
+        p.paint = {{"ch_grass_01", 0, 90}};
+        terrain::write(p, d.ents[te]);
+        terrain::repaint(d, p, nullptr, true);
+        terrain::Stroke pb_;
+        pb_.tool = terrain::Tool::Paint;
+        pb_.material = "brushed";
+        pb_.radius = 100;
+        pb_.scatter = 0;
+        const int n = terrain::paint(d, p, pb_, 0, 0, false);
+        int inside = 0, outsidePainted = 0;
+        for (const Brush& b : d.ents[0].brushes) {
+            Vec3 c;
+            for (const Vec3& q : b.faces[0].winding) c += q;
+            c = c * (1.0 / b.faces[0].winding.size());
+            const bool in = std::hypot(c.x, c.y) <= 100;
+            inside += in;
+            if (!in) outsidePainted += b.faces[0].material == "brushed";
+            if (in) CHECK(b.faces[0].material == "brushed" && terrain::painted(b));
+        }
+        CHECK(n == inside && n > 0 && outsidePainted == 0);
+        CHECK(terrain::paint(d, p, pb_, 0, 0, false) == 0);  // painting again changes nothing
+        for (Brush& b : d.ents[0].brushes)
+            if (terrain::painted(b)) b.setSurfaceType("grass");
+        terrain::repaint(d, p, nullptr, false);
+        terrain::Stroke up;
+        up.tool = terrain::Tool::Raise;
+        up.radius = 300;
+        up.strength = 200;
+        terrain::apply(p, up, 0, 0, 1.0, i0, j0, i1, j1);
+        terrain::rebuildCells(d, p, i0, j0, i1, j1);
+        int still = 0, surf = 0;
+        for (const Brush& b : d.ents[0].brushes)
+            if (b.faces[0].material == "brushed") still += terrain::painted(b), surf += b.surfaceType() == "grass";
+        CHECK(still == n && surf == n);
+        // slope filter: only steep triangles take the paint
+        pb_.material = "steep";
+        pb_.minSlope = 30;
+        pb_.radius = 10000;
+        terrain::paint(d, p, pb_, 0, 0, false);
+        bool filtered = true;
+        int steep = 0;
+        for (const Brush& b : d.ents[0].brushes) {
+            const double slope = std::acos(std::fabs(b.faces[0].normal.z)) * 180 / 3.14159265358979;
+            if (b.faces[0].material == "steep") steep++, filtered &= slope >= 30 - 1e-6;
+            else filtered &= slope < 30 + 1e-6 || b.faces[0].material == "steep";
+        }
+        CHECK(filtered && steep > 0);
+        // Ctrl erase: everything back to the rule, no marks
+        terrain::paint(d, p, pb_, 0, 0, true);
+        int left = 0;
+        for (const Brush& b : d.ents[0].brushes) left += terrain::painted(b) || b.faces[0].material != "ch_grass_01";
+        CHECK(left == 0);
+        // the mark round-trips through the .map
+        pb_.material = "brushed";
+        pb_.minSlope = 0;
+        pb_.radius = 100;
+        terrain::paint(d, p, pb_, 0, 0, false);
+        std::string perr;
+        Document pb;
+        CHECK(parseMapText(writeMapText(d), pb, perr));
+        int marks = 0;
+        for (const Brush& b : pb.ents[0].brushes) marks += terrain::painted(b);
+        CHECK(marks == n);
+        r = p;
+        r.paint.clear();
+        terrain::write(r, d.ents[te]);
+    }
+    if (const char* out = std::getenv("IW4R_TERRAIN_MAP")) {  // a bigger one, for a screenshot
+        Document big;
+        terrain::Field bf;
+        bf.nx = bf.ny = 32;
+        bf.cell = 64;
+        bf.origin = {-1024, -1024, 0};
+        bf.material = "ch_ground_dirt03";
+        bf.paint = terrain::paintPresets()[0].rules;
+        bf.paintJitter = 4;
+        const int be = terrain::create(big, bf);
+        terrain::read(big.ents[be], bf);
+        terrain::mountains(bf, 768, 5, 3);
+        terrain::write(bf, big.ents[be]);
+        terrain::rebuildCells(big, bf, 0, 0, bf.nx, bf.ny);
+        CHECK(saveMap(out, big, err));
+    }
+}
+
+// Pen tool: outlines -> convex pieces (area preserved, each convex) -> valid brushes.
+static void testPenOutlines() {
+    using P = shapes::Point2;
+    auto area = [](const std::vector<P>& p) {
+        double a = 0;
+        for (size_t i = 0; i < p.size(); i++) a += p[i][0] * p[(i + 1) % p.size()][1] - p[(i + 1) % p.size()][0] * p[i][1];
+        return a * 0.5;
+    };
+    auto check = [&](const char* name, const std::vector<P>& outline, size_t maxPieces) {
+        std::string err;
+        auto pieces = shapes::convexPieces(outline, err);
+        double sum = 0;
+        bool convex = true;
+        for (const auto& pc : pieces) {
+            sum += area(pc);
+            for (size_t i = 0; i < pc.size(); i++) {
+                const P &a = pc[(i + pc.size() - 1) % pc.size()], &b = pc[i], &c = pc[(i + 1) % pc.size()];
+                convex &= (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]) > 0;
+            }
+        }
+        const bool ok = !pieces.empty() && pieces.size() <= maxPieces && convex && std::fabs(sum - std::fabs(area(outline))) < 1e-6;
+        if (!ok) std::printf("  pen %s: %zu pieces, area %g vs %g, convex %d, %s\n", name, pieces.size(), sum, area(outline), convex, err.c_str());
+        CHECK(ok);
+        return pieces.size();
+    };
+    CHECK(check("square", {{0, 0}, {128, 0}, {128, 128}, {0, 128}}, 1) == 1);
+    CHECK(check("L", {{0, 0}, {128, 0}, {128, 32}, {32, 32}, {32, 128}, {0, 128}}, 2) == 2);
+    check("U", {{0, 0}, {192, 0}, {192, 128}, {128, 128}, {128, 32}, {64, 32}, {64, 128}, {0, 128}}, 4);
+    std::vector<P> star;
+    for (int i = 0; i < 10; i++) {
+        const double a = 3.14159265358979 * i / 5, r = i % 2 ? 40 : 100;
+        star.push_back({std::cos(a) * r, std::sin(a) * r});
+    }
+    check("star", star, 8);
+    // IW4R_PEN_MAP=<path>: the star extruded as the pen would (Top view, 0..64), for a screenshot
+    if (const char* out = std::getenv("IW4R_PEN_MAP")) {
+        std::vector<P> big;
+        for (const P& q : star) big.push_back({std::round(q[0] * 2.56) , std::round(q[1] * 2.56)});
+        std::string perr;
+        Document d;
+        for (Brush& b : shapes::fromOutline(big, 0, 1, 2, 0, 64, "wc/me_concrete", perr)) d.addBrush(std::move(b));
+        CHECK(d.ents[0].brushes.size() > 1 && saveMap(out, d, perr));
+    }
+    check("clockwise L", {{0, 128}, {32, 128}, {32, 32}, {128, 32}, {128, 0}, {0, 0}}, 2);
+    CHECK(check("collinear", {{0, 0}, {64, 0}, {128, 0}, {128, 128}, {0, 128}}, 1) == 1);
+    std::string err;
+    CHECK(shapes::convexPieces({{0, 0}, {128, 128}, {128, 0}, {0, 128}}, err).empty() && err.find("crosses") != std::string::npos);
+    CHECK(shapes::convexPieces({{0, 0}, {64, 0}, {128, 0}}, err).empty());
+    // extruded in the Top view (u x, v y, w z) and the Front view (u x, v z, w y)
+    auto brushes = shapes::fromOutline({{0, 0}, {128, 0}, {128, 32}, {32, 32}, {32, 128}, {0, 128}}, 0, 1, 2, 0, 64, "caulk", err);
+    bool ok = brushes.size() == 2;
+    for (Brush& b : brushes) ok &= b.rebuild() && b.bounds.mins.z == 0 && b.bounds.maxs.z == 64;
+    CHECK(ok);
+    brushes = shapes::fromOutline({{0, 0}, {64, 0}, {64, 96}, {0, 96}}, 0, 2, 1, 16, 48, "caulk", err);
+    CHECK(brushes.size() == 1 && brushes[0].bounds.mins.y == 16 && brushes[0].bounds.maxs.y == 48 && brushes[0].bounds.maxs.z == 96);
+}
+
+// Skeleton conversion (BO1 / CoD4 -> IW4): names, tags, the 128-bone limit with weights merged.
+static void testSkeletonConvert() {
+    xmodelexport::Model m;
+    auto bone = [&](const char* n, int parent, float x, float y, float z) {
+        xmodelexport::Bone b;
+        b.name = n;
+        b.parent = parent;
+        b.offset[0] = x, b.offset[1] = y, b.offset[2] = z;
+        m.bones.push_back(b);
+        return static_cast<int>(m.bones.size()) - 1;
+    };
+    const int root = bone("TAG_ORIGIN", -1, 0, 0, 0);
+    const int mainroot = bone("J_MainRoot", root, 0, 0, 40);
+    const int spine = bone("J_Spine4", mainroot, 0, 0, 55);
+    const int head = bone("J_Head", spine, 0, 0, 64);
+    bone("J_Wrist_RI", spine, 10, -20, 40);
+    bone("J_EyeBall_LE", head, 3, 1, 66);
+    bone("J_EyeBall_RI", head, 3, -1, 66);
+    bone("J_Brow_Out_LE", head, 3, 2, 68);
+    // A BO1-style face rig MW2 never animates, every bone skinned (so some weighted bones must go).
+    const int firstExtra = static_cast<int>(m.bones.size());
+    for (int i = 0; i < 132; i++) {
+        bone(("J_Face_Extra_" + std::to_string(i)).c_str(), head, 3, 0, 65);
+        xmodelexport::Vertex v;
+        v.weights = {{firstExtra + i, 1.0f}};
+        m.verts.push_back(v);
+    }
+    xmodelexport::Face f;
+    f.v[0].vert = 0, f.v[1].vert = 1, f.v[2].vert = 2;
+    m.faces.push_back(f);
+    m.objects.push_back("o");
+    m.materials.push_back({"mtl", "Lambert", "c:/x.tga"});
+    skeleton::Report r;
+    std::string err;
+    CHECK(skeleton::convertForIw4(m, r, err));
+    CHECK(r.kind == "character" && r.bonesBefore == 140 && m.bones.size() <= skeleton::kMaxBones);
+    auto has = [&](const char* n) {
+        for (const auto& b : m.bones)
+            if (b.name == n) return true;
+        return false;
+    };
+    CHECK(has("tag_origin") && has("j_head") && has("tag_eye") && has("tag_weapon_right") && has("j_browouter_le") && !has("J_Head"));
+    // the removed (weighted) face bone's weight went to j_head: one bone, weight 1
+    int headNow = -1;
+    for (size_t i = 0; i < m.bones.size(); i++)
+        if (m.bones[i].name == "j_head") headNow = static_cast<int>(i);
+    CHECK(m.verts[0].weights.size() == 1 && m.verts[0].weights[0].first == headNow && std::fabs(m.verts[0].weights[0].second - 1) < 1e-5f);
+    for (const auto& b : m.bones) CHECK(b.parent < static_cast<int>(m.bones.size()));
+    // written and read back
+    xmodelexport::Model back;
+    CHECK(xmodelexport::parse(xmodelexport::format(m, {"Export filename: 'C:/projects/cod/t5/model_export/x.XMODEL_EXPORT'"}), back, err));
+    CHECK(back.bones.size() == m.bones.size() && back.verts.size() == 132 && back.faces.size() == 1 && back.materials[0].texture == "c:/x.tga");
+    // converting again changes nothing
+    skeleton::Report again;
+    CHECK(skeleton::convertForIw4(back, again, err) && !again.changed());
+    CHECK(skeleton::detectSource("// Export filename: 'C:/projects/cod/t5/model_export/x'") == skeleton::Source::Bo1);
+    // The real thing, when Black Ops is installed: base_character (147 bones).
+    const char* bo1 = "C:/Program Files (x86)/Steam/steamapps/common/Call of Duty Black Ops/model_export/base_character/base_character.XMODEL_EXPORT";
+    xmodelexport::Model bc;
+    if (std::filesystem::exists(bo1) && xmodelexport::load(bo1, bc, err)) {
+        skeleton::Report br;
+        CHECK(skeleton::convertForIw4(bc, br, err) && bc.bones.size() <= skeleton::kMaxBones);
+        std::printf("skeleton: BO1 base_character %s\n", br.summary().c_str());
+        modelbuild::Model built;
+        CHECK(modelbuild::build(bc, "base_character", built, err));
+    }
+}
+
+// Brush surface type override: own clipMap material entry with surfaceFlags type << 20.
+static void testSurfaceTypes() {
+    CHECK(surfaceTypeIndex("metal") == 13 && surfaceTypeIndex("slush") == 30 && surfaceTypeIndex("") == -1);
+    Document d;
+    d.addBrush(makeBox({-128, -128, -16}, {128, 128, 0}, "wc/me_concrete"));
+    d.addBrush(makeBox({200, -128, -16}, {400, 128, 0}, "wc/me_concrete"));
+    d.ents[0].brushes[1].setSurfaceType("metal");
+    CHECK(d.ents[0].brushes[1].surfaceType() == "metal" && d.ents[0].brushes[0].surfaceType().empty());
+    d.ents[0].brushes[1].setSurfaceType("wood");  // replaces, doesn't stack
+    CHECK(d.ents[0].brushes[1].surfaceType() == "wood" && d.ents[0].brushes[1].attrs.size() == 1);
+    std::vector<uint8_t> ff;
+    std::string err;
+    CHECK(compileMapToFastfile(d, "surf", ff, err, MapTarget::SP, kNoBake));
+    Fastfile zf;
+    CHECK(readFastfile(ff, zf, err));
+    zone::SimulatedZone sim;
+    CHECK(zone::simulateLoad(zf.zone, sim, err));
+    auto* cm = static_cast<const iw4::clipMap_t*>(sim.find(IW4_CLIPMAP_SP));
+    int wood = 0, other = 0;
+    if (cm)
+        for (unsigned i = 0; i < cm->numMaterials; i++) {
+            if (std::string(cm->materials[i].name) != "me_concrete") continue;
+            ((cm->materials[i].surfaceFlags >> 20) == 21 ? wood : other)++;
+        }
+    CHECK(cm && wood == 1 && other == 1);
+}
+
 // A custom map script (<map>.gsc next to the .map) replaces the generated one in the zone.
-// Weapon pack (SP): the zone also carries level so_w_<map>'s script and an empty add-on lump.
+// Weapon pack (SP): the zone also carries level so_w_<map>'s script; the pack's add-on lump is renamed.
 static void testWeaponPackLevel() {
     CHECK(weaponPackLevel("basic") == "so_w_basic");
     Document d;
@@ -932,8 +1586,21 @@ static void testWeaponPackLevel() {
     zone::SimulatedZone sim;
     CHECK(zone::simulateLoad(zf.zone, sim, err));
     if (!err.empty()) std::printf("  simulateLoad (pack): %s\n", err.c_str());
-    auto* ame = static_cast<const iw4::AddonMapEnts*>(sim.find(IW4_ADDON_MAP_ENTS));
-    CHECK(ame && std::string(ame->name) == "maps/so_w_basic.mapents" && ame->numEntityChars == 1);
+    CHECK(!sim.find(IW4_ADDON_MAP_ENTS));  // the pack has the (single) add-on lump
+    // deployWeaponPack's rename of the pack's lump: same bytes, new name, blank entities.
+    std::vector<uint8_t> pack = buildZoneImage({buildAddonMapEnts("maps/so_juggernauts_favela.mapents",
+                                                                  "{\n\"classname\" \"worldspawn\"\n}\n"),
+                                                buildMapEnts("after", "{\n}\n")});
+    const size_t packSize = pack.size();
+    CHECK(retargetAddonMapEnts(pack, "maps/so_juggernauts_favela.mapents", "maps/so_w_basic.mapents", err));
+    CHECK(pack.size() == packSize);
+    zone::SimulatedZone psim;
+    CHECK(zone::simulateLoad(pack, psim, err));
+    auto* ame = static_cast<const iw4::AddonMapEnts*>(psim.find(IW4_ADDON_MAP_ENTS));
+    CHECK(ame && std::string(ame->name) == "maps/so_w_basic.mapents" &&
+          ame->numEntityChars == 35 + 30 - 24 && std::string(ame->entityString).find_first_not_of('\n') ==std::string::npos);
+    auto* me = static_cast<const iw4::MapEnts*>(psim.find(IW4_MAPENTS));
+    CHECK(me && std::string(me->name) == "after");
     bool levelScript = false, mapScript = false;
     for (const auto& a : sim.assets)
         if (a.type == IW4_RAWFILE) {
@@ -1402,6 +2069,8 @@ int main() {
     testEntityString();
     testZoneCompile();
     testZoneCompileSp();
+    testPathNodes();
+    testEffects();
     testZoneWriterModel();
     testRebuildStockRawfileZones();
     testClipMapCompile();
@@ -1410,6 +2079,11 @@ int main() {
     testLightingBake();
     testCustomMapScript();
     testWeaponPackLevel();
+    testSurfaceTypes();
+    testShapes();
+    testPenOutlines();
+    testTerrain();
+    testSkeletonConvert();
     testZoneSourceModel();
     testSkyCompile();
     testMaterialEmbed();

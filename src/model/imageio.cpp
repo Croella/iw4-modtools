@@ -185,6 +185,27 @@ int pow2(int v) {
 
 }  // namespace
 
+bool savePng(const std::string& path, const Rgba& img, std::string& error) {
+    if (img.width <= 0 || img.height <= 0 || img.pixels.size() < 4ull * img.width * img.height) {
+        error = "empty image";
+        return false;
+    }
+    size_t size = 0;
+    void* png = tdefl_write_image_to_png_file_in_memory(img.pixels.data(), img.width, img.height, 4, &size);
+    if (!png) {
+        error = "PNG encoding failed";
+        return false;
+    }
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    f.write(static_cast<const char*>(png), static_cast<std::streamsize>(size));
+    mz_free(png);
+    if (!f) {
+        error = "can't write " + path;
+        return false;
+    }
+    return true;
+}
+
 bool load(const std::string& path, Rgba& out, std::string& error) {
     std::vector<uint8_t> d;
     if (!readFile(path, d)) {

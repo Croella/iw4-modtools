@@ -327,6 +327,40 @@ private:
                 break;
             }
             case 42: assetPtr(a.header.addonMapEnts, a.type, [&](iw4::AddonMapEnts& m) { addonMapEnts(m); }); break;
+            case 30: {
+                uint8_t* f = reinterpret_cast<uint8_t*>(&a.header.data);
+                fxPtrAt(f);
+                break;
+            }
+            case 27: {  // Load_LocalizeEntryPtr (0x11cac0) -> 0x11c9d0: struct 16 {value, name}
+                uint8_t* f = reinterpret_cast<uint8_t*>(&a.header.data);
+                rawAssetPtr(f, 27, 16, [&](uint8_t* s) {
+                    push(BLOCK_VIRTUAL);
+                    rawXString(s);
+                    rawXString(s + 8);
+                    pop();
+                });
+                break;
+            }
+            case 37: {  // Load_StringTablePtr (0x11f3f0) -> 0x11f280: struct 24 {name, columns, rows,
+                        // values: 16 each {string, hash}, align 4}
+                uint8_t* f = reinterpret_cast<uint8_t*>(&a.header.data);
+                rawAssetPtr(f, 37, 24, [&](uint8_t* s) {
+                    push(BLOCK_VIRTUAL);
+                    rawXString(s);
+                    int32_t cols, rows;
+                    std::memcpy(&cols, s + 8, 4);
+                    std::memcpy(&rows, s + 12, 4);
+                    const size_t cells = static_cast<size_t>(std::max(0, cols)) * static_cast<size_t>(std::max(0, rows));
+                    if (rd64(s + 16)) {
+                        uint8_t* v = static_cast<uint8_t*>(stream(alloc(kAlign4), 16 * cells));
+                        wr64(s + 16, v);
+                        for (size_t i = 0; i < cells; i++) rawXString(v + 16 * i);
+                    }
+                    pop();
+                });
+                break;
+            }
             case 9: techsetPtr(reinterpret_cast<uint8_t*>(&a.header.techniqueSet)); break;
             case 10: imagePtr(a.header.image); break;
             default: throw Fail("zonesim: unsupported asset type " + std::to_string(a.type));
@@ -647,18 +681,55 @@ private:
     void gameWorldSp(iw4::GameWorldSp& g) {  // 0x11a360 (SP 0xddd70)
         push(BLOCK_VIRTUAL);
         xstring(g.name);
-        requireNull(g.path.nodes, "GameWorldSp.path.nodes");
-        requireNull(g.path.basenodes, "GameWorldSp.path.basenodes");
-        requireNull(g.path.chainNodeForNode, "GameWorldSp.path.chainNodeForNode");
-        requireNull(g.path.nodeForChainNode, "GameWorldSp.path.nodeForChainNode");
-        requireNull(g.path.pathVis, "GameWorldSp.path.pathVis");
-        requireNull(g.path.nodeTree, "GameWorldSp.path.nodeTree");
+        pathData(g.path);
         requireNull(g.vehicleTrack.segments, "GameWorldSp.vehicleTrack.segments");
         if (auto* gd = array(g.g_glassData, 1, kAlign4)) {  // Load_G_GlassData (SP 0xdda40)
             requireNull(gd->glassPieces, "GameWorldSp.g_glassData.glassPieces");
             requireNull(gd->glassNames, "GameWorldSp.g_glassData.glassNames");
         }
         pop();
+    }
+    // Load_PathData (0x11e110): nodes (+ per node pathnode_t 0x1261f0: 5 script strings, links),
+    // basenodes in RUNTIME, chain arrays (sized by nodeCount), pathVis, nodeTree (0x126330).
+    void pathData(iw4::PathData& p) {
+        const size_t n = p.nodeCount;
+        if (auto* nodes = array(p.nodes, n, kAlign4)) {
+            for (size_t i = 0; i < n; i++) {
+                iw4::pathnode_constant_t& c = nodes[i].constant;
+                for (uint16_t s : {c.targetname, c.script_linkName, c.script_noteworthy, c.target, c.animscript})
+                    if (s > z_.scriptStrings.size()) throw Fail("zonesim: path node script string out of range");
+                array(c.Links, c.totalLinkCount, kAlign4);
+                for (unsigned l = 0; c.Links && l < c.totalLinkCount; l++)
+                    if (c.Links[l].nodeNum >= n) throw Fail("zonesim: path link to a node out of range");
+            }
+        }
+        runtime(p.basenodes, 16 * n, kAlign16);
+        array(p.chainNodeForNode, n, kAlign2);
+        array(p.nodeForChainNode, n, kAlign2);
+        if (p.pathVis && static_cast<size_t>(p.visBytes) * 8 < n * (n ? n - 1 : 0))
+            throw Fail("zonesim: pathVis smaller than nodeCount * (nodeCount - 1) bits");
+        array(p.pathVis, static_cast<size_t>(p.visBytes), kAlign1);
+        if (auto* t = array(p.nodeTree, static_cast<size_t>(p.nodeTreeCount), kAlign4))
+            for (int i = 0; i < p.nodeTreeCount; i++) pathTree(t[i], n, t, p.nodeTreeCount);
+    }
+    void pathTree(iw4::pathnode_tree_t& t, size_t nodeCount, iw4::pathnode_tree_t* base, int count) {
+        if (t.axis < 0) {
+            if (auto* ids = array(t.u.s.nodes, static_cast<size_t>(t.u.s.nodeCount), kAlign2))
+                for (int k = 0; k < t.u.s.nodeCount; k++)
+                    if (ids[k] >= nodeCount) throw Fail("zonesim: path tree leaf lists a node out of range");
+            return;
+        }
+        for (auto*& c : t.u.child) {
+            uint64_t raw = reinterpret_cast<uint64_t>(c);
+            if (!raw) continue;
+            if (raw == kFollow) {
+                c = static_cast<iw4::pathnode_tree_t*>(stream(alloc(kAlign4), sizeof(iw4::pathnode_tree_t)));
+                pathTree(*c, nodeCount, base, count);
+            } else {
+                c = static_cast<iw4::pathnode_tree_t*>(offsetToPointer(raw));
+                if (c < base || c >= base + count) throw Fail("zonesim: path tree child outside the tree array");
+            }
+        }
     }
     void fxWorld(iw4::FxWorld& f) {  // 0x119ed0 + Load_FxGlassSystem 0x119740
         push(BLOCK_VIRTUAL);
@@ -764,16 +835,84 @@ private:
         xstring(f);
         wr(field, f);
     }
-    // Load_FxEffectDefHandle (0x119000) -> 0x118f30: 40 bytes, VIRTUAL, name, elemDefs.
+    // Load_FxEffectDefHandle (0x119000) -> 0x118f30: 40 bytes, VIRTUAL, name, elemDefs (288 each,
+    // align 4, count = looping + oneShot + emission at +20/+24/+28) -> 0x1191c0 per element.
     void fxPtrAt(uint8_t* field) {
         FxRaw* slot = reinterpret_cast<FxRaw*>(rd(field));
         assetPtr(slot, 30, [&](FxRaw& fx) {
             push(BLOCK_VIRTUAL);
             xstringAt(fx.b);
-            requireNull(reinterpret_cast<void*>(rd(fx.b + 32)), "FxEffectDef.elemDefs (only references)");
+            if (rd(fx.b + 32)) {
+                int32_t c[3];
+                std::memcpy(c, fx.b + 20, 12);
+                if (c[0] < 0 || c[1] < 0 || c[2] < 0 || c[0] + c[1] + c[2] > 256) throw Fail("zonesim: FxEffectDef elem counts");
+                const int n = c[0] + c[1] + c[2];
+                uint8_t* e = static_cast<uint8_t*>(stream(alloc(kAlign4), 288ull * n));
+                wr(fx.b + 32, e);
+                for (int i = 0; i < n; i++) fxElemDef(e + 288 * i);
+            }
             pop();
         });
         wr(field, slot);
+    }
+    // An effect-def reference inside an element (impact/death/emitted, runner visual): the name
+    // as an XString (-1 inline, else a back-reference), resolved by name at load (0x130550).
+    void fxNameRefAt(uint8_t* field) { xstringAt(field); }
+    // Load_FxElemDef (body of 0x1191c0): velSamples (96 * (velIntervalCount + 1)), visSamples
+    // (48 * (visStateIntervalCount + 1)), visuals (0x119460), effectOnImpact/Death/Emitted (+232/
+    // 240/248), extended (+272: trail 0x30 for type 3, spark fountain 0x34 for type 6, else 1 byte).
+    void fxElemDef(uint8_t* e) {
+        const uint8_t type = e[176], visualCount = e[177], velN = e[178], visN = e[179];
+        if (type > 12) throw Fail("zonesim: FxElemDef elemType " + std::to_string(type));
+        rawArray(e + 184, 96ull * (velN + 1), kAlign4);
+        rawArray(e + 192, 48ull * (visN + 1), kAlign4);
+        uint8_t* vis = e + 200;  // FxElemDefVisuals
+        if (type == 11) {        // decal: markArray of visualCount {material, material}
+            if (rd(vis)) {
+                uint8_t* m = static_cast<uint8_t*>(stream(alloc(kAlign4), 16ull * visualCount));
+                wr(vis, m);
+                for (int i = 0; i < 2 * visualCount; i++) materialPtrAt(m + 8 * i);
+            }
+        } else if (visualCount > 1) {
+            if (rd(vis)) {
+                uint8_t* a = static_cast<uint8_t*>(stream(alloc(kAlign4), 8ull * visualCount));
+                wr(vis, a);
+                for (int i = 0; i < visualCount; i++) fxVisualAt(type, a + 8 * i);
+            }
+        } else {
+            fxVisualAt(type, vis);
+        }
+        fxNameRefAt(e + 232);
+        fxNameRefAt(e + 240);
+        fxNameRefAt(e + 248);
+        uint8_t* ext = e + 272;
+        if (rd(ext)) {
+            if (type == 3) {
+                uint8_t* t = static_cast<uint8_t*>(stream(alloc(kAlign4), 0x30));
+                wr(ext, t);
+                int32_t verts, inds;
+                std::memcpy(&verts, t + 20, 4);
+                std::memcpy(&inds, t + 32, 4);
+                rawArray(t + 24, 20ull * static_cast<uint32_t>(verts), kAlign4);
+                rawArray(t + 40, 2ull * static_cast<uint32_t>(inds), kAlign2);
+            } else if (type == 6) {
+                wr(ext, stream(alloc(kAlign4), 0x34));
+            } else {
+                wr(ext, stream(alloc(kAlign1), 1));
+            }
+        }
+    }
+    // One FxElemVisuals (0x1196a0): model (7), sound name (10), runner effect name (12), nothing
+    // for lights (8, 9), else a material handle.
+    void fxVisualAt(uint8_t type, uint8_t* field) {
+        switch (type) {
+            case 7: xmodelPtrAt(field); break;
+            case 8:
+            case 9: break;
+            case 10:
+            case 12: xstringAt(field); break;
+            default: materialPtrAt(field); break;
+        }
     }
     void xmodelPtrAt(uint8_t* field) {
         iw4::XModel* m = reinterpret_cast<iw4::XModel*>(rd(field));
@@ -799,7 +938,10 @@ private:
     }
     void stringArrayAt(uint8_t* field, int n) {
         if (!rd(field)) return;
-        if (rd(field) != kFollow) throw Fail("zonesim: weapon string array back-reference");
+        if (rd(field) != kFollow) {  // shared with an earlier weapon (stock zones)
+            wr(field, offsetToPointer(rd(field)));
+            return;
+        }
         uint8_t* a = static_cast<uint8_t*>(stream(alloc(kAlign4), 8ull * n));
         wr(field, a);
         for (int i = 0; i < n; i++) xstringAt(a + 8 * i);
@@ -812,6 +954,10 @@ private:
     }
     void scriptStringsAt(uint8_t* field, int n) {
         if (!rd(field)) return;
+        if (rd(field) != kFollow) {  // shared with an earlier weapon (stock zones)
+            wr(field, offsetToPointer(rd(field)));
+            return;
+        }
         uint8_t* a = static_cast<uint8_t*>(stream(alloc(kAlign2), 2ull * n));
         wr(field, a);
         for (int i = 0; i < n; i++) {

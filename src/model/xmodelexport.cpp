@@ -1,5 +1,6 @@
 #include "model/xmodelexport.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -165,6 +166,86 @@ bool parse(const std::string& text, Model& out, std::string& error) {
         return false;
     }
     return true;
+}
+
+std::string format(const Model& m, const std::vector<std::string>& header) {
+    std::string o;
+    char b[256];
+    for (const std::string& h : header) o += "// " + h + "\n";
+    o += "MODEL\nVERSION 6\n\n";
+    std::snprintf(b, sizeof b, "NUMBONES %zu\n", m.bones.size());
+    o += b;
+    for (size_t i = 0; i < m.bones.size(); i++) {
+        std::snprintf(b, sizeof b, "BONE %zu %d \"%s\"\n", i, m.bones[i].parent, m.bones[i].name.c_str());
+        o += b;
+    }
+    o += "\n";
+    for (size_t i = 0; i < m.bones.size(); i++) {
+        const Bone& bn = m.bones[i];
+        std::snprintf(b, sizeof b, "BONE %zu\nOFFSET %f, %f, %f\nSCALE 1.000000, 1.000000, 1.000000\n", i, bn.offset[0], bn.offset[1],
+                      bn.offset[2]);
+        o += b;
+        for (int r = 0; r < 3; r++) {
+            std::snprintf(b, sizeof b, "%c %f, %f, %f\n", "XYZ"[r], bn.axis[r][0], bn.axis[r][1], bn.axis[r][2]);
+            o += b;
+        }
+        o += "\n";
+    }
+    std::snprintf(b, sizeof b, "NUMVERTS %zu\n", m.verts.size());
+    o += b;
+    for (size_t i = 0; i < m.verts.size(); i++) {
+        const Vertex& v = m.verts[i];
+        std::snprintf(b, sizeof b, "VERT %zu\nOFFSET %f, %f, %f\nBONES %zu\n", i, v.pos[0], v.pos[1], v.pos[2], v.weights.size());
+        o += b;
+        for (const auto& [bone, w] : v.weights) {
+            std::snprintf(b, sizeof b, "BONE %d %f\n", bone, w);
+            o += b;
+        }
+        o += "\n";
+    }
+    std::snprintf(b, sizeof b, "NUMFACES %zu\n", m.faces.size());
+    o += b;
+    for (const Face& f : m.faces) {
+        std::snprintf(b, sizeof b, "TRI %d %d 0 0\n", f.object, f.material);
+        o += b;
+        for (const FaceVertex& fv : f.v) {
+            std::snprintf(b, sizeof b, "VERT %d\nNORMAL %f %f %f\nCOLOR %f %f %f %f\nUV 1 %f %f\n", fv.vert, fv.normal[0], fv.normal[1],
+                          fv.normal[2], fv.color[0], fv.color[1], fv.color[2], fv.color[3], fv.uv[0], fv.uv[1]);
+            o += b;
+        }
+        o += "\n";
+    }
+    std::snprintf(b, sizeof b, "NUMOBJECTS %zu\n", m.objects.size());
+    o += b;
+    for (size_t i = 0; i < m.objects.size(); i++) {
+        std::snprintf(b, sizeof b, "OBJECT %zu \"%s\"\n", i, m.objects[i].c_str());
+        o += b;
+    }
+    o += "\n";
+    std::snprintf(b, sizeof b, "NUMMATERIALS %zu\n", m.materials.size());
+    o += b;
+    for (size_t i = 0; i < m.materials.size(); i++) {
+        const Material& mt = m.materials[i];
+        o += "MATERIAL " + std::to_string(i) + " \"" + mt.name + "\" \"" + (mt.type.empty() ? "Lambert" : mt.type) + "\" \"" +
+             (mt.texture.empty() ? std::string() : "color:" + mt.texture) + "\"\n";
+        o += "COLOR 0.000000 0.000000 0.000000 1.000000\nTRANSPARENCY 0.000000 0.000000 0.000000 1.000000\n"
+             "AMBIENTCOLOR 0.000000 0.000000 0.000000 1.000000\nINCANDESCENCE 0.000000 0.000000 0.000000 1.000000\n"
+             "COEFFS 0.800000 0.000000\nGLOW 0.000000 0\nREFRACTIVE 6 1.000000\nSPECULARCOLOR -1.000000 -1.000000 -1.000000 1.000000\n"
+             "REFLECTIVECOLOR -1.000000 -1.000000 -1.000000 1.000000\nREFLECTIVE -1 -1.000000\nBLINN -1.000000 -1.000000\n"
+             "PHONG -1.000000\n\n";
+    }
+    return o;
+}
+
+bool save(const Model& m, const std::string& path, std::string& error, const std::vector<std::string>& header) {
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        error = "can't write " + path;
+        return false;
+    }
+    const std::string text = format(m, header);
+    f.write(text.data(), static_cast<std::streamsize>(text.size()));
+    return static_cast<bool>(f);
 }
 
 }  // namespace xmodelexport

@@ -37,6 +37,8 @@ target_include_directories(imgui_lib PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_D
 # Core has no D3D or UI dependency, so the tests can link it directly.
 add_library(iw4r_core STATIC
   src/brush.cpp
+  src/brushshapes.cpp
+  src/terrain.cpp
   src/document.cpp
   src/mapio.cpp
   src/iwi.cpp
@@ -54,9 +56,13 @@ add_library(iw4r_core STATIC
   src/zone/modelbuild.cpp
   src/zone/animbuild.cpp
   src/zone/weapondef.cpp
+  src/zone/pathnodes.cpp
+  src/zone/efx.cpp
+  src/zone/bo1fx.cpp
   src/model/xanimexport.cpp
   src/model/imageio.cpp
   src/model/xmodelexport.cpp
+  src/model/skeleton.cpp
   src/live/process.cpp
   src/live/liveimport.cpp)
 target_include_directories(iw4r_core PUBLIC src)

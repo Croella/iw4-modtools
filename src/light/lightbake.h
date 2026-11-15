@@ -50,7 +50,7 @@ Environment readEnvironment(const Document& doc);
 // volumetric_skydepth, volumetric_debug (1 mask, 2 depth, 3 fog), volumetric_shafts (0 = fog only).
 // Height fog: volumetric_fog (1 = on), volumetric_fog_density, _fog_falloff, _fog_height,
 // _fog_color "r g b", _fog_sun, _fog_anisotropy, _fog_start, _fog_max, _fog_sky, _fog_skydist; every
-// fog setting is written, defaults included. full_clip faces are written as "occluder" triangles
+// fog setting is written, defaults included. player clip faces are written as "occluder" triangles
 // (sun blockers for the shafts). Always written (enabled 0 when off, or no sun and no
 // fog) so a stale file never keeps the effect on.
 struct Volumetric {
@@ -77,7 +77,8 @@ struct PointLight {
 std::vector<PointLight> readLights(const Document& doc);
 
 bool isSkyMaterial(const std::string& name);
-// full_clip / clip_full: invisible, but stops the volumetric sun (shafts) in the game and the editor.
+// Player clip contents (0x10000: full_clip, clip_player, clip_ai, ...): invisible, but stops the
+// volumetric sun (shafts) in the game and the editor.
 bool blocksVolumetricSun(const std::string& name);
 // Faces that block light: drawn faces, caulk and sky. Clip/trigger/hint/etc. let light through.
 bool blocksLight(const std::string& name);

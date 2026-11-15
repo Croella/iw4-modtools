@@ -37,24 +37,32 @@ bool parseIwi(const uint8_t* data, size_t size, int maxDim, IwiImage& out, std::
         error = "not an IWI file";
         return false;
     }
-    if (data[3] != 8) {
-        error = "unsupported IWI version " + std::to_string(data[3]);
+    // Version 8 (MW2): format at 8, dims at 10, 32-byte header. Version 13 (Black Ops): format at 4,
+    // flags at 5, dims at 6, 8 picmip sizes, 48-byte header. Both store the smallest level first.
+    const uint8_t version = data[3];
+    if (version != 8 && version != 13) {
+        error = "unsupported IWI version " + std::to_string(version);
         return false;
     }
-    uint8_t format = data[8];
+    const size_t headerSize = version == 13 ? 48 : kHeaderSize;
+    if (size < headerSize) {
+        error = "not an IWI file";
+        return false;
+    }
+    uint8_t format = version == 13 ? data[4] : data[8];
     if (!(format >= 1 && format <= 5) && !isBlock(format)) {
         error = "unsupported IWI format " + std::to_string(format);
         return false;
     }
     uint16_t dims[3];
-    std::memcpy(dims, data + 10, sizeof dims);
+    std::memcpy(dims, data + (version == 13 ? 6 : 10), sizeof dims);
     int w = dims[0], h = dims[1];
     if (w <= 0 || h <= 0 || dims[2] != 1) {
         error = "unsupported IWI dimensions";
         return false;
     }
 
-    size_t payload = size - kHeaderSize;
+    size_t payload = size - headerSize;
     std::vector<std::pair<int, int>> chain;
     size_t fullChain = 0;
     for (int mw = w, mh = h;;) {

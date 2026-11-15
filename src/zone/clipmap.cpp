@@ -59,17 +59,22 @@ public:
         return idx;
     }
 
+    // One clipMap material per (name, surface type override): brushes overriding their surface type
+    // get their own entry with the same name.
     uint16_t material(const std::string& name) {
-        auto it = materialIndex_.find(name);
+        const std::string key = name + "#" + std::to_string(surfaceOverride_);
+        auto it = materialIndex_.find(key);
         if (it != materialIndex_.end()) return it->second;
         Material m;
         m.name = name.rfind("wc/", 0) == 0 ? name.substr(3) : name;  // stock clipMap names drop "wc/"
         m.contents = contentsForMaterial(name);
+        m.surfaceType = surfaceOverride_;
         uint16_t idx = static_cast<uint16_t>(out_.materials.size());
         out_.materials.push_back(m);
-        materialIndex_[name] = idx;
+        materialIndex_[key] = idx;
         return idx;
     }
+    int surfaceOverride_ = -1;
 
     bool isNonSolid(const std::string& material) const {
         if (!nonSolid_ || nonSolid_->empty()) return false;
@@ -82,6 +87,7 @@ public:
     bool addBrush(const ::Brush& src) {
         ::Brush b = src;
         if (!b.rebuild()) return false;
+        surfaceOverride_ = surfaceTypeIndex(b.surfaceType());
 
         uint32_t contents = 0;
         for (const Face& f : b.faces)

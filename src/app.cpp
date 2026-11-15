@@ -5,6 +5,7 @@
 #include "app.h"
 #include <imgui_internal.h>
 #include <algorithm>
+#include <map>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -20,6 +21,10 @@
 #include "live/liveimport.h"
 #include "zone/zonedump.h"
 #include "zone/zonesim.h"
+#include "model/imageio.h"
+#include "model/skeleton.h"
+#include "model/xmodelexport.h"
+#include <sstream>
 
 namespace {
 const char* kToolMaterials[] = {"caulk", "clip", "clip_full", "nodraw", "portal", "trigger", "sky"};
@@ -340,22 +345,57 @@ void App::loadZoneSourcePreview() {
     const std::string dir = zoneSourcePath(doc.path);
     if (!std::filesystem::is_directory(std::filesystem::path(dir) / "xmodels")) return;
     std::vector<std::string> warnings;
-    std::vector<modelbuild::Model> models = loadZoneSourceModels(dir, warnings);
+    // Same build options as the compiler (weapon hideTags drop attachment geometry, ...), so the
+    // preview and the Models browser show what the game will.
+    std::vector<std::string> weaponWarnings;
+    ZoneSourceWeapons zw = loadZoneSourceWeapons(dir, weaponWarnings);
+    std::vector<modelbuild::Model> models = loadZoneSourceModels(dir, warnings, &zw.hints);
     for (const std::string& w : warnings) log("  zone_source: " + w);
+    browserModels.clear();
+    renderer.clearThumbnails();
     for (const modelbuild::Model& md : models) {
         auto lm = std::make_shared<live::LiveModel>();
         lm->name = md.name;
+        BrowserModel bm;
+        bm.name = md.name;
+        bm.bones = md.bones.size();
+        bm.surfaces = md.surfaces.size();
+        for (const modelbuild::Surface& s : md.surfaces) {
+            bm.tris += s.tris.size() / 3;
+            bm.verts += s.verts.size();
+            const std::string& tex = md.materials[s.material].texture;
+            const std::string t = tex.empty() ? md.materials[s.material].name : std::filesystem::path(tex).filename().string();
+            if (std::find(bm.textures.begin(), bm.textures.end(), t) == bm.textures.end()) bm.textures.push_back(t);
+        }
+        bm.size = Vec3{md.maxs[0] - md.mins[0], md.maxs[1] - md.mins[1], md.maxs[2] - md.mins[2]};
+        browserModels.push_back(std::move(bm));
         for (const modelbuild::Surface& s : md.surfaces) {
             live::LiveModelSurf ls;
             const modelbuild::Material& mm = md.materials[s.material];
             ls.material = "mc/" + md.name + "_" + mm.name;
+            // Same search as the compiler (planModelMaterials): zone_source/images, then next to the
+            // models in zone_source/xmodels; exported name, stem.png/.tga, and without t5_/t6_/t7_.
             std::string stem = std::filesystem::path(mm.texture).stem().string();
-            for (const std::string& cand : {std::filesystem::path(mm.texture).filename().string(), stem + ".png", stem + ".tga"}) {
-                std::filesystem::path p = std::filesystem::path(dir) / "images" / cand;
-                if (!cand.empty() && std::filesystem::exists(p)) {
-                    renderer.setTextureFile(ls.material, p.string());
-                    break;
+            if (stem.empty()) stem = mm.name;
+            std::string bare = stem;
+            for (const char* pre : {"t5_", "t6_", "t7_", "T5_", "T6_", "T7_"})
+                if (bare.rfind(pre, 0) == 0) bare = bare.substr(3);
+            bool found = false;
+            for (const char* sub : {"images", "xmodels"}) {
+                std::vector<std::string> cands;
+                if (!mm.texture.empty()) cands.push_back(std::filesystem::path(mm.texture).filename().string());
+                for (const std::string& st : {stem, bare})
+                    for (const char* ext : {".png", ".tga", ".PNG", ".TGA"}) cands.push_back(st + ext);
+                for (const std::string& cand : cands) {
+                    std::filesystem::path p = std::filesystem::path(dir) / sub / cand;
+                    std::error_code ec;
+                    if (!cand.empty() && std::filesystem::is_regular_file(p, ec)) {
+                        renderer.setTextureFile(ls.material, p.string());
+                        found = true;
+                        break;
+                    }
                 }
+                if (found) break;
             }
             for (const modelbuild::PackedVertex& v : s.verts) {
                 ls.pos.insert(ls.pos.end(), v.xyz, v.xyz + 3);
@@ -981,6 +1021,35 @@ void App::handleShortcuts() {
     ImGuiIO& io = ImGui::GetIO();
     if (io.WantTextInput || dragMode != DragMode::None) return;
     bool ctrl = io.KeyCtrl;
+    if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_T, false)) {
+        terrainSculpt = !terrainSculpt && activeTerrain() >= 0;
+        log(terrainSculpt ? "Terrain sculpting: hold the left mouse button on the terrain (Ctrl inverts)" : "Terrain sculpting off");
+    }
+    // Pen tool keys (before the general ones: Backspace/Esc mean "undo point"/"cancel" here).
+    if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_P, false)) {
+        penActive = !penActive;
+        penPoints.clear();
+        penView = -1;
+        log(penActive ? "Pen: click points in a grid view; Enter or the first point finishes" : "Pen off");
+    }
+    if (penActive) {
+        if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) {
+            finishPen();
+            return;
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Backspace, true) && !penPoints.empty()) {
+            penPoints.pop_back();
+            return;
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+            if (penPoints.empty()) {
+                penActive = false;
+                log("Pen off");
+            }
+            penPoints.clear();
+            return;
+        }
+    }
     if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Z, true)) doc.undo();
     if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Y, true)) doc.redo();
     if (ctrl && ImGui::IsKeyPressed(ImGuiKey_S, false)) save(io.KeyShift);
@@ -1031,15 +1100,23 @@ void App::frame() {
     pollBake();
     refreshMaterials();
     handleShortcuts();
-    drawDockspace();
     drawMenu();
+    drawToolbar();
+    drawDockspace();
     for (int i = 0; i < 3; i++) drawGrid(views[i], i);
     drawCamera();
     drawInspector();
+    drawTerrainPanel();
     drawTextures();
+    drawModelBrowser();
     drawConsole();
     if (showSettings) drawSettings();
     drawCompileTargetPopup();
+    if (terrainStroking && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) endTerrainStroke();
+    if (!focusWindow.empty() && !firstFrame) {
+        ImGui::SetWindowFocus(focusWindow.c_str());
+        focusWindow.clear();
+    }
     firstFrame = false;
 }
 
@@ -1066,6 +1143,7 @@ void App::drawDockspace() {
     ImGui::DockBuilderDockWindow("Side (YZ)", botRight);
     ImGui::DockBuilderDockWindow("Inspector", inspector);
     ImGui::DockBuilderDockWindow("Textures", right);
+    ImGui::DockBuilderDockWindow("Models", right);
     ImGui::DockBuilderDockWindow("Console", bottom);
     ImGui::DockBuilderFinish(id);
 }
@@ -1310,6 +1388,17 @@ void App::drawGrid(GridView& view, int index) {
     auto worldV = [&](float y) { return view.centerV - (y - cy) / view.zoom; };
 
     double mu = worldU(io.MousePos.x), mv = worldV(io.MousePos.y);
+    // A model dragged from the Models browser: placed under the cursor on the working plane.
+    if (ImGui::BeginDragDropTarget()) {
+        if (const ImGuiPayload* pl = ImGui::AcceptDragDropPayload("IW4R_XMODEL")) {
+            Vec3 p;
+            p[view.u] = snapTo(mu, gridSize);
+            p[view.v] = snapTo(mv, gridSize);
+            p[view.w] = workMin[view.w];
+            placeModel(static_cast<const char*>(pl->Data), p);
+        }
+        ImGui::EndDragDropTarget();
+    }
 
     // Zoom around the cursor, so the point under it stays put.
     if (hovered && io.MouseWheel != 0) {
@@ -1356,7 +1445,28 @@ void App::drawGrid(GridView& view, int index) {
         else if (insideSel) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
     }
 
-    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+    // Pen tool: left clicks place snapped outline points instead of selecting / dragging.
+    const double penU = snapTo(mu, gridSize), penV = snapTo(mv, gridSize);
+    bool penCloses = false;
+    if (penActive && penView == index && penPoints.size() >= 3) {
+        ImVec2 first = toScreen(penPoints[0][0], penPoints[0][1]);
+        penCloses = std::hypot(io.MousePos.x - first.x, io.MousePos.y - first.y) < 9.0f;
+    }
+    if (terrainSculpt) {
+        // Terrain sculpting in the Top view (the height field lies in XY).
+        if (view.w == 2 && hovered && ImGui::IsMouseDown(ImGuiMouseButton_Left) && (terrainStroking || ImGui::IsMouseClicked(ImGuiMouseButton_Left)))
+            terrainStrokeAt(mu, mv);
+    } else if (penActive) {
+        if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            if (penView != index) {  // a new outline in this view
+                penPoints.clear();
+                penView = index;
+            }
+            const bool repeat = !penPoints.empty() && penPoints.back()[0] == penU && penPoints.back()[1] == penV;
+            if (penCloses || (repeat && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && penPoints.size() >= 3)) finishPen();
+            else if (!repeat) penPoints.push_back({penU, penV});
+        }
+    } else if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         if (io.KeyShift) {
             pickInGrid(view, mu, mv, true);
         } else if (grabU || grabV || insideSel) {
@@ -1474,6 +1584,39 @@ void App::drawGrid(GridView& view, int index) {
         }
     }
 
+    if (terrainSculpt && view.w == 2 && hovered) {
+        const ImVec2 c = toScreen(mu, mv);
+        dl->AddCircle(c, static_cast<float>(terrainBrush.radius * view.zoom), rgb(0.5f, 1.0f, 0.45f), 48, 1.5f);
+        dl->AddText({c.x + 8, c.y + 8}, rgb(0.6f, 1.0f, 0.55f), terrain::toolName(terrainBrush.tool));
+    }
+    // Pen outline: placed points, the rubber band to the snapped cursor, and the closing edge.
+    if (penActive && (penView == index || (penPoints.empty() && hovered))) {
+        const ImU32 penCol = rgb(1.0f, 0.4f, 0.75f), faint = rgb(1.0f, 0.4f, 0.75f, 0.45f);
+        const ImVec2 cur = toScreen(penU, penV);
+        for (size_t i = 0; i + 1 < penPoints.size(); i++)
+            dl->AddLine(toScreen(penPoints[i][0], penPoints[i][1]), toScreen(penPoints[i + 1][0], penPoints[i + 1][1]), penCol, 2.0f);
+        if (!penPoints.empty() && hovered && penView == index) {
+            const ImVec2 last = toScreen(penPoints.back()[0], penPoints.back()[1]);
+            const ImVec2 first = toScreen(penPoints[0][0], penPoints[0][1]);
+            dl->AddLine(last, penCloses ? first : cur, penCol, 1.5f);
+            if (!penCloses && penPoints.size() >= 2) dl->AddLine(cur, first, faint, 1.0f);
+        } else if (penPoints.size() >= 3) {
+            dl->AddLine(toScreen(penPoints.back()[0], penPoints.back()[1]), toScreen(penPoints[0][0], penPoints[0][1]), faint, 1.0f);
+        }
+        for (size_t i = 0; i < penPoints.size(); i++) {
+            const ImVec2 q = toScreen(penPoints[i][0], penPoints[i][1]);
+            dl->AddCircleFilled(q, i == 0 ? (penCloses ? 7.0f : 5.0f) : 3.5f, i == 0 ? rgb(1, 0.85f, 0.95f) : penCol);
+        }
+        if (hovered) {
+            dl->AddCircle(cur, 5.0f, penCol, 12, 1.5f);
+            const char* hint = penPoints.empty()       ? "pen: click to start an outline"
+                               : penPoints.size() < 3 ? "pen: keep clicking points"
+                               : penCloses            ? "pen: click to finish"
+                                                      : "pen: click the first point or Enter to finish, Backspace undo, Esc cancel";
+            dl->AddText({cur.x + 10, cur.y + 8}, rgb(1, 0.75f, 0.9f), hint);
+        }
+    }
+
     if (selBox.valid()) {
         ImVec2 a = toScreen(selBox.mins[view.u], selBox.maxs[view.v]), c = toScreen(selBox.maxs[view.u], selBox.mins[view.v]);
         dl->AddRect(a, c, rgb(1, 0.45f, 0.3f, 0.5f));
@@ -1524,6 +1667,19 @@ void App::drawCamera() {
         ImGui::InvisibleButton("##cam", size, ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
         ImGuiIO& io = ImGui::GetIO();
         bool hovered = ImGui::IsItemHovered();
+        // A model dragged from the Models browser: placed where the cursor's ray hits a brush.
+        if (ImGui::BeginDragDropTarget()) {
+            if (const ImGuiPayload* pl = ImGui::AcceptDragDropPayload("IW4R_XMODEL")) {
+                double ys = std::tan(70.0 * 3.14159265358979323846 / 360.0);
+                double nx = ((io.MousePos.x - pos.x) / size.x * 2 - 1) * ys * (size.x / size.y);
+                double ny = (1 - (io.MousePos.y - pos.y) / size.y * 2) * ys;
+                Vec3 dir = normalize(camera.forward() + camera.right() * nx + camera.up() * ny);
+                Vec3 hit;
+                Vec3 p = cameraRayHit(dir, hit) ? hit : camera.pos + dir * 256.0;
+                placeModel(static_cast<const char*>(pl->Data), {snapTo(p.x, gridSize), snapTo(p.y, gridSize), snapTo(p.z, gridSize)});
+            }
+            ImGui::EndDragDropTarget();
+        }
         if (ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
             camera.yaw -= io.MouseDelta.x * 0.22;
             camera.pitch = std::clamp(camera.pitch - io.MouseDelta.y * 0.22, -89.0, 89.0);
@@ -1537,7 +1693,41 @@ void App::drawCamera() {
             if (ImGui::IsKeyDown(ImGuiKey_Q)) camera.pos.z -= speed;
         }
         if (hovered && io.MouseWheel != 0) camera.pos += camera.forward() * (io.MouseWheel * 64.0);
-        if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        terrainCursorValid = false;
+        if (terrainSculpt && hovered) {
+            // Sculpting: the cursor's ray against the terrain; the brush ring drawn on the ground.
+            double ys = std::tan(70.0 * 3.14159265358979323846 / 360.0);
+            double nx = ((io.MousePos.x - pos.x) / size.x * 2 - 1) * ys * (size.x / size.y);
+            double ny = (1 - (io.MousePos.y - pos.y) / size.y * 2) * ys;
+            Vec3 dir = normalize(camera.forward() + camera.right() * nx + camera.up() * ny);
+            double hx, hy;
+            if (terrainRayHit(dir, hx, hy)) {
+                terrainCursorValid = true;
+                terrainCursor[0] = hx, terrainCursor[1] = hy;
+                if (ImGui::IsMouseDown(ImGuiMouseButton_Left) && (terrainStroking || ImGui::IsMouseClicked(ImGuiMouseButton_Left)))
+                    terrainStrokeAt(hx, hy);
+                terrain::Field tf;
+                const int te = activeTerrain();
+                if (te >= 0 && (terrainStroking ? (tf = terrainField, true) : terrain::read(doc.ents[te], tf))) {
+                    ImDrawList* cdl = ImGui::GetWindowDrawList();
+                    const Vec3 f = camera.forward(), r = camera.right(), u = camera.up();
+                    std::vector<ImVec2> ring;
+                    for (int k = 0; k <= 48; k++) {
+                        const double a = 2 * 3.14159265358979323846 * k / 48;
+                        const double px = hx + std::cos(a) * terrainBrush.radius, py = hy + std::sin(a) * terrainBrush.radius;
+                        double ph = 0;
+                        if (!tf.heightAt(px, py, ph)) tf.heightAt(std::clamp(px, tf.worldX(0), tf.worldX(tf.nx)), std::clamp(py, tf.worldY(0), tf.worldY(tf.ny)), ph);
+                        const Vec3 d = Vec3{px, py, tf.origin.z + ph + 2} - camera.pos;
+                        const double z = dot(d, f);
+                        if (z < 1) continue;
+                        ring.push_back({pos.x + static_cast<float>((dot(d, r) / (z * ys * (size.x / size.y)) + 1) * 0.5 * size.x),
+                                        pos.y + static_cast<float>((1 - dot(d, u) / (z * ys)) * 0.5 * size.y)});
+                    }
+                    if (ring.size() > 2) cdl->AddPolyline(ring.data(), static_cast<int>(ring.size()), IM_COL32(130, 255, 115, 255), 0, 2.0f);
+                }
+            }
+        }
+        if (!terrainSculpt && hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             // Builds the view ray through the cursor to pick the nearest brush.
             double ys = std::tan(70.0 * 3.14159265358979323846 / 360.0);
             double nx = ((io.MousePos.x - pos.x) / size.x * 2 - 1) * ys * (size.x / size.y);
@@ -1660,6 +1850,31 @@ void App::drawInspector() {
             ImGui::SetTooltip("The game hides faces seen from behind. Two-sided brushes are compiled with a\n"
                               "mirrored copy of every face, so they also show from inside the brush.\n"
                               "Preview with View > Back-Face Culling (F6).");
+        // Per-brush surface type (footsteps, impacts, bullettrace surfacetype, AI groundtype).
+        {
+            const std::string cur = first->surfaceType();
+            bool mixed = false;
+            for (const Sel& s : doc.sel)
+                if (s.brush >= 0 && doc.ents[s.ent].brushes[s.brush].surfaceType() != cur) mixed = true;
+            const std::string preview = mixed ? "(mixed)" : cur.empty() ? "From material" : cur;
+            if (ImGui::BeginCombo("Surface type", preview.c_str())) {
+                auto pick = [&](const std::string& v) {
+                    doc.pushUndo();
+                    for (const Sel& s : doc.sel)
+                        if (s.brush >= 0) doc.ents[s.ent].brushes[s.brush].setSurfaceType(v);
+                    doc.touch();
+                };
+                if (ImGui::Selectable("From material", !mixed && cur.empty())) pick("");
+                ImGui::Separator();
+                for (const std::string& n : surfaceTypeNames())
+                    if (ImGui::Selectable(n.c_str(), !mixed && cur == n)) pick(n);
+                ImGui::EndCombo();
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("What the game thinks this brush is made of: footstep sounds, bullet impact\n"
+                                  "effects and sounds, and script traces (bullettrace \"surfacetype\").\n"
+                                  "From material = the stock material's own type (default for custom ones).");
+        }
         TexDef t = first->faces[0].tex;
         float vals[5] = {(float)t.w, (float)t.h, (float)t.sx, (float)t.sy, (float)t.rot};
         bool changed = false;
@@ -1726,6 +1941,672 @@ void App::drawTextures() {
                     ImGui::PushClipRect(ImGui::GetCursorScreenPos(),
                                         {ImGui::GetCursorScreenPos().x + thumbSize + 6, ImGui::GetCursorScreenPos().y + 20}, true);
                     ImGui::TextUnformatted(name.c_str());
+                    ImGui::PopClipRect();
+                    ImGui::PopID();
+                    ImGui::EndGroup();
+                }
+            }
+        }
+    }
+    ImGui::EndChild();
+    ImGui::End();
+}
+
+// The tool bar under the menu (an ImGui viewport side bar, so the dock space shrinks to fit).
+void App::drawToolbar() {
+    const float h = ImGui::GetFrameHeight() + ImGui::GetStyle().WindowPadding.y * 2;
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings;
+    if (ImGui::BeginViewportSideBar("##iw4r_toolbar", ImGui::GetMainViewport(), ImGuiDir_Up, h, flags)) {
+        const bool haveSource = !doc.path.empty();
+        ImGui::BeginDisabled(!haveSource);
+        if (ImGui::Button("TGA -> PNG")) convertTgaToPng();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Converts every .tga under zone_source (images, xmodels, ...) to a .png next to it.\n%s",
+                              haveSource ? "" : "Save the map first: zone_source is next to the .map.");
+        ImGui::SameLine();
+        ImGui::Checkbox("delete .tga", &deleteTgaAfterConvert);
+        ImGui::SameLine();
+        if (ImGui::Button("Fix skeletons for IW4")) convertSkeletons();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Black Ops / CoD4 models in zone_source/xmodels -> MW2 skeletons:\n"
+                              "lower-case bone names, tag_origin root and the tags MW2's AI/weapons use\n"
+                              "(tag_eye, tag_weapon_right, ...), at most 128 bones (bones MW2 never animates\n"
+                              "are merged into their parents). Originals are kept as .orig.");
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::TextDisabled("|");
+        ImGui::SameLine();
+        if (penActive) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+        if (ImGui::Button(penActive ? "Pen (on)" : "Pen")) {
+            penActive = !penActive;
+            penPoints.clear();
+            penView = -1;
+        }
+        if (penActive) ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Pen (P): click points in a grid view to outline a shape; click the first point or press\n"
+                              "Enter to make it. It's extruded through the work area's depth (the last selection's), split\n"
+                              "into convex brushes if needed. Backspace removes the last point, Esc cancels / turns it off.");
+        ImGui::SameLine();
+        for (shapes::Shape s : shapes::kAll) {
+            if (ImGui::Button(shapes::name(s))) addShape(static_cast<int>(s));
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s\nFits the selected brushes (replacing them), or a 128 box where the camera looks.\n"
+                                  "Material: the current texture (%s).",
+                                  shapes::tooltip(s), currentMaterial.c_str());
+            ImGui::SameLine();
+        }
+        ImGui::TextDisabled("|");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(70);
+        ImGui::DragInt("Sides", &shapeParams.sides, 0.2f, 3, 64);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(70);
+        ImGui::DragInt("Steps", &shapeParams.steps, 0.2f, 1, 128);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(70);
+        float t = static_cast<float>(shapeParams.thickness);
+        if (ImGui::DragFloat("Thickness", &t, 0.5f, 1, 512, "%.0f")) shapeParams.thickness = t;
+    }
+    ImGui::End();
+}
+
+void App::convertTgaToPng() {
+    namespace fs = std::filesystem;
+    const fs::path dir = zoneSourcePath(doc.path);
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) {
+        log("TGA -> PNG: no zone_source folder next to the map (" + dir.string() + ")");
+        return;
+    }
+    size_t converted = 0, skipped = 0, failed = 0;
+    for (fs::recursive_directory_iterator it(dir, ec), end; it != end && !ec; it.increment(ec)) {
+        if (!it->is_regular_file(ec)) continue;
+        std::string ext = it->path().extension().string();
+        for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (ext != ".tga") continue;
+        fs::path png = it->path();
+        png.replace_extension(".png");
+        if (fs::exists(png, ec) && fs::last_write_time(png, ec) >= fs::last_write_time(it->path(), ec)) {
+            skipped++;
+            continue;
+        }
+        imageio::Rgba img;
+        std::string err;
+        if (!imageio::load(it->path().string(), img, err) || !imageio::savePng(png.string(), img, err)) {
+            log("  " + it->path().filename().string() + ": " + err);
+            failed++;
+            continue;
+        }
+        converted++;
+        if (deleteTgaAfterConvert) fs::remove(it->path(), ec);
+    }
+    log("TGA -> PNG: " + std::to_string(converted) + " converted, " + std::to_string(skipped) + " already up to date" +
+        (failed ? ", " + std::to_string(failed) + " failed" : std::string()) + (deleteTgaAfterConvert ? " (.tga files deleted)" : ""));
+    if (converted) loadZoneSourcePreview();
+}
+
+void App::convertSkeletons() {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::path(zoneSourcePath(doc.path)) / "xmodels";
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) {
+        log("Fix skeletons: no zone_source/xmodels next to the map");
+        return;
+    }
+    size_t changed = 0, total = 0;
+    for (const auto& e : fs::directory_iterator(dir, ec)) {
+        std::string ext = e.path().extension().string();
+        for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (ext != ".xmodel_export") continue;
+        total++;
+        std::ifstream in(e.path(), std::ios::binary);
+        std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        in.close();
+        xmodelexport::Model m;
+        std::string err;
+        if (!xmodelexport::parse(text, m, err)) {
+            log("  " + e.path().filename().string() + ": " + err);
+            continue;
+        }
+        skeleton::Report r;
+        r.source = skeleton::detectSource(text);
+        if (!skeleton::convertForIw4(m, r, err)) {
+            log("  " + e.path().filename().string() + ": " + err);
+            continue;
+        }
+        log("  " + e.path().filename().string() + ": " + r.summary());
+        if (!r.changed()) continue;
+        // Keep the original once, and the export's comment header (it says which game it came from).
+        fs::path orig = e.path();
+        orig += ".orig";
+        if (!fs::exists(orig, ec)) fs::copy_file(e.path(), orig, ec);
+        std::vector<std::string> header;
+        std::istringstream lines(text);
+        for (std::string line; std::getline(lines, line) && line.rfind("//", 0) == 0;) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+            header.push_back(line.substr(line.find_first_not_of("/ ")));
+        }
+        header.push_back("Skeleton converted for IW4 by iw4-radiant: " + r.summary());
+        if (!xmodelexport::save(m, e.path().string(), err, header)) {
+            log("  " + err);
+            continue;
+        }
+        changed++;
+    }
+    log("Fix skeletons: " + std::to_string(changed) + " of " + std::to_string(total) + " model(s) converted" +
+        (changed ? " (originals kept as .orig)" : ""));
+    if (changed) loadZoneSourcePreview();
+}
+
+// ---- terrain ----
+int App::activeTerrain() {
+    // The selected terrain entity, else the last one edited, else the first in the map.
+    for (const Sel& s : doc.sel)
+        if (s.brush < 0 && s.ent > 0 && s.ent < static_cast<int>(doc.ents.size()) && doc.ents[s.ent].classname() == terrain::kClass)
+            return terrainEnt = s.ent;
+    if (terrainEnt > 0 && terrainEnt < static_cast<int>(doc.ents.size()) && doc.ents[terrainEnt].classname() == terrain::kClass)
+        return terrainEnt;
+    for (size_t e = 1; e < doc.ents.size(); e++)
+        if (doc.ents[e].classname() == terrain::kClass) return terrainEnt = static_cast<int>(e);
+    return terrainEnt = -1;
+}
+
+bool App::terrainRayHit(const Vec3& dir, double& x, double& y) {
+    const int te = activeTerrain();
+    terrain::Field f;
+    if (te < 0 || !(terrainStroking ? (f = terrainField, true) : terrain::read(doc.ents[te], f))) return false;
+    // March along the ray, then bisect the crossing.
+    const double step = f.cell * 0.25;
+    double prevT = 0;
+    auto below = [&](double t, bool& inside) {
+        const Vec3 p = camera.pos + dir * t;
+        double h;
+        inside = f.heightAt(p.x, p.y, h);
+        return inside && p.z <= f.origin.z + h;
+    };
+    bool inside;
+    for (double t = step; t < 40000; t += step) {
+        if (below(t, inside)) {
+            double a = prevT, b = t;
+            for (int k = 0; k < 20; k++) {
+                const double m = (a + b) / 2;
+                (below(m, inside) ? b : a) = m;
+            }
+            const Vec3 p = camera.pos + dir * b;
+            x = p.x, y = p.y;
+            return true;
+        }
+        prevT = t;
+    }
+    return false;
+}
+
+void App::terrainStrokeAt(double x, double y) {
+    const int te = activeTerrain();
+    if (te < 0) return;
+    if (!terrainStroking) {
+        if (!terrain::read(doc.ents[te], terrainField)) return;
+        doc.pushUndo();
+        terrainStroking = true;
+        double h = 0;
+        terrainField.heightAt(x, y, h);
+        terrainBrush.flattenTo = h;
+        terrainBrush.seed++;
+    }
+    terrain::Stroke s = terrainBrush;
+    if (s.tool == terrain::Tool::Paint) {
+        s.material = currentMaterial;
+        terrain::paint(doc, terrainField, s, x, y, ImGui::GetIO().KeyCtrl);
+        return;
+    }
+    if (ImGui::GetIO().KeyCtrl) {  // Ctrl inverts raise / lower
+        if (s.tool == terrain::Tool::Raise) s.tool = terrain::Tool::Lower;
+        else if (s.tool == terrain::Tool::Lower) s.tool = terrain::Tool::Raise;
+    }
+    int i0, j0, i1, j1;
+    const double dt = std::min(0.1, static_cast<double>(ImGui::GetIO().DeltaTime));
+    if (terrain::apply(terrainField, s, x, y, dt, i0, j0, i1, j1)) terrain::rebuildCells(doc, terrainField, i0, j0, i1, j1);
+}
+
+void App::endTerrainStroke() {
+    if (!terrainStroking) return;
+    terrainStroking = false;
+    const int te = activeTerrain();
+    if (te >= 0) terrain::write(terrainField, doc.ents[te]);
+    doc.touch();
+}
+
+// The Terrain panel: create a terrain, sculpt it (T), generate mountains, delete it.
+void App::drawTerrainPanel() {
+    if (ImGuiWindow* iw = ImGui::FindWindowByName("Inspector"); iw && iw->DockId)
+        ImGui::SetNextWindowDockID(iw->DockId, ImGuiCond_FirstUseEver);  // a tab next to the Inspector
+    if (!ImGui::Begin("Terrain")) {
+        ImGui::End();
+        return;
+    }
+    const int te = activeTerrain();
+    terrain::Field f;
+    const bool have = te >= 0 && terrain::read(doc.ents[te], f);
+    ImGui::SeparatorText("Sculpt");
+    if (!have) ImGui::TextDisabled("No terrain yet: create one below.");
+    ImGui::BeginDisabled(!have);
+    if (terrainSculpt) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+    if (ImGui::Button(terrainSculpt ? "Sculpting (T)" : "Sculpt (T)", {-1, 0})) terrainSculpt = !terrainSculpt;
+    if (terrainSculpt) ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("While on: hold the left mouse button on the terrain in the 3D view or the Top view.\n"
+                          "Ctrl inverts Raise/Lower and makes Paint erase. Each stroke is one undo step.");
+    int k = 0;
+    for (terrain::Tool t : terrain::kTools) {
+        if (k++ % 3) ImGui::SameLine();
+        if (ImGui::RadioButton(terrain::toolName(t), terrainBrush.tool == t)) terrainBrush.tool = t;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", terrain::toolTip(t));
+    }
+    float radius = static_cast<float>(terrainBrush.radius), strength = static_cast<float>(terrainBrush.strength);
+    if (ImGui::SliderFloat("Radius", &radius, 16, 2048, "%.0f", ImGuiSliderFlags_Logarithmic)) terrainBrush.radius = radius;
+    if (terrainBrush.tool != terrain::Tool::Paint) {
+        if (ImGui::SliderFloat("Strength", &strength, 4, 1024, "%.0f", ImGuiSliderFlags_Logarithmic)) terrainBrush.strength = strength;
+    } else {
+        const bool bad = currentMaterial.empty() || currentMaterial.find("caulk") != std::string::npos;
+        ImGui::TextColored(bad ? ImVec4(1, 0.5f, 0.4f, 1) : ImGui::GetStyleColorVec4(ImGuiCol_Text), "Texture: %s", currentMaterial.c_str());
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("The current texture: pick one in the Textures browser. Ctrl+drag erases paint.");
+        float scatter = static_cast<float>(terrainBrush.scatter);
+        if (ImGui::SliderFloat("Scatter", &scatter, 0, 1, "%.2f")) terrainBrush.scatter = scatter;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("0: a hard circle. Higher: a ragged, scattered rim that looks less hand-drawn.");
+        float s0 = static_cast<float>(terrainBrush.minSlope), s1 = static_cast<float>(terrainBrush.maxSlope);
+        if (ImGui::DragFloatRange2("Only slopes", &s0, &s1, 0.25f, 0, 90, "%.0f deg", "%.0f deg", ImGuiSliderFlags_AlwaysClamp))
+            terrainBrush.minSlope = s0, terrainBrush.maxSlope = s1;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Paint only triangles this steep, e.g. 35-90 puts rock on cliffs without touching the flats");
+    }
+    ImGui::EndDisabled();
+    if (have) {
+        ImGui::SeparatorText("This terrain");
+        ImGui::TextDisabled("%s: %d x %d cells of %g (%d brushes), %s", f.id.c_str(), f.nx, f.ny, f.cell, f.nx * f.ny * 2, f.material.c_str());
+        ImGui::SetNextItemWidth(120);
+        ImGui::DragFloat("Height", &terrainMountain, 4, 16, 8192, "%.0f");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(80);
+        ImGui::SliderInt("Detail", &terrainOctaves, 1, 8);
+        if (ImGui::Button("Mountains")) {
+            doc.pushUndo();
+            terrain::mountains(f, terrainMountain, terrainOctaves, terrainSeed++);
+            terrain::write(f, doc.ents[te]);
+            terrain::rebuildCells(doc, f, 0, 0, f.nx, f.ny);
+            log("Terrain " + f.id + ": generated mountains");
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Replaces the heights with fractal hills (a new random set each click)");
+        ImGui::SameLine();
+        if (ImGui::Button("Flatten all")) {
+            doc.pushUndo();
+            std::fill(f.h.begin(), f.h.end(), 0.0);
+            terrain::write(f, doc.ents[te]);
+            terrain::rebuildCells(doc, f, 0, 0, f.nx, f.ny);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Use current texture")) {
+            doc.pushUndo();
+            f.material = currentMaterial;
+            terrain::write(f, doc.ents[te]);
+            auto& world = doc.ents[0].brushes;  // retexture the tops (rebuild keeps hand-set ones)
+            for (Brush& b : world) {
+                std::string id;
+                int i, j, t;
+                if (terrain::parseTag(b, id, i, j, t) && id == f.id && !b.faces.empty()) b.faces[0].material = f.material;
+            }
+            terrain::rebuildCells(doc, f, 0, 0, f.nx, f.ny);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Delete")) {
+            doc.pushUndo();
+            terrain::removeBrushes(doc, f.id);
+            doc.ents.erase(doc.ents.begin() + te);
+            terrainEnt = -1;
+            terrainSculpt = false;
+            doc.touch();
+            ImGui::End();
+            return;
+        }
+        drawTerrainPaint(te, f);
+    }
+    ImGui::SeparatorText("New terrain");
+    ImGui::SetNextItemWidth(120);
+    ImGui::InputInt2("Cells", terrainNew);
+    terrainNew[0] = std::clamp(terrainNew[0], 1, 128);
+    terrainNew[1] = std::clamp(terrainNew[1], 1, 128);
+    ImGui::SetNextItemWidth(120);
+    ImGui::DragFloat("Cell size", &terrainCell, 1, 8, 1024, "%.0f");
+    ImGui::SetNextItemWidth(120);
+    ImGui::DragFloat("Depth", &terrainDepth, 1, 8, 4096, "%.0f");
+    ImGui::TextDisabled("%g x %g units, %d brushes, texture %s", terrainNew[0] * terrainCell, terrainNew[1] * terrainCell,
+                        terrainNew[0] * terrainNew[1] * 2, currentMaterial.c_str());
+    if (ImGui::Button("Create terrain", {-1, 0})) {
+        terrain::Field nf;
+        nf.nx = terrainNew[0];
+        nf.ny = terrainNew[1];
+        nf.cell = terrainCell;
+        nf.depth = terrainDepth;
+        const std::string cm = currentMaterial;
+        nf.material = (cm.find("caulk") != std::string::npos || cm.find("clip") != std::string::npos || cm.empty()) ? "ch_ground_dirt03" : cm;
+        // On the selection's floor (its min corner), else centred where the camera looks.
+        AABB sel = doc.selectionBounds();
+        if (sel.valid()) {
+            nf.origin = {sel.mins.x, sel.mins.y, sel.maxs.z};
+        } else {
+            Vec3 hit;
+            Vec3 p = cameraRayHit(camera.forward(), hit) ? hit : camera.pos + camera.forward() * 512.0;
+            nf.origin = {snapTo(p.x - nf.nx * nf.cell / 2, gridSize), snapTo(p.y - nf.ny * nf.cell / 2, gridSize), snapTo(p.z, gridSize)};
+        }
+        doc.pushUndo();
+        terrainEnt = terrain::create(doc, nf);
+        doc.sel = {Sel{terrainEnt, -1}};
+        doc.touchSelection();
+        terrainSculpt = true;
+        log("Terrain created: " + std::to_string(nf.nx) + " x " + std::to_string(nf.ny) + " cells (" + std::to_string(nf.nx * nf.ny * 2) +
+            " brushes); sculpting on (T), hold the left mouse button on it");
+    }
+    ImGui::End();
+}
+
+// Texture painting by slope: an ordered rule list (first match wins) stored on the terrain entity.
+// Every edit repaints immediately (materials only, no geometry rebuild); one undo step per edit.
+void App::drawTerrainPaint(int te, terrain::Field& f) {
+    ImGui::SeparatorText("Paint by slope");
+    const terrain::Field before = f;
+    bool changed = false, begin = false;
+    auto track = [&](bool edited) {
+        if (ImGui::IsItemActivated()) begin = true;
+        changed |= edited;
+    };
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::BeginCombo("##preset", "Preset...")) {
+        for (const terrain::PaintPreset& p : terrain::paintPresets())
+            if (ImGui::Selectable(p.name)) {
+                f.paint = p.rules;
+                if (f.paintJitter <= 0) f.paintJitter = 4;
+                begin = changed = true;
+            }
+        ImGui::EndCombo();
+    }
+    if (f.paint.empty()) ImGui::TextDisabled("No rules: every cell uses %s. Pick a preset or add a rule.", f.material.c_str());
+    int remove = -1, up = -1;
+    for (size_t k = 0; k < f.paint.size(); k++) {
+        terrain::PaintRule& r = f.paint[k];
+        ImGui::PushID(static_cast<int>(k));
+        char buf[128];
+        std::snprintf(buf, sizeof buf, "%s", r.material.c_str());
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 110);
+        if (ImGui::InputText("##mat", buf, sizeof buf, ImGuiInputTextFlags_EnterReturnsTrue)) {
+            r.material = buf;
+            begin = changed = true;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Material (Enter to apply). Rules are tried top to bottom; the first match wins.");
+        ImGui::SameLine();
+        if (ImGui::Button("Use")) {
+            r.material = currentMaterial;
+            begin = changed = true;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Use the current texture (%s)", currentMaterial.c_str());
+        ImGui::SameLine();
+        ImGui::BeginDisabled(k == 0);
+        if (ImGui::ArrowButton("##up", ImGuiDir_Up)) up = static_cast<int>(k);
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("X")) remove = static_cast<int>(k);
+        float s0 = static_cast<float>(r.minSlope), s1 = static_cast<float>(r.maxSlope);
+        ImGui::SetNextItemWidth(-60);
+        track(ImGui::DragFloatRange2("Slope", &s0, &s1, 0.25f, 0, 90, "%.0f deg", "%.0f deg", ImGuiSliderFlags_AlwaysClamp));
+        r.minSlope = s0, r.maxSlope = s1;
+        bool useHeight = r.minHeight > -1e5 || r.maxHeight < 1e5;
+        if (ImGui::Checkbox("Height", &useHeight)) {
+            if (useHeight) {
+                double lo = 1e30, hi = -1e30;
+                for (double h : f.h) lo = std::min(lo, h), hi = std::max(hi, h);
+                r.minHeight = lo + (hi - lo) * 0.6, r.maxHeight = 1e6;  // default: the top 40%
+            } else {
+                r.minHeight = -1e6, r.maxHeight = 1e6;
+            }
+            begin = changed = true;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Also limit this rule to a height band (above the terrain's base), e.g. snow or rock on peaks");
+        if (useHeight) {
+            ImGui::SameLine();
+            float h0 = static_cast<float>(r.minHeight), h1 = static_cast<float>(std::min(r.maxHeight, 99999.0));
+            ImGui::SetNextItemWidth(-1);
+            track(ImGui::DragFloatRange2("##h", &h0, &h1, 4, static_cast<float>(-f.depth), 99999, "%.0f", h1 >= 99999 ? "top" : "%.0f"));
+            r.minHeight = h0, r.maxHeight = h1 >= 99999 ? 1e6 : h1;
+        }
+        ImGui::PopID();
+    }
+    if (remove >= 0) f.paint.erase(f.paint.begin() + remove), begin = changed = true;
+    if (up > 0) std::swap(f.paint[up], f.paint[up - 1]), begin = changed = true;
+    if (ImGui::Button("Add rule")) {
+        f.paint.push_back({currentMaterial, f.paint.empty() ? 0.0 : 40.0, 90});
+        if (f.paintJitter <= 0) f.paintJitter = 4;
+        begin = changed = true;
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("A rule painting the current texture on slopes over 40 degrees");
+    ImGui::SameLine();
+    float jit = static_cast<float>(f.paintJitter);
+    ImGui::SetNextItemWidth(-60);
+    track(ImGui::SliderFloat("Jitter", &jit, 0, 15, "%.1f deg"));
+    f.paintJitter = jit;
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Randomises each triangle's slope thresholds so borders between textures are ragged, not straight");
+    if (ImGui::Button("Repaint all")) {
+        doc.pushUndo();
+        const int n = terrain::repaint(doc, f, &before, true);
+        log("Terrain " + f.id + ": repainted " + std::to_string(n) + " faces (hand-set textures replaced)");
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Repaint every cell from the rules, including cells you retextured by hand.\n"
+                          "Edits above repaint automatically but keep hand-set textures, and so does sculpting.");
+    if (!f.paint.empty()) {  // coverage readout
+        std::map<std::string, int> count;
+        for (const Brush& b : doc.ents[0].brushes) {
+            std::string id;
+            int i, j, t;
+            if (terrain::parseTag(b, id, i, j, t) && id == f.id && !b.faces.empty()) count[b.faces[0].material]++;
+        }
+        const int total = std::max(1, f.nx * f.ny * 2);
+        for (const auto& [m, c] : count) ImGui::TextDisabled("  %5.1f%%  %s", 100.0 * c / total, m.c_str());
+    }
+    if (begin) doc.pushUndo();  // snapshot before this edit (a drag's later frames are part of it)
+    if (!changed) return;
+    terrain::write(f, doc.ents[te]);
+    terrain::repaint(doc, f, &before, false);
+}
+
+void App::finishPen() {
+    if (penView < 0 || penPoints.size() < 3) return;
+    const GridView& v = views[penView];
+    double w0 = workMin[v.w], w1 = workMax[v.w];
+    if (w1 - w0 < 1) w1 = w0 + 64;
+    std::string err;
+    std::vector<Brush> made = shapes::fromOutline(penPoints, v.u, v.v, v.w, w0, w1, currentMaterial, err);
+    if (made.empty()) {
+        log("Pen: " + err + " (fix it with Backspace, or Esc to start over)");
+        return;
+    }
+    doc.pushUndo();
+    std::vector<Sel> added;
+    for (Brush& b : made) added.push_back(doc.addBrush(std::move(b)));
+    doc.sel = added;
+    doc.touchSelection();
+    log("Pen: " + std::to_string(penPoints.size()) + "-point outline -> " + std::to_string(made.size()) + " brush" +
+        (made.size() > 1 ? "es (split into convex pieces)" : "") + ", " + std::to_string(static_cast<int>(w1 - w0)) + " deep");
+    penPoints.clear();
+}
+
+void App::addShape(int shapeIndex) {
+    const shapes::Shape shape = static_cast<shapes::Shape>(shapeIndex);
+    AABB box;
+    bool fromSelection = false;
+    for (const Sel& s : doc.sel)
+        if (s.brush >= 0) {
+            const AABB& b = doc.ents[s.ent].brushes[s.brush].bounds;
+            box.add(b.mins);
+            box.add(b.maxs);
+            fromSelection = true;
+        }
+    if (!fromSelection) {
+        Vec3 hit;
+        Vec3 p = cameraRayHit(camera.forward(), hit) ? hit : camera.pos + camera.forward() * 256.0;
+        p = {snapTo(p.x, gridSize), snapTo(p.y, gridSize), snapTo(p.z, gridSize)};
+        box.add(p + Vec3{-64, -64, 0});
+        box.add(p + Vec3{64, 64, 128});
+    }
+    std::vector<Brush> made = shapes::make(shape, box.mins, box.maxs, shapeParams, currentMaterial);
+    if (made.empty()) {
+        log(std::string(shapes::name(shape)) + ": the box is too small for that shape (check Thickness)");
+        return;
+    }
+    doc.pushUndo();
+    if (fromSelection) {  // replace the selected brushes
+        std::vector<Sel> keep;
+        for (const Sel& s : doc.sel)
+            if (s.brush < 0) keep.push_back(s);
+        std::vector<Sel> brushes;
+        for (const Sel& s : doc.sel)
+            if (s.brush >= 0) brushes.push_back(s);
+        doc.sel = brushes;
+        doc.deleteSelected();
+    }
+    std::vector<Sel> added;
+    for (Brush& b : made) added.push_back(doc.addBrush(std::move(b)));
+    doc.sel = added;
+    doc.touchSelection();
+    log(std::string("Added ") + shapes::name(shape) + " (" + std::to_string(made.size()) + " brush" + (made.size() > 1 ? "es" : "") + ")");
+}
+
+// A script_model using `model` at `at` (selected, undoable).
+void App::placeModel(const std::string& model, const Vec3& at) {
+    doc.pushUndo();
+    Sel s = doc.addPointEntity("script_model", at);
+    doc.ents[s.ent].set("model", model);
+    doc.ents[s.ent].set("angles", "0 0 0");
+    doc.sel = {s};
+    doc.touchSelection();
+    currentModel = model;
+    log("Placed " + model + " at " + std::to_string(static_cast<int>(at.x)) + " " + std::to_string(static_cast<int>(at.y)) + " " +
+        std::to_string(static_cast<int>(at.z)));
+}
+
+bool App::cameraRayHit(const Vec3& dir, Vec3& hit) {
+    double bestT = 1e30;
+    for (const Entity& e : doc.ents)
+        for (const Brush& b : e.brushes) {
+            double t;
+            int face;
+            if (rayBrush(b, camera.pos, dir, t, face) && t < bestT) bestT = t;
+        }
+    if (bestT > 1e29) return false;
+    hit = camera.pos + dir * bestT;
+    return true;
+}
+
+// Models browser: every zone_source/xmodels model as a rendered thumbnail (spins while hovered).
+// Click selects it; double-click places it in front of the camera; drag it onto a grid view or the
+// camera view to place it there; "Use on selection" swaps the model of the selected entities.
+void App::drawModelBrowser() {
+    if (ImGuiWindow* tw = ImGui::FindWindowByName("Textures"); tw && tw->DockId)
+        ImGui::SetNextWindowDockID(tw->DockId, ImGuiCond_FirstUseEver);  // a tab next to Textures
+    if (!ImGui::Begin("Models")) {
+        ImGui::End();
+        return;
+    }
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 150);
+    ImGui::InputTextWithHint("##mfilter", "search zone_source models", modelFilter, sizeof modelFilter);
+    ImGui::SameLine();
+    if (ImGui::Button("Reload")) loadZoneSourcePreview();
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(70);
+    ImGui::SliderFloat("##msize", &modelThumbSize, 64, 256, "%.0f px");
+    std::vector<const BrowserModel*> shown;
+    for (const BrowserModel& m : browserModels)
+        if (containsNoCase(m.name, modelFilter)) shown.push_back(&m);
+    if (browserModels.empty()) {
+        ImGui::TextWrapped(doc.path.empty() ? "Save the map first: models come from zone_source/xmodels next to the .map."
+                                            : "No models in zone_source/xmodels next to this map (*.xmodel_export).");
+        ImGui::End();
+        return;
+    }
+    // Actions on the current model.
+    const BrowserModel* cur = nullptr;
+    for (const BrowserModel& m : browserModels)
+        if (m.name == currentModel) cur = &m;
+    ImGui::BeginDisabled(!cur);
+    if (ImGui::Button("Place at camera") && cur) {
+        Vec3 hit;
+        Vec3 p = cameraRayHit(camera.forward(), hit) ? hit : camera.pos + camera.forward() * 256.0;
+        placeModel(cur->name, {snapTo(p.x, gridSize), snapTo(p.y, gridSize), snapTo(p.z, gridSize)});
+    }
+    ImGui::SameLine();
+    int selectedEnts = 0;
+    for (const Sel& s : doc.sel)
+        if (s.brush < 0 && s.ent > 0) selectedEnts++;
+    ImGui::BeginDisabled(selectedEnts == 0);
+    if (ImGui::Button("Use on selection") && cur) {
+        doc.pushUndo();
+        for (const Sel& s : doc.sel)
+            if (s.brush < 0 && s.ent > 0) doc.ents[s.ent].set("model", cur->name);
+        doc.touch();
+    }
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
+    if (cur)
+        ImGui::TextDisabled("%s  |  %zu tris, %zu bones, %.0f x %.0f x %.0f", cur->name.c_str(), cur->tris, cur->bones, cur->size.x,
+                            cur->size.y, cur->size.z);
+    else
+        ImGui::TextDisabled("%zu models  |  click to select, double-click to place, drag into a view", shown.size());
+
+    if (ImGui::BeginChild("mgrid")) {
+        const float spacing = ImGui::GetStyle().ItemSpacing.x;
+        const float ts = modelThumbSize;
+        const int columns = std::max(1, static_cast<int>((ImGui::GetContentRegionAvail().x + spacing) / (ts + spacing)));
+        const float cell = ts + ImGui::GetTextLineHeight() + ImGui::GetStyle().ItemSpacing.y + 8;
+        const int rows = (static_cast<int>(shown.size()) + columns - 1) / columns;
+        const float spin = static_cast<float>(std::fmod(ImGui::GetTime() * 90.0, 360.0));
+        ImGuiListClipper clip;  // only visible thumbnails render
+        clip.Begin(rows, cell);
+        while (clip.Step()) {
+            for (int r = clip.DisplayStart; r < clip.DisplayEnd; r++) {
+                for (int c = 0; c < columns; c++) {
+                    const int i = r * columns + c;
+                    if (i >= static_cast<int>(shown.size())) break;
+                    const BrowserModel& m = *shown[i];
+                    auto lm = liveModels.find(live::modelKey(m.name));
+                    if (c) ImGui::SameLine();
+                    ImGui::BeginGroup();
+                    ImGui::PushID(i);
+                    const ImVec2 at = ImGui::GetCursorScreenPos();
+                    const bool hover = ImGui::IsMouseHoveringRect(at, {at.x + ts + 8, at.y + ts + 8});
+                    ID3D11ShaderResourceView* srv =
+                        lm != liveModels.end() ? renderer.modelThumbnail(m.name, *lm->second, static_cast<int>(ts), hover ? 35.0f + spin : 35.0f)
+                                               : nullptr;
+                    const bool active = m.name == currentModel;
+                    if (active) ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(230, 80, 60, 255));
+                    if (ImGui::ImageButton("##m", (ImTextureID)(intptr_t)srv, {ts, ts})) currentModel = m.name;
+                    if (active) ImGui::PopStyleColor();
+                    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                        Vec3 hit;
+                        Vec3 p = cameraRayHit(camera.forward(), hit) ? hit : camera.pos + camera.forward() * 256.0;
+                        placeModel(m.name, {snapTo(p.x, gridSize), snapTo(p.y, gridSize), snapTo(p.z, gridSize)});
+                    }
+                    if (ImGui::BeginDragDropSource()) {
+                        ImGui::SetDragDropPayload("IW4R_XMODEL", m.name.c_str(), m.name.size() + 1);
+                        if (srv) ImGui::Image((ImTextureID)(intptr_t)srv, {64, 64});
+                        ImGui::Text("%s", m.name.c_str());
+                        ImGui::EndDragDropSource();
+                    }
+                    if (ImGui::IsItemHovered() && !ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                        std::string texs;
+                        for (const std::string& t : m.textures) texs += "\n  " + t;
+                        ImGui::SetTooltip("%s\n%zu triangles, %zu vertices, %zu surfaces, %zu bones\nsize %.1f x %.1f x %.1f\ntextures:%s",
+                                          m.name.c_str(), m.tris, m.verts, m.surfaces, m.bones, m.size.x, m.size.y, m.size.z, texs.c_str());
+                    }
+                    ImGui::PushClipRect(ImGui::GetCursorScreenPos(),
+                                        {ImGui::GetCursorScreenPos().x + ts + 6, ImGui::GetCursorScreenPos().y + 20}, true);
+                    ImGui::TextUnformatted(m.name.c_str());
                     ImGui::PopClipRect();
                     ImGui::PopID();
                     ImGui::EndGroup();

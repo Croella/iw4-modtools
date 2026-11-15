@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <fstream>
 #include "mapio.h"
+#include "terrain.h"
 
 UiTest::UiTest(App& a, std::string path) : app(a), reportPath(std::move(path)) {
     if (!reportPath.empty()) build();
@@ -213,6 +214,121 @@ void UiTest::build() {
     wait(3);
     release(0);
     check("undo during a drag is ignored", [=] { return brushes() == 3; });
+
+    // Pen tool: an L outline closed by clicking its first point -> two convex brushes; a triangle
+    // finished with Enter; Backspace drops a point; Esc clears, then turns the pen off.
+    key(ImGuiKey_Escape);
+    key(ImGuiKey_P);
+    check("P turns the pen on", [this] { return app.penActive; });
+    const double L[][2] = {{-560, -160}, {-432, -160}, {-432, -128}, {-528, -128}, {-528, -32}, {-560, -32}, {-560, -160}};
+    for (const auto& pt : L) {
+        const double u = pt[0], v = pt[1];
+        click([this, top, u, v] { return app.gridToScreen(top, u, v); });
+        wait(12);  // keeps successive clicks from counting as a double-click
+    }
+    check("pen L outline makes two brushes", [=, &doc] { return brushes() == 5 && doc.sel.size() == 2; });
+    check("pen L brushes cover the outline", [=] {
+        AABB b = bounds();
+        return b.mins.x == -560 && b.maxs.x == -432 && b.mins.y == -160 && b.maxs.y == -32;
+    });
+    check("pen stays on with an empty outline", [this] { return app.penActive && app.penPoints.empty(); });
+    const double T[][2] = {{-384, -160}, {-288, -160}, {-336, -64}};
+    for (const auto& pt : T) {
+        const double u = pt[0], v = pt[1];
+        click([this, top, u, v] { return app.gridToScreen(top, u, v); });
+        wait(12);
+    }
+    key(ImGuiKey_Enter);
+    check("Enter finishes a pen outline", [=] { return brushes() == 6; });
+    click([this, top] { return app.gridToScreen(top, -240, -160); });
+    wait(12);
+    click([this, top] { return app.gridToScreen(top, -176, -160); });
+    wait(12);
+    key(ImGuiKey_Backspace);
+    check("Backspace removes the last pen point", [=] { return app.penPoints.size() == 1 && brushes() == 6; });
+    key(ImGuiKey_Escape);
+    check("Esc clears the pen outline", [this] { return app.penActive && app.penPoints.empty(); });
+    key(ImGuiKey_Escape);
+    check("Esc again turns the pen off", [this] { return !app.penActive; });
+
+    // Terrain: hold the left button in the Top view with Raise -> the heights under it go up (one
+    // undo step); Ctrl inverts to Lower.
+    steps.push_back([this] {
+        terrain::Field f;
+        f.nx = f.ny = 8;
+        f.cell = 32;
+        f.origin = {-560, 64, 0};
+        terrain::create(app.doc, f);
+        app.terrainSculpt = true;
+        app.terrainBrush.tool = terrain::Tool::Raise;
+        app.terrainBrush.radius = 64;
+        app.terrainBrush.strength = 200;
+    });
+    wait(3);
+    auto peak = [this]() {
+        const int te = app.activeTerrain();
+        terrain::Field f;
+        if (te < 0 || !terrain::read(app.doc.ents[te], f)) return -1e9;
+        return f.at(4, 4);
+    };
+    steps.push_back([this, top] {
+        ImVec2 p = app.gridToScreen(top, -432, 192);  // the field's centre corner (4, 4)
+        ImGui::GetIO().AddMousePosEvent(p.x, p.y);
+    });
+    wait(3);
+    press(0);
+    wait(20);
+    release(0);
+    wait(3);
+    check("terrain raise stroke lifts the ground under the cursor", [=] { return peak() > 20; });
+    check("terrain stroke is undoable", [this, peak] {
+        const double up = peak();
+        app.doc.undo();
+        const double back = peak();
+        app.doc.redo();
+        return back < 1 && up > 20;
+    });
+    steps.push_back([] { ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, true); });
+    wait(2);
+    press(0);
+    wait(20);
+    release(0);
+    steps.push_back([] { ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false); });
+    wait(3);
+    check("Ctrl inverts raise into lower", [=] { return peak() < 20; });
+    // Paint brush: a drag paints the current texture; Ctrl+drag erases it.
+    auto paintedCount = [this]() {
+        int n = 0;
+        for (const Brush& b : app.doc.ents[0].brushes) n += terrain::painted(b) && b.faces[0].material == "ch_cliff01";
+        return n;
+    };
+    steps.push_back([this] {
+        app.terrainBrush.tool = terrain::Tool::Paint;
+        app.terrainBrush.scatter = 0;
+        app.currentMaterial = "ch_cliff01";
+    });
+    wait(2);
+    press(0);
+    wait(10);
+    release(0);
+    wait(3);
+    check("terrain paint stroke paints the current texture", [=] { return paintedCount() > 0; });
+    check("terrain paint stroke is undoable", [this, paintedCount] {
+        const int n = paintedCount();
+        app.doc.undo();
+        const int back = paintedCount();
+        app.doc.redo();
+        return n > 0 && back == 0 && paintedCount() == n;
+    });
+    steps.push_back([] { ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, true); });
+    wait(2);
+    press(0);
+    wait(10);
+    release(0);
+    steps.push_back([] { ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false); });
+    wait(3);
+    check("Ctrl+paint erases", [=] { return paintedCount() == 0; });
+    steps.push_back([this] { app.terrainSculpt = false; });
 
     // Everything built by hand above must survive a save and reload.
     check("map survives a save and reload", [this, &doc] {
