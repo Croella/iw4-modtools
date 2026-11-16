@@ -48,6 +48,8 @@ const std::vector<EntityClass>& entityClasses() {
         {"misc_model", 0.8f, 0.6f, 0.3f, {-16, -16, -16}, {16, 16, 16}, false},
         {"trigger_multiple", 0.9f, 0.5f, 0.1f, {}, {}, true},
         {"trigger_radius", 0.9f, 0.5f, 0.1f, {-16, -16, 0}, {16, 16, 64}, false},
+        {"trigger_grade", 0.85f, 0.35f, 0.9f, {}, {}, true},  // per-area colour grading (post pass only, not compiled)
+        {"trigger_weather", 0.35f, 0.6f, 0.95f, {}, {}, true},  // shelters from the screen-space weather (post pass only)
         {"script_brushmodel", 0.3f, 0.7f, 0.9f, {}, {}, true},
         // SP AI: path nodes compile into the GameWorldSp path data (links, visibility, node tree);
         // actor spawners stay in the entity lump.

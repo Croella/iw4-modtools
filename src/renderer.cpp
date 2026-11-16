@@ -85,9 +85,32 @@ cbuffer Post : register(b0) {
     float4 blur;      // x step, y decay, z weight
     float4 tint;      // rgb colour * intensity, w fade
     float4 flags;     // x debug view
+    float4 aoParm;    // x radius, y intensity, z bias, w 1 = AO only
+    float4 aoFade;    // x near, y far, z 1/width, w 1/height
+    float4 aoBlur;    // xy one texel along the blur direction; zw projection x/y scale
+    float4 grade;     // x table size, y vignette, z aspect
+    float4 dofDist;   // nearStart, nearEnd, farStart, farEnd (offsets from the focus in auto mode)
+    float4 dofBlurP;  // x near max CoC, y far max CoC (half-res px), z weapon distance, w 1 = show the blur amount
+    float4 dofStep;   // xy half-res texel, zw full-res texel
+    float4 dofAutoP;  // x 1 = auto focus, y ease factor this frame, z distance the sky counts as
+    float4 flareSun;  // xy sun uv, z aspect, w strength
+    float4 flareCol;  // rgb colour, w ghosts
+    float4 flareParm; // x halo, y streak, z veiling glare, w visibility disc radius
+    float4 flareMisc; // x visibility ease factor
+    float4 glareParm; // x threshold, y intensity, zw blur step
+    float4 wxParm;    // x 1 rain / 2 snow, y density, z time, w farthest layer
+    float4 wxWind;    // xy wind, z fall speed, w pixel size at distance 1
+    float4 wxColor;   // rgb colour, w opacity
+    float4 lPos;      // local light: xyz position, w radius
+    float4 lCol;      // rgb colour * intensity * density
+    float4 lSpot;     // xyz spot direction, w cos outer (< -1.5: point light)
+    float4 lMisc;     // x cos inner, y shadow strength, z jitter, w 1 = shadow pass on
+    float4 lScreen;   // xy light uv, z shadow reach
 };
 Texture2D src : register(t0);
 Texture2D<float> depthTex : register(t1);
+Texture3D lutTex : register(t2);
+Texture2D<float> focusTex : register(t3);
 SamplerState lin : register(s0);
 struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 V vsFull(uint id : SV_VertexID) {
@@ -143,12 +166,321 @@ float4 psBlur(V i) : SV_Target {
 }
 float4 psComposite(V i) : SV_Target { return float4(src.Sample(lin, i.uv).rgb * tint.rgb * tint.w, 0); }
 float4 psOpaque(V i) : SV_Target { return float4(0, 0, 0, 1); }
+// Ambient occlusion: same model as iw4r_mapload.dll's (tools/shaders/post/volumetric.hlsl psAo), on
+// world positions from the depth buffer; sky (alpha 0) and the void get none.
+float3 worldAt(float2 uv, out bool sky) {
+    int2 px = clamp(int2(uv / aoFade.zw), int2(0, 0), int2(1 / aoFade.zw) - 1);
+    float d = depthTex.Load(int3(px, 0));
+    sky = d >= 1;
+    float2 ndc = float2(uv.x * 2 - 1, 1 - uv.y * 2);
+    float4 w = mul(invViewProj, float4(ndc, d, 1));
+    return w.xyz / w.w;
+}
+float3 worldAt(float2 uv) { bool s; return worldAt(uv, s); }
+#define AO_TAPS 16
+float4 psAo(V i) : SV_Target {
+    bool sky;
+    float3 P = worldAt(i.uv, sky);
+    if (sky || src.SampleLevel(lin, i.uv, 0).a < 0.5) return 1;
+    float z = length(P - eye.xyz);
+    if (z < aoFade.x * 0.5) return 1;
+    float2 tx = float2(aoFade.z, 0), ty = float2(0, aoFade.w);
+    float3 pr = worldAt(i.uv + tx), pl = worldAt(i.uv - tx), pd = worldAt(i.uv + ty), pu = worldAt(i.uv - ty);
+    float3 dx = dot(pr - P, pr - P) < dot(P - pl, P - pl) ? pr - P : P - pl;
+    float3 dy = dot(pd - P, pd - P) < dot(P - pu, P - pu) ? pd - P : P - pu;
+    float3 n = normalize(cross(dx, dy));
+    if (dot(n, P - eye.xyz) > 0) n = -n;
+    float r = aoParm.x, r2 = r * r;
+    float2 scale = 0.5 * aoBlur.zw * r / z;
+    scale *= min(1, 0.25 / max(scale.y, 1e-5));
+    float ang = 6.2831853 * frac(52.9829189 * frac(dot(i.pos.xy, float2(0.06711056, 0.00583715))));
+    float sum = 0;
+    [unroll] for (int t = 0; t < AO_TAPS; t++) {
+        float f = (t + 0.5) / AO_TAPS;
+        float a = ang + t * 2.3999632;
+        float3 v = worldAt(i.uv + float2(cos(a), sin(a)) * f * scale) - P;
+        float vv = dot(v, v);
+        sum += max(dot(v, n) * rsqrt(vv + 1e-4) - aoParm.z, 0) * saturate(1 - vv / r2);
+    }
+    float ao = saturate(1 - aoParm.y * 2 * sum / (AO_TAPS * (1 - aoParm.z)));
+    float fade = saturate((z - aoFade.x) / max(aoFade.x * 0.5, 1)) * saturate((aoFade.y - z) / (aoFade.y * 0.25));
+    return lerp(1, ao, fade);
+}
+float4 psAoBlur(V i) : SV_Target {
+    float zc = length(worldAt(i.uv) - eye.xyz);
+    float sum = 0, wsum = 0;
+    [unroll] for (int t = -4; t <= 4; t++) {
+        float2 u = i.uv + aoBlur.xy * t;
+        float zi = length(worldAt(u) - eye.xyz);
+        float w = (5 - abs(t)) * saturate(1 - abs(zi - zc) / (0.04 * zc + 2));
+        sum += src.SampleLevel(lin, u, 0).r * w;
+        wsum += w;
+    }
+    float ao = wsum > 0 ? sum / wsum : 1;
+    return float4(ao, ao, ao, 1);
+}
+// Depth of field: same model as iw4r_mapload.dll's (volumetric.hlsl psDof*), on the distance from
+// the camera.
+float viewDist(float2 uv) {
+    bool sky;
+    float3 P = worldAt(uv, sky);
+    return sky ? 1e7 : length(P - eye.xyz);
+}
+float4 dofPlanes() {
+    if (dofAutoP.x < 0.5) return dofDist;
+    float f = focusTex.Load(int3(0, 0, 0));
+    return float4(max(f - dofDist.x, 0), max(f - dofDist.y, 0), f + dofDist.z, f + dofDist.w);
+}
+float dofCoc(float z, float4 pl) {
+    if (z < dofBlurP.z) return 0;
+    float n = dofBlurP.x * saturate((pl.y - z) / max(pl.y - pl.x, 1));
+    float f = dofBlurP.y * saturate((z - pl.z) / max(pl.w - pl.z, 1));
+    return max(n, f);
+}
+float4 psDofFocus(V i) : SV_Target {
+    float sum = 0;
+    [unroll] for (int t = 0; t < 5; t++) {
+        float2 o = t == 0 ? float2(0, 0) : float2(t == 1 ? 0.02 : t == 2 ? -0.02 : 0, t == 3 ? 0.03 : t == 4 ? -0.03 : 0);
+        float z = viewDist(float2(0.5, 0.5) + o);
+        sum += z < dofBlurP.z ? dofAutoP.z : min(z, dofAutoP.z);
+    }
+    float cur = sum / 5;
+    float prev = src.Load(int3(0, 0, 0)).r;
+    float f = prev > 0 ? lerp(prev, cur, dofAutoP.y) : cur;
+    return float4(f, f, f, 1);
+}
+float4 psDofDown(V i) : SV_Target {
+    float3 c = src.SampleLevel(lin, i.uv, 0).rgb;
+    return float4(c, dofCoc(viewDist(i.uv), dofPlanes()));
+}
+#define DOF_TAPS 24
+float4 psDofBlur(V i) : SV_Target {
+    float4 c0 = src.SampleLevel(lin, i.uv, 0);
+    float cc = c0.a, zc = viewDist(i.uv);
+    float R = max(dofBlurP.x, dofBlurP.y);
+    float3 sum = c0.rgb;
+    float wsum = 1, csum = cc;
+    [unroll] for (int t = 0; t < DOF_TAPS; t++) {
+        float r = sqrt((t + 0.5) / DOF_TAPS);
+        float a = t * 2.3999632;
+        float dist = r * R;
+        float2 u = i.uv + float2(cos(a), sin(a)) * dist * dofStep.xy;
+        float4 s = src.SampleLevel(lin, u, 0);
+        float eff = viewDist(u) > zc ? min(s.a, cc) : s.a;
+        float w = saturate(eff - dist + 1);
+        sum += s.rgb * w;
+        wsum += w;
+        csum += eff * w;
+    }
+    return float4(sum / wsum, csum / wsum);
+}
+Texture2D blurTex : register(t4);
+float4 psDofComp(V i) : SV_Target {
+    float4 sharp = src.Sample(lin, i.uv);
+    float4 b = blurTex.SampleLevel(lin, i.uv, 0);
+    float coc = max(dofCoc(viewDist(i.uv), dofPlanes()), b.a);
+    float f = smoothstep(0.25, 1.0, coc);
+    if (dofBlurP.w > 0.5) return float4(f, f, f, sharp.a);
+    return float4(lerp(sharp.rgb, b.rgb, f), sharp.a);
+}
+// Colour grade (baked 3D table) + vignette; alpha (the sky marker) kept.
+float4 psGrade(V i) : SV_Target {
+    float4 c = src.Sample(lin, i.uv);
+    float n = grade.x;
+    float3 g = lutTex.SampleLevel(lin, saturate(c.rgb) * ((n - 1) / n) + 0.5 / n, 0).rgb;
+    float2 d = (i.uv - 0.5) * float2(grade.z, 1);
+    g *= 1 - grade.y * smoothstep(0.3, 1.0, length(d) * 1.1);
+    return float4(g, c.a);
+}
+// Sun flare + glare: same model as iw4r_mapload.dll's (volumetric.hlsl psFlare*, psGlare*). The
+// visibility is the share of sky (alpha 0: occluders count as solid) around the sun, eased, + 1.
+Texture2D<float> visTex : register(t5);
+float4 psFlareVis(V i) : SV_Target {
+    float sum = 0;
+    [unroll] for (int t = 0; t < 16; t++) {
+        float r = sqrt((t + 0.5) / 16);
+        float a = t * 2.3999632;
+        float2 u = saturate(flareSun.xy + float2(cos(a) / flareSun.z, sin(a)) * r * flareParm.w);
+        sum += src.SampleLevel(lin, u, 0).a < 0.5 ? 1 : 0;
+    }
+    float cur = sum / 16 + 1;
+    float prev = visTex.Load(int3(0, 0, 0));
+    float f = prev > 0.5 ? lerp(prev, cur, flareMisc.x) : cur;
+    return float4(f, f, f, 1);
+}
+static const float kGhostT[6] = {0.45, 0.75, 1.15, 1.4, 1.7, 2.2};
+static const float kGhostR[6] = {0.035, 0.06, 0.02, 0.09, 0.045, 0.14};
+static const float3 kGhostC[6] = {float3(1.0, 0.75, 0.4), float3(0.45, 0.85, 0.6), float3(0.9, 0.5, 1.0),
+                                  float3(0.4, 0.6, 1.0), float3(1.0, 0.9, 0.55), float3(0.5, 0.7, 1.0)};
+float4 psFlare(V i) : SV_Target {
+    float vis = saturate(visTex.Load(int3(0, 0, 0)) - 1);
+    float2 uv = i.uv;
+    float2 asp = float2(flareSun.z, 1);
+    float2 d = (uv - flareSun.xy) * asp;
+    float r = length(d);
+    float3 c = flareCol.rgb;
+    float3 o = c * (exp(-r * r / 0.0003) * 1.5 + exp(-r / 0.05) * 0.35) * flareParm.x;
+    float ang = atan2(d.y, d.x);
+    float rays = pow(abs(cos(ang * 3)), 60) + 0.5 * pow(abs(cos(ang * 3 + 0.5236)), 90);
+    o += c * rays * exp(-r / 0.07) * 0.35 * flareParm.x;
+    o += float3(0.55, 0.72, 1.0) * c * flareParm.y * exp(-abs(d.y) / 0.0035) * exp(-abs(d.x) / 0.3);
+    float2 axis = float2(0.5, 0.5) - flareSun.xy;
+    [unroll] for (int t = 0; t < 6; t++) {
+        float gd = length((uv - (flareSun.xy + axis * kGhostT[t])) * asp);
+        float disc = saturate((kGhostR[t] - gd) / (kGhostR[t] * 0.35));
+        o += kGhostC[t] * c * disc * (0.06 + 0.06 * (gd / kGhostR[t])) * flareCol.w;
+    }
+    float2 hc = (uv - 0.5) * asp;
+    float hr = length(hc);
+    float2 sd = (flareSun.xy - 0.5) * asp;
+    float side = saturate(dot(hc / max(hr, 1e-4), sd / max(length(sd), 1e-4)));
+    o += float3(0.6, 0.8, 1.0) * c * exp(-pow((hr - 0.42) / 0.02, 2)) * side * side * 0.06 * flareCol.w;
+    o += c * flareParm.z * (0.15 + 0.85 * exp(-r / 0.35)) * 0.25;
+    return float4(o * flareSun.w * vis, 0);
+}
+float4 psGlareDown(V i) : SV_Target {
+    float3 c = src.SampleLevel(lin, i.uv, 0).rgb;
+    float l = max(c.r, max(c.g, c.b));
+    float k = saturate((l - glareParm.x) / max(1 - glareParm.x, 0.05));
+    return float4(c * k * k, 1);
+}
+float4 psGlareBlur(V i) : SV_Target {
+    float3 sum = 0;
+    float wsum = 0;
+    [unroll] for (int t = -6; t <= 6; t++) {
+        float w = exp(-t * t / 18.0);
+        sum += src.SampleLevel(lin, i.uv + glareParm.zw * t, 0).rgb * w;
+        wsum += w;
+    }
+    return float4(sum / wsum, 1);
+}
+float4 psGlareComp(V i) : SV_Target { return float4(src.SampleLevel(lin, i.uv, 0).rgb * glareParm.y, 0); }
+// Screen-space weather: same model as iw4r_mapload.dll's (volumetric.hlsl psWeather).
+float wxHash(float2 p) { return frac(sin(dot(p, float2(127.1, 311.7))) * 43758.5453); }
+float wxLayer(float3 dir, float hl, int li, float sceneDist) {
+    bool snow = wxParm.x > 1.5;
+    float d = wxParm.w * (li == 0 ? 0.1 : li == 1 ? 0.25 : li == 2 ? 0.5 : 1.0);
+    float N = snow ? 46 + 14 * li : 96 + 22 * li;
+    float aspect = snow ? 1 : 3;
+    float cellW = d * 6.2831853 / N, cellH = cellW * aspect;
+    float X = (atan2(dir.y, dir.x) / 6.2831853 + 0.5) * N;
+    float Y = d * dir.z / hl / cellH;
+    float2 tng = float2(-dir.y, dir.x) / hl;
+    float fall = max(wxWind.z, 1);
+    float slant = dot(wxWind.xy, tng) / fall * (cellH / cellW);
+    float S = X + slant * Y;
+    float Yd = Y + frac(wxParm.z * fall / (64 * cellH)) * 64;
+    float pxc = wxWind.w * N / 6.2831853;
+    float col = floor(S - N * floor(S / N));
+    float a = 0;
+    if (snow) {
+        float row = floor(Yd);
+        float2 key = float2(col + 17 * li, row - 64 * floor(row / 64));
+        float r1 = wxHash(key), r2 = wxHash(key + 3.7), r3 = wxHash(key + 9.1);
+        if (r3 < wxParm.y) {
+            float sway = 0.2 * sin(wxParm.z * (1.1 + r2) + r1 * 6.28);
+            float2 c = float2(floor(S) + 0.3 + 0.4 * r1 + sway, row + 0.3 + 0.4 * r2);
+            float rPhys = 0.07 / (1 + 0.5 * li), rad = max(rPhys, 0.9 * pxc);
+            a = saturate(1 - length(float2(S, Yd) - c) / rad) * min(1, rPhys / rad + 0.3);
+        }
+    } else {
+        [unroll] for (int k = 0; k < 2; k++) {
+            float row = floor(Yd) - k;
+            float2 key = float2(col + 17 * li, row - 64 * floor(row / 64));
+            float r1 = wxHash(key), r2 = wxHash(key + 3.7), r3 = wxHash(key + 9.1);
+            float xc = floor(S) + 0.2 + 0.6 * r1;
+            float t = (Yd - (row + r2)) / (0.55 + 0.3 * r1);
+            float wPhys = 0.035 / (1 + 0.6 * li), w = max(wPhys, 0.7 * pxc);
+            float across = saturate(1 - abs(S - xc) / w) * min(1, wPhys / w + 0.4);
+            a = max(a, (r3 < wxParm.y && t >= 0 && t <= 1) ? across * (1 - t * 0.7) : 0);
+        }
+    }
+    float depthFade = saturate((sceneDist - d) / (0.25 * d));
+    return a * depthFade * (li == 3 ? 0.5 : li == 2 ? 0.7 : 1.0);
+}
+float4 psWeather(V i) : SV_Target {
+    float4 c = src.Sample(lin, i.uv);
+    float2 ndc = float2(i.uv.x * 2 - 1, 1 - i.uv.y * 2);
+    float4 f4 = mul(invViewProj, float4(ndc, 1, 1));
+    float3 dir = normalize(f4.xyz / f4.w - eye.xyz);
+    float sceneDist = c.a < 0.5 ? 1e7 : viewDist(i.uv);
+    float hl = length(dir.xy);
+    float pole = saturate((hl - 0.3) / 0.25);
+    float a = 0;
+    if (pole > 0) {
+        [unroll] for (int li = 0; li < 4; li++) a = 1 - (1 - a) * (1 - wxLayer(dir, hl, li, sceneDist));
+    }
+    a *= pole * wxColor.w;
+    return float4(lerp(c.rgb, wxColor.rgb, a), c.a);
+}
+// Local light shafts: same model as iw4r_mapload.dll's (volumetric.hlsl psLight*).
+float lCone(float3 v, float d) {
+    return lSpot.w < -1.5 ? 1 : smoothstep(lSpot.w, lMisc.x, dot(v, lSpot.xyz) / max(d, 1e-3));
+}
+float3 lightScatter(float3 dir, float L, float2 pix) {
+    float3 oc = eye.xyz - lPos.xyz;
+    float R = lPos.w, R2 = R * R;
+    float b = dot(oc, dir), h = b * b - (dot(oc, oc) - R2);
+    if (h <= 0) return 0;
+    h = sqrt(h);
+    float t0 = max(-b - h, 0), t1 = min(-b + h, L);
+    if (t1 <= t0) return 0;
+    float dt = (t1 - t0) / 24;
+    float j = frac(52.9829189 * frac(dot(pix, float2(0.06711056, 0.00583715))) + lMisc.z);
+    float sum = 0;
+    [unroll] for (int i = 0; i < 24; i++) {
+        float3 v = oc + dir * (t0 + (i + j) * dt);
+        float d2 = dot(v, v);
+        float f = saturate(1 - d2 / R2);
+        sum += f * f * lCone(v, sqrt(d2));
+    }
+    sum *= dt;
+    float tm = -b;
+    float3 vc = oc + dir * clamp(tm, t0, t1);
+    float hh2 = max(dot(oc, oc) - b * b, 0);
+    float k2 = 0.02 * R2, s = sqrt(hh2 + k2);
+    float core = k2 / s * (atan((t1 - tm) / s) - atan((t0 - tm) / s));
+    float fc = saturate(1 - dot(vc, vc) / R2);
+    sum += 2 * core * fc * fc * lCone(vc, length(vc));
+    return lCol.rgb * sum;
+}
+float4 psLightScatter(V i) : SV_Target {
+    float2 ndc = float2(i.uv.x * 2 - 1, 1 - i.uv.y * 2);
+    float4 f4 = mul(invViewProj, float4(ndc, 1, 1));
+    float3 dir = normalize(f4.xyz / f4.w - eye.xyz);
+    float L = src.SampleLevel(lin, i.uv, 0).a < 0.5 ? 1e7 : viewDist(i.uv);
+    float3 S = lightScatter(dir, L, i.pos.xy);
+    float free = L > length(lPos.xyz - eye.xyz) - 0.25 * lPos.w ? 1 : 0;
+    return float4(S, free);
+}
+float4 psLightShaft(V i) : SV_Target {
+    float4 c = src.SampleLevel(lin, i.uv, 0);
+    float vis = 1;
+    if (lMisc.w > 0.5) {
+        float2 delta = (lScreen.xy - i.uv) * (lScreen.z / 24);
+        float sum = 0, wsum = 0, w = 1;
+        float2 p = i.uv;
+        [unroll] for (int t = 0; t < 24; t++) {
+            p += delta;
+            sum += src.SampleLevel(lin, saturate(p), 0).a * w;
+            wsum += w;
+            w *= 0.96;
+        }
+        vis = lerp(1, sum / wsum, lMisc.y);
+    }
+    return float4(c.rgb * vis, 1);
+}
+float4 psLightComp(V i) : SV_Target { return float4(src.SampleLevel(lin, i.uv, 0).rgb, 0); }
 float4 psSolid() : SV_Target { return float4(0, 0, 0, 1); }  // any vertex shader
 )";
 
 struct PostConstants {
     float invViewProj[16];
     float eye[4], sun[4], fogColor[4], fogLight[4], fogParm[4], sunUv[4], mask[4], glow[4], blur[4], tint[4], flags[4];
+    float aoParm[4], aoFade[4], aoBlur[4], grade[4];
+    float dofDist[4], dofBlurP[4], dofStep[4], dofAutoP[4];
+    float flareSun[4], flareCol[4], flareParm[4], flareMisc[4], glareParm[4], wxParm[4], wxWind[4], wxColor[4];
+    float lPos[4], lCol[4], lSpot[4], lMisc[4], lScreen[4];
 };
 
 // Inverse of a row-major 4x4 (cofactors, in double).
@@ -314,7 +646,12 @@ bool Renderer::init(ID3D11Device* device, ID3D11DeviceContext* context, std::str
             const char* entry;
             ComPtr<ID3D11PixelShader>* out;
         };
-        for (P q : {P{"psFog", &psFog}, P{"psMask", &psMask}, P{"psBlur", &psBlur}, P{"psComposite", &psComposite}, P{"psOpaque", &psOpaque}, P{"psSolid", &psSolid}}) {
+        for (P q : {P{"psFog", &psFog}, P{"psMask", &psMask}, P{"psBlur", &psBlur}, P{"psComposite", &psComposite}, P{"psOpaque", &psOpaque},
+                    P{"psSolid", &psSolid}, P{"psAo", &psAo}, P{"psAoBlur", &psAoBlur}, P{"psGrade", &psGrade}, P{"psDofFocus", &psDofFocus},
+                    P{"psDofDown", &psDofDown}, P{"psDofBlur", &psDofBlur}, P{"psDofComp", &psDofComp},
+                    P{"psFlareVis", &psFlareVis}, P{"psFlare", &psFlare}, P{"psGlareDown", &psGlareDown}, P{"psGlareBlur", &psGlareBlur},
+                    P{"psGlareComp", &psGlareComp}, P{"psWeather", &psWeather},
+                    P{"psLightScatter", &psLightScatter}, P{"psLightShaft", &psLightShaft}, P{"psLightComp", &psLightComp}}) {
             ComPtr<ID3DBlob> pb;
             if (!compilePost(q.entry, "ps_5_0", pb)) return false;
             dev->CreatePixelShader(pb->GetBufferPointer(), pb->GetBufferSize(), nullptr, q.out->GetAddressOf());
@@ -339,6 +676,26 @@ bool Renderer::init(ID3D11Device* device, ID3D11DeviceContext* context, std::str
         sb.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
         sb.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
         dev->CreateBlendState(&sb, &blendScreen);
+        // AO: frame * ao (colour only; alpha is the sky marker).
+        D3D11_BLEND_DESC mb{};
+        mb.RenderTarget[0].BlendEnable = TRUE;
+        mb.RenderTarget[0].SrcBlend = D3D11_BLEND_ZERO;
+        mb.RenderTarget[0].DestBlend = D3D11_BLEND_SRC_COLOR;
+        mb.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        mb.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ZERO;
+        mb.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+        mb.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        mb.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE;
+        dev->CreateBlendState(&mb, &blendMultiply);
+        D3D11_BLEND_DESC co{};
+        co.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE;
+        dev->CreateBlendState(&co, &blendColorOnly);
+        // Flare + glare: added on, colour only.
+        D3D11_BLEND_DESC ac = mb;
+        ac.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+        ac.RenderTarget[0].DestBlend = D3D11_BLEND_ONE;
+        ac.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        dev->CreateBlendState(&ac, &blendAddColor);
         D3D11_DEPTH_STENCIL_DESC nd{};
         nd.DepthEnable = FALSE;
         dev->CreateDepthStencilState(&nd, &depthOff);
@@ -846,8 +1203,8 @@ void Renderer::uploadRefMesh(std::shared_ptr<const RefMesh> mesh) {
 bool Renderer::ensureTarget(int width, int height) {
     if (width == viewWidth && height == viewHeight && color) return true;
     color.Reset(); colorRtv.Reset(); colorSrv.Reset(); depth.Reset(); depthDsv.Reset(); depthSrv.Reset();
-    sceneCopy.Reset(); sceneCopySrv.Reset();
-    for (int i = 0; i < 2; i++) half[i].Reset(), halfRtv[i].Reset(), halfSrv[i].Reset();
+    sceneCopy.Reset(); sceneCopySrv.Reset(); lacc.Reset(); laccRtv.Reset(); laccSrv.Reset();
+    for (int i = 0; i < 2; i++) half[i].Reset(), halfRtv[i].Reset(), halfSrv[i].Reset(), aoTex[i].Reset(), aoRtv[i].Reset(), aoSrv[i].Reset();
     D3D11_TEXTURE2D_DESC td{};
     td.Width = width;
     td.Height = height;
@@ -872,6 +1229,32 @@ bool Renderer::ensureTarget(int width, int height) {
             if (FAILED(dev->CreateTexture2D(&hd, nullptr, &half[i]))) return false;
             dev->CreateRenderTargetView(half[i].Get(), nullptr, &halfRtv[i]);
             dev->CreateShaderResourceView(half[i].Get(), nullptr, &halfSrv[i]);
+        }
+        if (FAILED(dev->CreateTexture2D(&hd, nullptr, &lacc))) return false;  // local light shafts accumulator
+        dev->CreateRenderTargetView(lacc.Get(), nullptr, &laccRtv);
+        dev->CreateShaderResourceView(lacc.Get(), nullptr, &laccSrv);
+    }
+    {  // full-res AO + blur ping-pong
+        D3D11_TEXTURE2D_DESC ad = td;
+        ad.Format = DXGI_FORMAT_R8_UNORM;
+        ad.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        for (int i = 0; i < 2; i++) {
+            if (FAILED(dev->CreateTexture2D(&ad, nullptr, &aoTex[i]))) return false;
+            dev->CreateRenderTargetView(aoTex[i].Get(), nullptr, &aoRtv[i]);
+            dev->CreateShaderResourceView(aoTex[i].Get(), nullptr, &aoSrv[i]);
+        }
+    }
+    if (!focusTex[0]) {  // 1x1 auto-focus distance, ping-pong (size independent)
+        D3D11_TEXTURE2D_DESC fd = td;
+        fd.Width = fd.Height = 1;
+        fd.Format = DXGI_FORMAT_R32_FLOAT;
+        fd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        for (int i = 0; i < 2; i++) {
+            if (FAILED(dev->CreateTexture2D(&fd, nullptr, &focusTex[i])) || FAILED(dev->CreateTexture2D(&fd, nullptr, &visTex[i]))) return false;
+            dev->CreateRenderTargetView(focusTex[i].Get(), nullptr, &focusRtv[i]);
+            dev->CreateShaderResourceView(focusTex[i].Get(), nullptr, &focusSrv[i]);
+            dev->CreateRenderTargetView(visTex[i].Get(), nullptr, &visRtv[i]);
+            dev->CreateShaderResourceView(visTex[i].Get(), nullptr, &visSrv[i]);
         }
     }
     // Depth the post passes can read: typeless storage, D24S8 view to draw, R24 view to sample.
@@ -903,6 +1286,7 @@ void Renderer::render(const FlyCamera& cam, int width, int height) {
         0, 0, 0, 1};
     double fovY = 70.0 * kPi / 180.0, nearZ = 4.0, farZ = 60000.0;
     float ys = (float)(1.0 / std::tan(fovY * 0.5)), xs = ys / (float)aspect();
+    projScale[0] = xs, projScale[1] = ys;
     float proj[16] = {
         xs, 0, 0, 0,
         0, ys, 0, 0,
@@ -1072,7 +1456,19 @@ void Renderer::postProcess(const float viewProj[16], const FlyCamera& cam) {
         su = 0.5f + 0.5f * nx, sv = 0.5f - 0.5f * ny;
     }
     const bool shafts = v.shafts && fade > 0;
-    if (!v.fog && !shafts) return;
+    const bool grading = v.grade && v.gradeLut && v.debug == 0 && ensureLut(v, cam.pos);
+    const bool dof = v.dof && (v.debug == 0 || v.debug == 5);
+    float flareFade = 0;
+    if (clip[3] > 0.02f) {
+        const float nx = su * 2 - 1, ny = 1 - sv * 2, off = std::max(std::fabs(nx), std::fabs(ny));
+        flareFade = std::min(1.0f, clip[3] / 0.35f) * std::max(0.0f, std::min(1.0f, (1.15f - off) / 0.15f));
+    }
+    const bool flare = (v.flare || (v.glare && v.glareSun > 0)) && flareFade > 0 && v.debug == 0;
+    const bool glare = v.glare && v.glareIntensity > 0 && v.debug == 0;
+    const float shelter = v.weather ? weatherShelter(v, cam.pos) : 0.0f;
+    const bool weather = v.weather && shelter > 0.001f && v.weatherIntensity > 0 && v.debug == 0;
+    const bool lights = v.lights && !v.volLights.empty() && v.lightsIntensity > 0 && v.debug == 0;
+    if (!v.fog && !shafts && !v.ssao && !grading && !dof && !flare && !glare && !weather && !lights) return;
     for (int k = 0; k < 3; k++) {
         pc.eye[k] = static_cast<float>(cam.pos[k]);
         pc.sun[k] = sd[k];
@@ -1097,6 +1493,68 @@ void Renderer::postProcess(const float viewProj[16], const FlyCamera& cam) {
     pc.mask[1] = 1;
     pc.tint[3] = fade;
     pc.flags[0] = static_cast<float>(v.debug);
+    pc.aoParm[0] = static_cast<float>(v.ssaoRadius);
+    pc.aoParm[1] = static_cast<float>(v.ssaoIntensity);
+    pc.aoParm[2] = static_cast<float>(v.ssaoBias);
+    pc.aoParm[3] = v.debug == 4 ? 1.0f : 0.0f;
+    pc.aoFade[0] = static_cast<float>(v.ssaoNear);
+    pc.aoFade[1] = static_cast<float>(v.ssaoDistance);
+    pc.aoFade[2] = 1.0f / std::max(1, viewWidth);
+    pc.aoFade[3] = 1.0f / std::max(1, viewHeight);
+    pc.aoBlur[2] = projScale[0];
+    pc.aoBlur[3] = projScale[1];
+    pc.grade[0] = static_cast<float>(lutSize);
+    pc.grade[1] = vignetteNow;
+    {
+        const ULONGLONG now = GetTickCount64();
+        const float dt = dofTick ? std::min(0.25f, (now - dofTick) / 1000.0f) : 0.0f;
+        dofTick = now;
+        const float hs = viewHeight / 1080.0f * 0.5f;
+        const float d4[4] = {static_cast<float>(v.dofNearStart), static_cast<float>(v.dofNearEnd), static_cast<float>(v.dofFarStart),
+                             static_cast<float>(v.dofFarEnd)};
+        std::memcpy(pc.dofDist, d4, sizeof d4);
+        pc.dofBlurP[0] = static_cast<float>(v.dofNearBlur) * hs;
+        pc.dofBlurP[1] = static_cast<float>(v.dofFarBlur) * hs;
+        pc.dofBlurP[2] = static_cast<float>(v.dofWeapon);
+        pc.dofBlurP[3] = v.debug == 5 ? 1.0f : 0.0f;
+        pc.dofStep[0] = 1.0f / std::max(1, viewWidth / 2), pc.dofStep[1] = 1.0f / std::max(1, viewHeight / 2);
+        pc.dofStep[2] = 1.0f / std::max(1, viewWidth), pc.dofStep[3] = 1.0f / std::max(1, viewHeight);
+        pc.dofAutoP[0] = v.dofAuto ? 1.0f : 0.0f;
+        pc.dofAutoP[1] = 1.0f - std::exp(-static_cast<float>(v.dofAutoSpeed) * dt);
+        pc.dofAutoP[2] = static_cast<float>(std::max(v.dofFarEnd * 4, 20000.0));
+    }
+    pc.grade[2] = static_cast<float>(aspect());
+    {
+        const ULONGLONG now = GetTickCount64();
+        const float dt = flareTick ? std::min(0.25f, (now - flareTick) / 1000.0f) : 0.0f;
+        flareTick = now;
+        const float on = v.flare ? 1.0f : 0.0f;
+        const float fi = static_cast<float>(v.flareIntensity);
+        const float fs[4] = {su, sv, static_cast<float>(aspect()), flareFade};
+        const float fc[4] = {static_cast<float>(v.flareColor.x) * fi, static_cast<float>(v.flareColor.y) * fi,
+                             static_cast<float>(v.flareColor.z) * fi, static_cast<float>(v.flareGhosts) * on};
+        const float fp[4] = {static_cast<float>(v.flareHalo) * on, static_cast<float>(v.flareStreak) * on,
+                             v.glare ? static_cast<float>(v.glareSun) / std::max(0.01f, fi) : 0.0f, 0.012f};
+        std::memcpy(pc.flareSun, fs, sizeof fs);
+        std::memcpy(pc.flareCol, fc, sizeof fc);
+        std::memcpy(pc.flareParm, fp, sizeof fp);
+        pc.flareMisc[0] = 1.0f - std::exp(-14.0f * dt);
+        pc.glareParm[0] = static_cast<float>(v.glareThreshold);
+        pc.glareParm[1] = static_cast<float>(v.glareIntensity);
+        const bool snow = v.weather == 2;
+        pc.wxParm[0] = static_cast<float>(v.weather);
+        pc.wxParm[1] = std::min(1.0f, (snow ? 0.45f : 0.5f) * static_cast<float>(v.weatherIntensity));
+        pc.wxParm[2] = static_cast<float>(static_cast<double>(now % 3600000ull) / 1000.0);
+        pc.wxParm[3] = static_cast<float>(v.weatherDistance);
+        pc.wxWind[0] = static_cast<float>(v.weatherWind[0]);
+        pc.wxWind[1] = static_cast<float>(v.weatherWind[1]);
+        pc.wxWind[2] = (snow ? 48.0f : 420.0f) * static_cast<float>(v.weatherSpeed);
+        pc.wxWind[3] = 2.0f / (projScale[1] * std::max(1, viewHeight));
+        pc.wxColor[0] = static_cast<float>(v.weatherColor.x);
+        pc.wxColor[1] = static_cast<float>(v.weatherColor.y);
+        pc.wxColor[2] = static_cast<float>(v.weatherColor.z);
+        pc.wxColor[3] = static_cast<float>(v.weatherOpacity * std::min(1.0, v.weatherIntensity)) * shelter;
+    }
     auto upload = [&] {
         D3D11_MAPPED_SUBRESOURCE m;
         if (SUCCEEDED(ctx->Map(postConstants.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
@@ -1132,7 +1590,118 @@ void Renderer::postProcess(const float viewProj[16], const FlyCamera& cam) {
         ctx->PSSetShaderResources(0, 2, none);
         ctx->OMSetRenderTargets(0, nullptr, nullptr);
     };
+    // Same order as the game: AO -> fog -> shafts -> grade; each reads a fresh copy of the frame.
+    if (v.ssao) {
+        pass(aoRtv[0].Get(), full, psAo.Get(), sceneCopySrv.Get(), depthSrv.Get(), nullptr);
+        pc.aoBlur[0] = 2.0f / std::max(1, viewWidth), pc.aoBlur[1] = 0;
+        upload();
+        pass(aoRtv[1].Get(), full, psAoBlur.Get(), aoSrv[0].Get(), depthSrv.Get(), nullptr);
+        pc.aoBlur[0] = 0, pc.aoBlur[1] = 2.0f / std::max(1, viewHeight);
+        upload();
+        pass(colorRtv.Get(), full, psAoBlur.Get(), aoSrv[1].Get(), depthSrv.Get(), v.debug == 4 ? blendColorOnly.Get() : blendMultiply.Get());
+        if (v.debug == 4) {
+            ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+            ctx->RSSetViewports(1, &full);
+            return;
+        }
+        ctx->CopyResource(sceneCopy.Get(), color.Get());
+    }
     if (v.fog) pass(colorRtv.Get(), full, psFog.Get(), sceneCopySrv.Get(), depthSrv.Get(), nullptr);
+    if (dof) {  // auto focus (1x1) -> half res colour + blur size -> gather -> composite
+        if (v.fog) ctx->CopyResource(sceneCopy.Get(), color.Get());
+        auto bindExtra = [&](UINT slot, ID3D11ShaderResourceView* srv) { ctx->PSSetShaderResources(slot, 1, &srv); };
+        const D3D11_VIEWPORT one{0, 0, 1, 1, 0, 1};
+        if (v.dofAuto) {
+            const int prev = focusCur, cur = 1 - focusCur;
+            if (!focusValid) {
+                const float zero[4] = {0, 0, 0, 0};
+                ctx->ClearRenderTargetView(focusRtv[prev].Get(), zero);
+            }
+            pass(focusRtv[cur].Get(), one, psDofFocus.Get(), focusSrv[prev].Get(), depthSrv.Get(), nullptr);
+            focusCur = cur;
+            focusValid = true;
+        }
+        bindExtra(3, focusSrv[focusCur].Get());
+        pass(halfRtv[0].Get(), halfVp, psDofDown.Get(), sceneCopySrv.Get(), depthSrv.Get(), nullptr);
+        bindExtra(3, focusSrv[focusCur].Get());
+        pass(halfRtv[1].Get(), halfVp, psDofBlur.Get(), halfSrv[0].Get(), depthSrv.Get(), nullptr);
+        bindExtra(3, focusSrv[focusCur].Get());
+        bindExtra(4, halfSrv[1].Get());
+        pass(colorRtv.Get(), full, psDofComp.Get(), sceneCopySrv.Get(), depthSrv.Get(), nullptr);
+        bindExtra(3, nullptr);
+        bindExtra(4, nullptr);
+        if (v.debug == 5) {
+            ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+            ctx->RSSetViewports(1, &full);
+            return;
+        }
+        ctx->CopyResource(sceneCopy.Get(), color.Get());
+    }
+    if (lights) {  // per light: scatter (half res) -> shadowed towards the light into the accumulator -> added on
+        if (v.fog && !dof) ctx->CopyResource(sceneCopy.Get(), color.Get());
+        struct Pick {
+            size_t i;
+            float score, clip[4];
+        };
+        std::vector<Pick> picks;
+        for (size_t i = 0; i < v.volLights.size(); i++) {
+            const light::VolLight& L = v.volLights[i];
+            const Vec3 d = L.origin - cam.pos;
+            const double dist = length(d);
+            if (dist - L.radius > v.lightsDistance) continue;
+            Pick pk{i, 0, {0, 0, 0, 0}};
+            const float p[3] = {static_cast<float>(L.origin.x), static_cast<float>(L.origin.y), static_cast<float>(L.origin.z)};
+            for (int r = 0; r < 4; r++) pk.clip[r] = viewProj[r * 4] * p[0] + viewProj[r * 4 + 1] * p[1] + viewProj[r * 4 + 2] * p[2] + viewProj[r * 4 + 3];
+            if (pk.clip[3] < -L.radius) continue;
+            if (pk.clip[3] > 0 && dist > L.radius) {
+                const float slack = 1 + static_cast<float>(L.radius) / std::max(pk.clip[3], 1.0f) * std::max(projScale[0], projScale[1]);
+                if (std::fabs(pk.clip[0]) / pk.clip[3] > slack || std::fabs(pk.clip[1]) / pk.clip[3] > slack) continue;
+            }
+            const double lum = L.color.x * 0.3 + L.color.y * 0.59 + L.color.z * 0.11;
+            pk.score = static_cast<float>(lum * L.radius * L.radius / std::max(dist * dist, L.radius * L.radius));
+            picks.push_back(pk);
+        }
+        std::sort(picks.begin(), picks.end(), [](const Pick& a, const Pick& b) { return a.score > b.score; });
+        if (picks.size() > static_cast<size_t>(v.lightsMax)) picks.resize(v.lightsMax);
+        const float zero[4] = {0, 0, 0, 0};
+        ctx->ClearRenderTargetView(laccRtv.Get(), zero);
+        const double secs = static_cast<double>(GetTickCount64() % 3600000ull) / 1000.0;
+        lightFrame++;
+        for (const Pick& pk : picks) {
+            const light::VolLight& L = v.volLights[pk.i];
+            float k = 0.0007f * static_cast<float>(v.lightsIntensity);
+            if (L.flicker > 0) {
+                const double ph = pk.i * 1.7;
+                const double n = 0.5 * std::sin(secs * 13.0 + ph) + 0.3 * std::sin(secs * 7.3 + 2 * ph) + 0.2 * std::sin(secs * 23.0 + 3 * ph);
+                k *= static_cast<float>(1 - L.flicker * (0.5 + 0.5 * n));
+            }
+            const bool front = pk.clip[3] > 1;
+            const float lp[4] = {static_cast<float>(L.origin.x), static_cast<float>(L.origin.y), static_cast<float>(L.origin.z), static_cast<float>(L.radius)};
+            const float lc[4] = {static_cast<float>(L.color.x) * k, static_cast<float>(L.color.y) * k, static_cast<float>(L.color.z) * k, 0};
+            const float ls[4] = {static_cast<float>(L.spotDir.x), static_cast<float>(L.spotDir.y), static_cast<float>(L.spotDir.z),
+                                 L.spot ? static_cast<float>(L.cosOuter) : -2.0f};
+            const float lm[4] = {L.spot ? static_cast<float>(L.cosInner) : -2.0f, static_cast<float>(v.lightsShadows),
+                                 std::fmod(lightFrame * 0.618034f, 1.0f), front && v.lightsShadows > 0 ? 1.0f : 0.0f};
+            const float lscr[4] = {front ? 0.5f + 0.5f * pk.clip[0] / pk.clip[3] : 0.5f, front ? 0.5f - 0.5f * pk.clip[1] / pk.clip[3] : 0.5f, 0.9f, 0};
+            std::memcpy(pc.lPos, lp, sizeof lp);
+            std::memcpy(pc.lCol, lc, sizeof lc);
+            std::memcpy(pc.lSpot, ls, sizeof ls);
+            std::memcpy(pc.lMisc, lm, sizeof lm);
+            std::memcpy(pc.lScreen, lscr, sizeof lscr);
+            upload();
+            pass(halfRtv[0].Get(), halfVp, psLightScatter.Get(), sceneCopySrv.Get(), depthSrv.Get(), nullptr);
+            pass(laccRtv.Get(), halfVp, psLightShaft.Get(), halfSrv[0].Get(), nullptr, blendAddColor.Get());
+        }
+        if (!picks.empty()) {
+            pass(colorRtv.Get(), full, psLightComp.Get(), laccSrv.Get(), nullptr, blendAddColor.Get());
+            ctx->CopyResource(sceneCopy.Get(), color.Get());
+        }
+    }
+    if (weather) {
+        if (v.fog && !dof && !lights) ctx->CopyResource(sceneCopy.Get(), color.Get());
+        pass(colorRtv.Get(), full, psWeather.Get(), sceneCopySrv.Get(), depthSrv.Get(), nullptr);
+        ctx->CopyResource(sceneCopy.Get(), color.Get());
+    }
     if (shafts) {
         if (v.debug == 1) {
             pass(colorRtv.Get(), full, psMask.Get(), sceneCopySrv.Get(), nullptr, nullptr);
@@ -1150,6 +1719,121 @@ void Renderer::postProcess(const float viewProj[16], const FlyCamera& cam) {
             pass(colorRtv.Get(), full, psComposite.Get(), halfSrv[0].Get(), nullptr, blendScreen.Get());
         }
     }
+    if (glare) {  // bright pass (half res) -> blur across -> down -> added on
+        ctx->CopyResource(sceneCopy.Get(), color.Get());
+        const float step = static_cast<float>(v.glareRadius) * (viewHeight / 1080.0f) * 0.5f / 6;
+        pass(halfRtv[0].Get(), halfVp, psGlareDown.Get(), sceneCopySrv.Get(), nullptr, nullptr);
+        pc.glareParm[2] = step / std::max(1, viewWidth / 2), pc.glareParm[3] = 0;
+        upload();
+        pass(halfRtv[1].Get(), halfVp, psGlareBlur.Get(), halfSrv[0].Get(), nullptr, nullptr);
+        pc.glareParm[2] = 0, pc.glareParm[3] = step / std::max(1, viewHeight / 2);
+        upload();
+        pass(halfRtv[0].Get(), halfVp, psGlareBlur.Get(), halfSrv[1].Get(), nullptr, nullptr);
+        pass(colorRtv.Get(), full, psGlareComp.Get(), halfSrv[0].Get(), nullptr, blendAddColor.Get());
+    }
+    if (flare) {  // visibility around the sun (1x1, eased) -> flare added on
+        ctx->CopyResource(sceneCopy.Get(), color.Get());
+        const int prev = visCur, cur = 1 - visCur;
+        if (!visValid) {
+            const float zero[4] = {0, 0, 0, 0};
+            ctx->ClearRenderTargetView(visRtv[prev].Get(), zero);
+        }
+        ID3D11ShaderResourceView* pv = visSrv[prev].Get();
+        ctx->PSSetShaderResources(5, 1, &pv);
+        const D3D11_VIEWPORT one{0, 0, 1, 1, 0, 1};
+        pass(visRtv[cur].Get(), one, psFlareVis.Get(), sceneCopySrv.Get(), nullptr, nullptr);
+        visCur = cur;
+        visValid = true;
+        ID3D11ShaderResourceView* cv = visSrv[cur].Get();
+        ctx->PSSetShaderResources(5, 1, &cv);
+        pass(colorRtv.Get(), full, psFlare.Get(), nullptr, nullptr, blendAddColor.Get());
+        ID3D11ShaderResourceView* none = nullptr;
+        ctx->PSSetShaderResources(5, 1, &none);
+    }
+    if (grading) {
+        ctx->CopyResource(sceneCopy.Get(), color.Get());
+        ID3D11ShaderResourceView* lut = lutSrv.Get();
+        ctx->PSSetShaderResources(2, 1, &lut);
+        pass(colorRtv.Get(), full, psGrade.Get(), sceneCopySrv.Get(), nullptr, nullptr);
+        ID3D11ShaderResourceView* none = nullptr;
+        ctx->PSSetShaderResources(2, 1, &none);
+    }
     ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
     ctx->RSSetViewports(1, &full);
+}
+
+// How much weather reaches the camera: trigger_weather volumes blended over 1 in order, eased.
+float Renderer::weatherShelter(const light::Volumetric& v, const Vec3& eyePos) {
+    const size_t nv = v.weatherVolumes.size();
+    const ULONGLONG now = GetTickCount64();
+    const bool newSet = wxW.size() != nv;
+    const float dt = newSet || !wxTick ? 0.0f : std::min(0.25f, (now - wxTick) / 1000.0f);
+    wxTick = now;
+    if (newSet) wxW.assign(nv, 0.0f);
+    const float eye[3] = {static_cast<float>(eyePos.x), static_cast<float>(eyePos.y), static_cast<float>(eyePos.z)};
+    float m = 1;
+    for (size_t i = 0; i < nv; i++) {
+        const light::WeatherVolume& wv = v.weatherVolumes[i];
+        const float target = gradevol::targetWeight(wv.brushes, static_cast<float>(wv.blend), eye);
+        wxW[i] = newSet ? target : gradevol::approach(wxW[i], target, static_cast<float>(wv.blendTime), dt);
+        m += (static_cast<float>(wv.intensity) - m) * wxW[i];
+    }
+    return m;
+}
+
+// The frame's grade table: the base with each trigger_grade volume blended over it by how far the
+// camera is inside (eased over its blend time); re-uploaded only when the weights move.
+bool Renderer::ensureLut(const light::Volumetric& v, const Vec3& eyePos) {
+    const light::GradeLut& t = *v.gradeLut;
+    if (t.size < 2) return false;
+    const size_t nv = v.gradeVolumes.size();
+    const ULONGLONG now = GetTickCount64();
+    const bool newSet = lutUploaded != &t || volW.size() != nv || lutSize != t.size;
+    if (newSet) {
+        volW.assign(nv, 0.0f);
+        volWUploaded.assign(nv, -1.0f);
+        gradeTick = now;
+    }
+    const float dt = std::min(0.25f, (now - gradeTick) / 1000.0f);
+    gradeTick = now;
+    const float eye[3] = {static_cast<float>(eyePos.x), static_cast<float>(eyePos.y), static_cast<float>(eyePos.z)};
+    bool changed = newSet || !lutSrv;
+    for (size_t i = 0; i < nv; i++) {
+        const light::GradeVolume& gv = v.gradeVolumes[i];
+        const float target = gradevol::targetWeight(gv.brushes, static_cast<float>(gv.blend), eye);
+        volW[i] = newSet ? target : gradevol::approach(volW[i], target, static_cast<float>(gv.blendTime), dt);
+        if (std::fabs(volW[i] - volWUploaded[i]) > 1.0f / 512 || (volW[i] == 0) != (volWUploaded[i] == 0)) changed = true;
+    }
+    if (!changed) return true;
+    std::vector<uint8_t> rgb(t.rgb);
+    float vig = static_cast<float>(v.vignette);
+    for (size_t i = 0; i < nv; i++) {
+        const light::GradeVolume& gv = v.gradeVolumes[i];
+        if (volW[i] <= 0 || !gv.lut || gv.lut->size != t.size) continue;
+        gradevol::blendInto(rgb, gv.lut->rgb, volW[i]);
+        vig += (static_cast<float>(gv.vignette) - vig) * volW[i];
+    }
+    std::vector<uint8_t> rgba(static_cast<size_t>(t.size) * t.size * t.size * 4, 255);
+    for (size_t i = 0, n = rgba.size() / 4; i < n; i++)
+        for (int k = 0; k < 3; k++) rgba[i * 4 + k] = rgb[i * 3 + k];
+    if (!lutSrv || lutSize != t.size) {
+        lutSrv.Reset();
+        lutTex.Reset();
+        D3D11_TEXTURE3D_DESC d{};
+        d.Width = d.Height = d.Depth = static_cast<UINT>(t.size);
+        d.MipLevels = 1;
+        d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        d.Usage = D3D11_USAGE_DEFAULT;
+        d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(dev->CreateTexture3D(&d, nullptr, &lutTex)) || FAILED(dev->CreateShaderResourceView(lutTex.Get(), nullptr, &lutSrv))) {
+            lutSrv.Reset();
+            return false;
+        }
+    }
+    ctx->UpdateSubresource(lutTex.Get(), 0, nullptr, rgba.data(), static_cast<UINT>(t.size * 4), static_cast<UINT>(t.size * t.size * 4));
+    lutUploaded = &t;
+    lutSize = t.size;
+    volWUploaded = volW;
+    vignetteNow = vig;
+    return true;
 }

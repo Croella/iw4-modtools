@@ -920,6 +920,16 @@ int main(int argc, char** argv) {
     if (argc >= 3 && std::string(argv[1]) == "fxprobe") return fxProbe(argc - 2, argv + 2);
     if (argc >= 3 && std::string(argv[1]) == "efxcheck") return efxCheck(argc - 2, argv + 2);
     if (argc >= 3 && std::string(argv[1]) == "animprobe") return animProbe(argv[2]);
+    if (argc >= 3 && std::string(argv[1]) == "neutrallut") {  // a strip LUT to grade in an image editor
+        std::string err;
+        const int size = argc >= 4 ? std::atoi(argv[3]) : 32;
+        if (!light::saveNeutralStripLut(argv[2], size, err)) {
+            std::printf("error: %s\n", err.c_str());
+            return 1;
+        }
+        std::printf("wrote %s (neutral %dx%dx%d LUT strip)\n", argv[2], size, size, size);
+        return 0;
+    }
     if (argc >= 3 && std::string(argv[1]) == "livemodels") return liveModels(argc - 2, argv + 2);
     std::printf("usage:\n"
                 "  iw4r_zone info <in.ff>\n"
@@ -930,6 +940,7 @@ int main(int argc, char** argv) {
                 "  iw4r_zone import <map.ff> [out.map]\n"
                 "  iw4r_zone livedump [out.map]   (reads the running iw4mp.exe or iw4sp.exe; load a map first)\n"
                 "  iw4r_zone liveprobe | livemodels <name...>\n"
+                "  iw4r_zone neutrallut <out.png> [size]   (identity colour-grade LUT strip, default 32)\n"
                 "  --mp / --sp pick the game (compile default MP; live* default: whichever is running)\n");
     return 1;
 }

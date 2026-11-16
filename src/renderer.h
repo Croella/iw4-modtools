@@ -86,6 +86,8 @@ private:
     };
     bool ensureTarget(int width, int height);
     void postProcess(const float viewProj[16], const FlyCamera& cam);
+    bool ensureLut(const light::Volumetric& v, const Vec3& eyePos);
+    float weatherShelter(const light::Volumetric& v, const Vec3& eyePos);
     void uploadVertices(ComPtr<ID3D11Buffer>& buffer, UINT& capacity, const std::vector<Vertex>& data);
     void uploadRefMesh(std::shared_ptr<const RefMesh> mesh);
     ID3D11ShaderResourceView* makeTexture(const IwiImage& image);
@@ -125,9 +127,38 @@ private:
     ComPtr<ID3D11ShaderResourceView> sceneCopySrv, halfSrv[2];
     ComPtr<ID3D11RenderTargetView> halfRtv[2];
     ComPtr<ID3D11VertexShader> postVs;
-    ComPtr<ID3D11PixelShader> psFog, psMask, psBlur, psComposite, psOpaque, psSolid;
+    ComPtr<ID3D11PixelShader> psFog, psMask, psBlur, psComposite, psOpaque, psSolid, psAo, psAoBlur, psGrade, psDofFocus, psDofDown, psDofBlur,
+        psDofComp, psFlareVis, psFlare, psGlareDown, psGlareBlur, psGlareComp, psWeather,
+        psLightScatter, psLightShaft, psLightComp;
     ComPtr<ID3D11Buffer> postConstants;
-    ComPtr<ID3D11BlendState> blendAlphaOnly, blendScreen;
+    ComPtr<ID3D11BlendState> blendAlphaOnly, blendScreen, blendMultiply, blendColorOnly, blendAddColor;
+    ComPtr<ID3D11Texture2D> aoTex[2];
+    ComPtr<ID3D11RenderTargetView> aoRtv[2];
+    ComPtr<ID3D11ShaderResourceView> aoSrv[2];
+    ComPtr<ID3D11Texture3D> lutTex;
+    ComPtr<ID3D11ShaderResourceView> lutSrv;   // the frame's grade table (base + trigger_grade volumes)
+    const light::GradeLut* lutUploaded = nullptr;  // identity of the base (vol.gradeLut keeps it alive)
+    int lutSize = 0;
+    std::vector<float> volW, volWUploaded;      // trigger_grade weights at the camera
+    unsigned long long gradeTick = 0, dofTick = 0;
+    float vignetteNow = 0;
+    ComPtr<ID3D11Texture2D> focusTex[2];        // 1x1 auto-focus distance (ping-pong)
+    ComPtr<ID3D11RenderTargetView> focusRtv[2];
+    ComPtr<ID3D11ShaderResourceView> focusSrv[2];
+    int focusCur = 0;
+    bool focusValid = false;
+    ComPtr<ID3D11Texture2D> visTex[2];          // 1x1 sun visibility for the flare (vis + 1, ping-pong)
+    ComPtr<ID3D11RenderTargetView> visRtv[2];
+    ComPtr<ID3D11ShaderResourceView> visSrv[2];
+    int visCur = 0;
+    bool visValid = false;
+    unsigned long long flareTick = 0, wxTick = 0;
+    std::vector<float> wxW;                     // trigger_weather weights at the camera
+    ComPtr<ID3D11Texture2D> lacc;               // half-res accumulator of the local light shafts
+    ComPtr<ID3D11RenderTargetView> laccRtv;
+    ComPtr<ID3D11ShaderResourceView> laccSrv;
+    unsigned lightFrame = 0;
+    float projScale[2] = {1, 1};  // projection x/y scale (for the AO's screen radius)
     ComPtr<ID3D11DepthStencilState> depthOff;
     int viewWidth = 0, viewHeight = 0;
 

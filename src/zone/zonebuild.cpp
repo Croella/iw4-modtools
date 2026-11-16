@@ -2982,9 +2982,13 @@ bool compileMapToFastfile(const Document& doc, const std::string& mapName,
     if (options.warnings)
         for (const std::string& x : fxWarnings) options.warnings->push_back(x);
     std::vector<FxPlacement> placements = fxPlacements(entDoc, zfx.looping, options.warnings);
-    // fx_origin -> the generated script; iw4r_terrain is editor data (its brushes are world brushes).
+    // fx_origin -> the generated script; iw4r_terrain is editor data (its brushes are world brushes);
+    // trigger_grade volumes only drive the post pass (written to the .volumetric file).
     entDoc.ents.erase(std::remove_if(entDoc.ents.begin(), entDoc.ents.end(),
-                                     [](const Entity& e) { return e.classname() == "fx_origin" || e.classname() == "iw4r_terrain"; }),
+                                     [](const Entity& e) {
+                                         return e.classname() == "fx_origin" || e.classname() == "iw4r_terrain" || e.classname() == "trigger_grade" ||
+                                                e.classname() == "trigger_weather";
+                                     }),
                       entDoc.ents.end());
     const std::string fxScriptName = mapAssetDir(target) + mapName + "_fx";
     std::string fxCall;

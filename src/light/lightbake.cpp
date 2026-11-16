@@ -5,6 +5,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <map>
+#include <mutex>
 #include <thread>
 
 #include "zone/clipmap.h"
@@ -288,12 +291,18 @@ Vec3 pointLights(const Scene& sc, const std::vector<PointLight>& lights, const V
     for (const PointLight& L : lights) {
         Vec3 d = L.origin - p;
         double dist = length(d);
-        if (dist >= L.radius || dist < 1e-6) continue;
+        if (!L.bake || dist >= L.radius || dist < 1e-6) continue;
         Vec3 l = d * (1.0 / dist);
         double ndl = n ? dot(*n, l) : 1.0;
         if (ndl <= 0) continue;
         double f = 1 - (dist * dist) / (L.radius * L.radius);
         double atten = f * f;
+        if (L.spot) {  // smoothstep across the cone edge (same as the shafts)
+            const double c = -dot(l, L.spotDir);
+            const double t = std::clamp((c - L.cosOuter) / std::max(L.cosInner - L.cosOuter, 1e-6), 0.0, 1.0);
+            atten *= t * t * (3 - 2 * t);
+            if (atten <= 0) continue;
+        }
         if (sc.occluded(p, l, static_cast<float>(dist - 1.0))) continue;
         sum += L.color * (atten * ndl);
     }
@@ -405,6 +414,91 @@ Environment readEnvironment(const Document& doc) {
     return env;
 }
 
+// zone_source/luts/<name>.png (or <name> as a path relative to zone_source / the map, or absolute).
+std::string gradeLutPath(const Document& doc, const std::string& name) {
+    namespace fs = std::filesystem;
+    if (name.empty()) return {};
+    const fs::path mapDir = doc.path.empty() ? fs::path() : fs::path(doc.path).parent_path();
+    std::vector<fs::path> tries;
+    const fs::path n(name);
+    if (n.is_absolute()) tries.push_back(n);
+    for (const fs::path& base : {mapDir / "zone_source" / "luts", mapDir / "zone_source", mapDir}) {
+        tries.push_back(base / n);
+        if (!n.has_extension()) tries.push_back(base / (name + ".png")), tries.push_back(base / (name + ".tga"));
+    }
+    std::error_code ec;
+    for (const fs::path& p : tries)
+        if (fs::is_regular_file(p, ec)) return p.string();
+    return {};
+}
+
+// The baked grade table, rebuilt only when the settings or the LUT image change.
+std::shared_ptr<const GradeLut> cachedGradeLut(const Document& doc, const GradeParams& g, const std::string& lutName, std::string& warning) {
+    namespace fs = std::filesystem;
+    struct Entry {
+        std::shared_ptr<const GradeLut> lut;
+        std::string warning;
+    };
+    static std::mutex mx;
+    static std::map<std::string, Entry> cache;
+    const std::string path = gradeLutPath(doc, lutName);
+    std::error_code ec;
+    const long long stamp = path.empty() ? 0 : static_cast<long long>(fs::last_write_time(path, ec).time_since_epoch().count());
+    char nums[400];
+    std::snprintf(nums, sizeof nums, "%.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g|%lld", g.exposure, g.contrast,
+                  g.saturation, g.temperature, g.tint, g.lift[0], g.lift[1], g.lift[2], g.gamma[0], g.gamma[1], g.gamma[2], g.gain[0],
+                  g.gain[1], g.gain[2], stamp);
+    const std::string key = std::string(nums) + "|" + lutName + "|" + path;
+    std::lock_guard<std::mutex> l(mx);
+    if (auto it = cache.find(key); it != cache.end()) {
+        warning = it->second.warning;
+        return it->second.lut;
+    }
+    GradeLut artist;
+    std::string err;
+    warning.clear();
+    if (!lutName.empty()) {
+        if (path.empty()) warning = "grade LUT '" + lutName + "' not found (looked in zone_source/luts)";
+        else if (!loadStripLut(path, artist, err)) warning = err, artist = {};
+    }
+    if (cache.size() > 64) cache.clear();
+    Entry& e = cache[key];
+    e.lut = std::make_shared<const GradeLut>(bakeGradeLut(g, artist.size ? &artist : nullptr));
+    e.warning = warning;
+    return e.lut;
+}
+
+// Grade keys from one entity (worldspawn: prefix "volumetric_" first, then bare) into `g`; only
+// keys that are present change it.
+void readGradeKeys(const Entity& e, bool worldspawn, GradeParams& g, double& vignette, std::string& lutName) {
+    auto num = [&](const char* name, double& x) {
+        if (worldspawn && readNum(e, (std::string("volumetric_") + name).c_str(), x)) return;
+        readNum(e, name, x);
+    };
+    auto vec3 = [&](const char* name, double* out) {
+        Vec3 x{out[0], out[1], out[2]};
+        if (!(worldspawn && readVec(e, (std::string("volumetric_") + name).c_str(), x))) readVec(e, name, x);
+        out[0] = x.x, out[1] = x.y, out[2] = x.z;
+    };
+    num("grade_exposure", g.exposure);
+    num("grade_contrast", g.contrast);
+    num("grade_saturation", g.saturation);
+    num("grade_temperature", g.temperature);
+    num("grade_tint", g.tint);
+    vec3("grade_lift", g.lift);
+    vec3("grade_gamma", g.gamma);
+    vec3("grade_gain", g.gain);
+    num("grade_vignette", vignette);
+    g.contrast = std::max(0.0, g.contrast);
+    g.saturation = std::max(0.0, g.saturation);
+    g.temperature = std::clamp(g.temperature, -1.0, 1.0);
+    g.tint = std::clamp(g.tint, -1.0, 1.0);
+    vignette = std::clamp(vignette, 0.0, 1.0);
+    const std::string* lut = worldspawn ? e.find("volumetric_grade_lut") : nullptr;
+    if (!lut) lut = e.find("grade_lut");
+    if (lut) lutName = *lut;
+}
+
 Volumetric readVolumetric(const Document& doc) {
     Volumetric v;
     const Environment env = readEnvironment(doc);
@@ -445,6 +539,134 @@ Volumetric readVolumetric(const Document& doc) {
     v.fogSky = num("fog_sky", v.fogSky);
     v.fogSkyDist = num("fog_skydist", v.fogSkyDist);
     if (ws && !readVec(*ws, "volumetric_fog_color", v.fogColor)) readVec(*ws, "fog_color", v.fogColor);
+    // Ambient occlusion.
+    v.ssao = num("ssao", 0) != 0;
+    v.ssaoRadius = std::max(1.0, num("ssao_radius", v.ssaoRadius));
+    v.ssaoIntensity = std::max(0.0, num("ssao_intensity", v.ssaoIntensity));
+    v.ssaoBias = std::clamp(num("ssao_bias", v.ssaoBias), 0.0, 0.95);
+    v.ssaoNear = std::max(0.0, num("ssao_near", v.ssaoNear));
+    v.ssaoDistance = std::max(v.ssaoNear + 1, num("ssao_distance", v.ssaoDistance));
+    // Colour grading: worldspawn is the base; trigger_grade volumes inherit it (or neutral when the
+    // base is off) and override what they set.
+    v.grade = num("grade", 0) != 0;
+    if (ws && v.grade) readGradeKeys(*ws, true, v.gradeParams, v.vignette, v.gradeLutName);
+    for (size_t i = 1; i < doc.ents.size(); i++) {
+        const Entity& e = doc.ents[i];
+        if (lower(e.classname()) != "trigger_grade" || e.brushes.empty()) continue;
+        GradeVolume gv;
+        const std::string* tn = e.find("targetname");
+        gv.name = tn && !tn->empty() ? *tn : "trigger_grade #" + std::to_string(i);
+        gv.params = v.gradeParams;
+        gv.vignette = v.vignette;
+        std::string lutName = v.gradeLutName;
+        readGradeKeys(e, false, gv.params, gv.vignette, lutName);
+        readNum(e, "blend", gv.blend);
+        readNum(e, "blend_time", gv.blendTime);
+        double pr = 0;
+        readNum(e, "priority", pr);
+        gv.priority = static_cast<int>(pr);
+        gv.blend = std::max(0.0, gv.blend);
+        gv.blendTime = std::max(0.0, gv.blendTime);
+        for (const Brush& b : e.brushes) {
+            gradevol::Brush pb;
+            for (const Face& f : b.faces)
+                pb.push_back({{static_cast<float>(f.normal.x), static_cast<float>(f.normal.y), static_cast<float>(f.normal.z)},
+                              static_cast<float>(f.dist)});
+            if (!pb.empty()) gv.brushes.push_back(std::move(pb));
+        }
+        std::string warn;
+        gv.lut = cachedGradeLut(doc, gv.params, lutName, warn);
+        if (!warn.empty() && v.gradeWarning.empty()) v.gradeWarning = gv.name + ": " + warn;
+        v.gradeVolumes.push_back(std::move(gv));
+    }
+    std::stable_sort(v.gradeVolumes.begin(), v.gradeVolumes.end(), [](const GradeVolume& a, const GradeVolume& b) { return a.priority < b.priority; });
+    if (v.gradeVolumes.size() > 16) v.gradeVolumes.resize(16);
+    if (v.grade || !v.gradeVolumes.empty()) {
+        std::string warn;
+        v.gradeLut = cachedGradeLut(doc, v.gradeParams, v.gradeLutName, warn);
+        if (!warn.empty()) v.gradeWarning = warn;
+        v.grade = true;
+    }
+    // Depth of field.
+    v.dof = num("dof", 0) != 0;
+    v.dofAuto = num("dof_auto", 0) != 0;
+    v.dofNearStart = std::max(0.0, num("dof_near_start", v.dofNearStart));
+    v.dofNearEnd = std::max(0.0, num("dof_near_end", v.dofNearEnd));
+    v.dofFarStart = std::max(0.0, num("dof_far_start", v.dofFarStart));
+    v.dofFarEnd = std::max(v.dofFarStart, num("dof_far_end", v.dofFarEnd));
+    v.dofNearBlur = std::clamp(num("dof_near_blur", v.dofNearBlur), 0.0, 32.0);
+    v.dofFarBlur = std::clamp(num("dof_far_blur", v.dofFarBlur), 0.0, 32.0);
+    v.dofWeapon = std::max(0.0, num("dof_weapon", v.dofWeapon));
+    v.dofAutoSpeed = std::max(0.01, num("dof_auto_speed", v.dofAutoSpeed));
+    // Sun flare + glare.
+    v.flare = env.hasSun && num("flare", 0) != 0;
+    v.flareIntensity = std::max(0.0, num("flare_intensity", v.flareIntensity));
+    v.flareHalo = std::max(0.0, num("flare_halo", v.flareHalo));
+    v.flareGhosts = std::max(0.0, num("flare_ghosts", v.flareGhosts));
+    v.flareStreak = std::max(0.0, num("flare_streak", v.flareStreak));
+    v.flareColor = v.color;
+    if (ws) readVec(*ws, "volumetric_flare_color", v.flareColor);
+    v.glare = num("glare", 0) != 0;
+    v.glareThreshold = std::clamp(num("glare_threshold", v.glareThreshold), 0.0, 0.98);
+    v.glareIntensity = std::max(0.0, num("glare_intensity", v.glareIntensity));
+    v.glareRadius = std::clamp(num("glare_radius", v.glareRadius), 1.0, 64.0);
+    v.glareSun = env.hasSun ? std::max(0.0, num("glare_sun", v.glareSun)) : 0;
+    // Screen-space weather.
+    v.weather = std::clamp(static_cast<int>(num("weather", 0)), 0, 2);
+    if (v.weather == 2) v.weatherColor = {0.95, 0.96, 1.0}, v.weatherOpacity = 0.85;
+    v.weatherIntensity = std::max(0.0, num("weather_intensity", v.weatherIntensity));
+    v.weatherSpeed = std::max(0.0, num("weather_speed", v.weatherSpeed));
+    v.weatherDistance = std::max(32.0, num("weather_distance", v.weatherDistance));
+    v.weatherOpacity = std::clamp(num("weather_opacity", v.weatherOpacity), 0.0, 1.0);
+    if (ws) readVec(*ws, "volumetric_weather_color", v.weatherColor);
+    if (ws) {
+        Vec3 wind{0, 0, 0};
+        readVec(*ws, "volumetric_weather_wind", wind);
+        v.weatherWind[0] = wind.x, v.weatherWind[1] = wind.y;
+    }
+    for (size_t i = 1; i < doc.ents.size() && v.weather; i++) {
+        const Entity& e = doc.ents[i];
+        if (lower(e.classname()) != "trigger_weather" || e.brushes.empty()) continue;
+        WeatherVolume wv;
+        const std::string* tn = e.find("targetname");
+        wv.name = tn && !tn->empty() ? *tn : "trigger_weather #" + std::to_string(i);
+        readNum(e, "weather_intensity", wv.intensity);
+        readNum(e, "blend", wv.blend);
+        readNum(e, "blend_time", wv.blendTime);
+        wv.intensity = std::max(0.0, wv.intensity);
+        wv.blend = std::max(0.0, wv.blend);
+        wv.blendTime = std::max(0.0, wv.blendTime);
+        for (const Brush& b : e.brushes) {
+            gradevol::Brush pb;
+            for (const Face& f : b.faces)
+                pb.push_back({{static_cast<float>(f.normal.x), static_cast<float>(f.normal.y), static_cast<float>(f.normal.z)},
+                              static_cast<float>(f.dist)});
+            if (!pb.empty()) wv.brushes.push_back(std::move(pb));
+        }
+        if (!wv.brushes.empty() && v.weatherVolumes.size() < 16) v.weatherVolumes.push_back(std::move(wv));
+    }
+    // Local light shafts.
+    v.lights = num("lights", 0) != 0;
+    v.lightsIntensity = std::max(0.0, num("lights_intensity", v.lightsIntensity));
+    v.lightsShadows = std::clamp(num("lights_shadows", v.lightsShadows), 0.0, 1.0);
+    v.lightsMax = std::clamp(static_cast<int>(num("lights_max", v.lightsMax)), 1, 16);
+    v.lightsDistance = std::max(64.0, num("lights_distance", v.lightsDistance));
+    if (v.lights)
+        for (const PointLight& L : readLights(doc)) {
+            if (!L.shafts || L.shaftScale <= 0) continue;
+            VolLight vl;
+            vl.origin = L.origin;
+            vl.color = L.color * L.shaftScale;
+            vl.radius = L.radius;
+            vl.spot = L.spot;
+            vl.spotDir = L.spotDir;
+            vl.cosOuter = L.cosOuter;
+            vl.cosInner = L.cosInner;
+            vl.flicker = L.flicker;
+            v.volLights.push_back(vl);
+        }
+    if (v.volLights.empty()) v.lights = false;
+    v.enabled = on != 0 && (env.hasSun || v.fog || v.ssao || v.grade || v.dof || v.glare || v.weather || v.lights);
     return v;
 }
 
@@ -465,6 +687,85 @@ std::string volumetricConfig(const Document& doc) {
                   v.fog ? 1 : 0, v.fogDensity, v.fogFalloff, v.fogHeight, v.fogSun, v.fogG, v.fogStart, v.fogMax, v.fogSky, v.fogSkyDist,
                   v.fogColor.x, v.fogColor.y, v.fogColor.z);
     out += buf;
+    std::snprintf(buf, sizeof buf, "// ambient occlusion\nssao %d\nssaoradius %g\nssaointensity %g\nssaobias %g\nssaonear %g\nssaofar %g\n",
+                  v.ssao ? 1 : 0, v.ssaoRadius, v.ssaoIntensity, v.ssaoBias, v.ssaoNear, v.ssaoDistance);
+    out += buf;
+    std::snprintf(buf, sizeof buf,
+                  "// depth of field\ndof %d\ndofnear %g %g\ndoffar %g %g\ndofblur %g %g\ndofweapon %g\ndofauto %d\ndofautospeed %g\n",
+                  v.dof ? 1 : 0, v.dofNearStart, v.dofNearEnd, v.dofFarStart, v.dofFarEnd, v.dofNearBlur, v.dofFarBlur, v.dofWeapon,
+                  v.dofAuto ? 1 : 0, v.dofAutoSpeed);
+    out += buf;
+    std::snprintf(buf, sizeof buf,
+                  "// sun flare + glare\nflare %d\nflareparm %g %g %g %g\nflarecolor %.4f %.4f %.4f\nglare %d\nglareparm %g %g %g %g\n",
+                  v.flare ? 1 : 0, v.flareIntensity, v.flareHalo, v.flareGhosts, v.flareStreak, v.flareColor.x, v.flareColor.y, v.flareColor.z,
+                  v.glare ? 1 : 0, v.glareThreshold, v.glareIntensity, v.glareRadius, v.glareSun);
+    out += buf;
+    std::snprintf(buf, sizeof buf,
+                  "// screen-space weather (0 off, 1 rain, 2 snow)\nweather %d\nweatherparm %g %g %g\nweatherwind %g %g\n"
+                  "weathercolor %.4f %.4f %.4f %g\n",
+                  v.weather, v.weatherIntensity, v.weatherSpeed, v.weatherDistance, v.weatherWind[0], v.weatherWind[1], v.weatherColor.x,
+                  v.weatherColor.y, v.weatherColor.z, v.weatherOpacity);
+    out += buf;
+    std::snprintf(buf, sizeof buf, "// local light shafts\nlights %d\nlightsparm %g %g %d %g\n", v.lights ? 1 : 0, v.lightsIntensity,
+                  v.lightsShadows, v.lightsMax, v.lightsDistance);
+    out += buf;
+    if (v.lights)  // x y z  r g b  radius  spot dir xyz  cos outer  cos inner  flicker (point lights: dir 0 0 0, cos -2)
+        for (const VolLight& L : v.volLights) {
+            std::snprintf(buf, sizeof buf, "llight %.2f %.2f %.2f %.4f %.4f %.4f %g %.5f %.5f %.5f %.5f %.5f %g\n", L.origin.x, L.origin.y,
+                          L.origin.z, L.color.x, L.color.y, L.color.z, L.radius, L.spot ? L.spotDir.x : 0, L.spot ? L.spotDir.y : 0,
+                          L.spot ? L.spotDir.z : 0, L.spot ? L.cosOuter : -2, L.spot ? L.cosInner : -2, L.flicker);
+            out += buf;
+        }
+    for (size_t vi = 0; vi < v.weatherVolumes.size(); vi++) {
+        const WeatherVolume& wv = v.weatherVolumes[vi];
+        std::snprintf(buf, sizeof buf, "// weather volume: %s\nwxvolume %zu %g %g %g\n", wv.name.c_str(), vi, wv.blend, wv.blendTime, wv.intensity);
+        out += buf;
+        for (const gradevol::Brush& b : wv.brushes) {
+            out += "wxbrush " + std::to_string(vi) + "\n";
+            for (const gradevol::Plane& pl : b) {
+                std::snprintf(buf, sizeof buf, "wxplane %zu %.6f %.6f %.6f %.3f\n", vi, pl.n[0], pl.n[1], pl.n[2], pl.d);
+                out += buf;
+            }
+        }
+    }
+    std::snprintf(buf, sizeof buf, "// colour grading (every grade setting is baked into the table below)\ngrade %d\nvignette %g\n",
+                  v.grade && v.gradeLut ? 1 : 0, v.vignette);
+    out += buf;
+    if (v.grade && v.gradeLut) {
+        const GradeLut& t = *v.gradeLut;
+        static const char hex[] = "0123456789abcdef";
+        out += "lut " + std::to_string(t.size) + "\n";
+        for (int b = 0; b < t.size; b++)
+            for (int g = 0; g < t.size; g++) {
+                std::string row = "lutrow " + std::to_string(b) + " " + std::to_string(g) + " ";
+                const uint8_t* p = &t.rgb[((static_cast<size_t>(b) * t.size + g) * t.size) * 3];
+                for (int i = 0; i < t.size * 3; i++) row += hex[p[i] >> 4], row += hex[p[i] & 15];
+                out += row + "\n";
+            }
+        // trigger_grade volumes: convex brushes (outward planes) + their own table, blended in by the camera position.
+        int vi = 0;
+        for (const GradeVolume& gv : v.gradeVolumes) {
+            if (!gv.lut || gv.lut->size != t.size) continue;
+            std::snprintf(buf, sizeof buf, "// grade volume: %s\ngradevolume %d %g %g %g\n", gv.name.c_str(), vi, gv.blend, gv.blendTime,
+                          gv.vignette);
+            out += buf;
+            for (const gradevol::Brush& b : gv.brushes) {
+                out += "volbrush " + std::to_string(vi) + "\n";
+                for (const gradevol::Plane& pl : b) {
+                    std::snprintf(buf, sizeof buf, "volplane %d %.6f %.6f %.6f %.3f\n", vi, pl.n[0], pl.n[1], pl.n[2], pl.d);
+                    out += buf;
+                }
+            }
+            for (int b = 0; b < t.size; b++)
+                for (int g = 0; g < t.size; g++) {
+                    std::string row = "vollutrow " + std::to_string(vi) + " " + std::to_string(b) + " " + std::to_string(g) + " ";
+                    const uint8_t* p = &gv.lut->rgb[((static_cast<size_t>(b) * t.size + g) * t.size) * 3];
+                    for (int i = 0; i < t.size * 3; i++) row += hex[p[i] >> 4], row += hex[p[i] & 15];
+                    out += row + "\n";
+                }
+            vi++;
+        }
+    }
     // Player clip brushes (full_clip, clip_player, ...) stop the sun's shafts (the game doesn't draw them, so the DLL draws these
     // triangles into its sky mask).
     size_t tris = 0;
@@ -497,6 +798,47 @@ std::vector<PointLight> readLights(const Document& doc) {
         if (!readNum(e, "radius", radius)) readNum(e, "light", radius);
         L.radius = radius > 0 ? radius : 300;
         L.color = color * intensity;
+        // Spotlight: a cone and/or a target.
+        double outer = 0, inner = -1;
+        readNum(e, "fov_outer", outer);
+        readNum(e, "fov_inner", inner);
+        const std::string* target = e.find("target");
+        if (outer > 0 || (target && !target->empty())) {
+            if (outer <= 0) outer = 45;
+            outer = std::clamp(outer, 1.0, 89.0);
+            inner = inner < 0 ? outer * 0.8 : std::clamp(inner, 0.0, outer);
+            Vec3 dir{0, 0, -1};
+            bool aimed = false;
+            if (target && !target->empty())
+                for (const Entity& t : doc.ents) {
+                    const std::string* tn = t.find("targetname");
+                    Vec3 to;
+                    if (tn && *tn == *target && t.origin(to) && length(to - L.origin) > 1e-3) {
+                        dir = normalize(to - L.origin);
+                        aimed = true;
+                        break;
+                    }
+                }
+            if (!aimed) {  // angles "pitch yaw roll" / angle (yaw); neither: straight down
+                Vec3 ang{90, 0, 0};
+                double yaw = 0;
+                if (!readVec(e, "angles", ang) && readNum(e, "angle", yaw)) ang = {0, yaw, 0};
+                const double p = ang.x * kPi / 180, y = ang.y * kPi / 180;
+                dir = {std::cos(p) * std::cos(y), std::cos(p) * std::sin(y), -std::sin(p)};
+            }
+            L.spot = true;
+            L.spotDir = dir;
+            L.cosOuter = std::cos(outer * kPi / 180);
+            L.cosInner = std::cos(inner * kPi / 180);
+        }
+        double n = 1;
+        if (readNum(e, "volumetric", n)) L.shafts = n != 0;
+        readNum(e, "volumetric_intensity", L.shaftScale);
+        readNum(e, "volumetric_flicker", L.flicker);
+        L.flicker = std::clamp(L.flicker, 0.0, 1.0);
+        L.shaftScale = std::max(0.0, L.shaftScale);
+        double only = 0;
+        if (readNum(e, "volumetric_only", only) && only != 0) L.bake = false;
         out.push_back(L);
     }
     return out;

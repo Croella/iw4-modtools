@@ -581,6 +581,13 @@ static void testBrushTriggers() {
     CHECK(cm.triggerModels[0].contents == clip::kTriggerContents && cm.triggerModels[0].hullCount == 2 &&
           cm.triggerModels[1].firstHull == 2);
 
+    // A trigger_grade / trigger_weather (post-pass only) is left out of the zone entirely.
+    Entity grade;
+    grade.set("classname", "trigger_grade");
+    grade.brushes.push_back(makeBox({-300, -300, 0}, {-200, -200, 64}, "trigger"));
+    d.ents.push_back(grade);
+    grade.set("classname", "trigger_weather");
+    d.ents.push_back(grade);
     // whole compile: the loader reads them back
     for (MapTarget target : {MapTarget::MP, MapTarget::SP}) {
         std::vector<uint8_t> ff;
@@ -598,6 +605,7 @@ static void testBrushTriggers() {
             CHECK(me->trigger.slabCount == cm.triggerSlabs.size() && me->trigger.slabs[0].halfSize == cm.triggerSlabs[0].halfSize);
             const std::string ents(me->entityString);
             CHECK(ents.find("\"model\" \"?0\"") != std::string::npos && ents.find("\"model\" \"?1\"") != std::string::npos);
+            CHECK(ents.find("trigger_grade") == std::string::npos && ents.find("trigger_weather") == std::string::npos);
         }
     }
 }
@@ -2374,6 +2382,227 @@ static void testImportFastfile() {
     fs::remove_all(root, ec);
 }
 
+// Colour grading + SSAO settings: the baked table, artist LUT strips and the .volumetric lines the
+// DLL reads.
+static void testPostSettings() {
+    using namespace light;
+    // Neutral settings bake an identity table.
+    GradeParams none;
+    GradeLut id = bakeGradeLut(none, nullptr, 17);
+    CHECK(id.size == 17 && id.rgb.size() == size_t(17) * 17 * 17 * 3);
+    int worst = 0;
+    for (int b = 0; b < 17; b++)
+        for (int g = 0; g < 17; g++)
+            for (int r = 0; r < 17; r++) {
+                const uint8_t* p = &id.rgb[((size_t(b) * 17 + g) * 17 + r) * 3];
+                const int want[3] = {int(std::lround(r * 255.0 / 16)), int(std::lround(g * 255.0 / 16)), int(std::lround(b * 255.0 / 16))};
+                for (int k = 0; k < 3; k++) worst = std::max(worst, std::abs(p[k] - want[k]));
+            }
+    CHECK(worst <= 1);
+    // Each knob moves mid grey the right way.
+    const double grey[3] = {0.5, 0.5, 0.5}, red[3] = {0.8, 0.3, 0.2};
+    double o[3];
+    GradeParams p;
+    p.exposure = 1;
+    gradeColor(p, nullptr, grey, o);
+    CHECK(o[0] > 0.65 && std::fabs(o[0] - o[2]) < 1e-6);
+    p = {};
+    p.temperature = 1;
+    gradeColor(p, nullptr, grey, o);
+    CHECK(o[0] > 0.52 && o[2] < 0.48);
+    p = {};
+    p.saturation = 0;
+    gradeColor(p, nullptr, red, o);
+    CHECK(std::fabs(o[0] - o[1]) < 1e-6 && std::fabs(o[1] - o[2]) < 1e-6);
+    p = {};
+    p.contrast = 2;
+    const double dark[3] = {0.3, 0.3, 0.3};
+    gradeColor(p, nullptr, dark, o);
+    CHECK(std::fabs(o[0] - 0.1) < 1e-6);
+    p = {};
+    p.lift[2] = 0.2;
+    const double black[3] = {0, 0, 0};
+    gradeColor(p, nullptr, black, o);
+    CHECK(o[0] == 0 && std::fabs(o[2] - 0.2) < 1e-6);
+
+    // Artist strip LUT: a neutral one round-trips; a hand-made "swap red and blue" one is applied.
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "iw4r_grade_test";
+    fs::create_directories(dir / "zone_source" / "luts");
+    std::string err;
+    const std::string neutral = (dir / "neutral.png").string();
+    CHECK(saveNeutralStripLut(neutral, 16, err));
+    GradeLut art;
+    CHECK(loadStripLut(neutral, art, err) && art.size == 16);
+    gradeColor(none, &art, red, o);
+    CHECK(std::fabs(o[0] - 0.8) < 0.01 && std::fabs(o[1] - 0.3) < 0.01 && std::fabs(o[2] - 0.2) < 0.01);
+    {
+        imageio::Rgba img;
+        CHECK(imageio::load(neutral, img, err));
+        for (size_t i = 0; i < img.pixels.size(); i += 4) std::swap(img.pixels[i], img.pixels[i + 2]);
+        CHECK(imageio::savePng((dir / "zone_source" / "luts" / "swap.png").string(), img, err));
+    }
+    imageio::Rgba bad;
+    bad.width = 30, bad.height = 7;
+    bad.pixels.assign(30 * 7 * 4, 0);
+    CHECK(imageio::savePng((dir / "bad.png").string(), bad, err));
+    CHECK(!loadStripLut((dir / "bad.png").string(), art, err) && err.find("LUT strip") != std::string::npos);
+
+    // Worldspawn keys -> Volumetric -> .volumetric text.
+    Document d;
+    d.path = (dir / "gradetest.map").string();
+    d.ents[0].set("volumetric_ssao", "1");
+    d.ents[0].set("volumetric_ssao_radius", "48");
+    d.ents[0].set("volumetric_ssao_intensity", "1.25");
+    d.ents[0].set("volumetric_grade", "1");
+    d.ents[0].set("volumetric_grade_lut", "swap");
+    d.ents[0].set("volumetric_grade_vignette", "0.4");
+    d.ents[0].set("volumetric_grade_gain", "1 1 1");
+    Volumetric v = readVolumetric(d);
+    CHECK(v.enabled && v.ssao && v.ssaoRadius == 48 && v.ssaoIntensity == 1.25 && v.grade && v.vignette == 0.4);
+    CHECK(v.gradeLut && v.gradeLut->size == 32 && v.gradeWarning.empty());
+    if (v.gradeLut) {  // pure red in -> blue out (the swap LUT)
+        const uint8_t* px = &v.gradeLut->rgb[(size_t(31)) * 3];  // r = 31, g = 0, b = 0
+        CHECK(px[0] < 4 && px[1] < 4 && px[2] > 250);
+    }
+    CHECK(readVolumetric(d).gradeLut == v.gradeLut);  // cached
+    const std::string cfg = volumetricConfig(d);
+    CHECK(cfg.find("\nssao 1\n") != std::string::npos && cfg.find("\nssaoradius 48\n") != std::string::npos);
+    CHECK(cfg.find("\ngrade 1\n") != std::string::npos && cfg.find("\nvignette 0.4\n") != std::string::npos);
+    CHECK(cfg.find("\nlut 32\n") != std::string::npos);
+    size_t rows = 0;
+    for (size_t at = cfg.find("\nlutrow "); at != std::string::npos; at = cfg.find("\nlutrow ", at + 1)) rows++;
+    CHECK(rows == 32 * 32);
+    // A row: "lutrow b g " + 32 * 6 hex digits.
+    const size_t r0 = cfg.find("\nlutrow 0 0 ");
+    CHECK(r0 != std::string::npos && cfg.find('\n', r0 + 1) - (r0 + 1) == std::string("lutrow 0 0 ").size() + 32 * 6);
+    // Missing LUT: grading still on (parameters only), with a warning.
+    d.ents[0].set("volumetric_grade_lut", "nope");
+    v = readVolumetric(d);
+    CHECK(v.gradeLut && v.gradeWarning.find("not found") != std::string::npos);
+    // Grading off: no table written, the rest of the file as before.
+    d.ents[0].set("volumetric_grade", "0");
+    d.ents[0].set("volumetric_ssao", "0");
+    const std::string off = volumetricConfig(d);
+    CHECK(off.find("\ngrade 0\n") != std::string::npos && off.find("lutrow") == std::string::npos && off.find("\nssao 0\n") != std::string::npos);
+
+    // trigger_grade volumes: inherit worldspawn, override their keys; grading turns on for them alone.
+    d.ents[0].set("volumetric_grade_lut", "");
+    d.ents[0].set("volumetric_grade_saturation", "0.5");
+    Entity tg;
+    tg.set("classname", "trigger_grade");
+    tg.set("targetname", "cellar");
+    tg.set("grade_temperature", "-0.8");
+    tg.set("blend", "32");
+    tg.set("blend_time", "1.5");
+    tg.set("priority", "2");
+    tg.brushes.push_back(makeBox({0, 0, 0}, {256, 256, 128}, "trigger"));
+    d.ents.push_back(tg);
+    Entity tg2 = tg;
+    tg2.set("targetname", "attic");
+    tg2.set("priority", "-1");
+    tg2.set("grade_saturation", "0");
+    d.ents.push_back(tg2);
+    v = readVolumetric(d);
+    CHECK(v.grade && v.gradeLut && v.gradeVolumes.size() == 2);
+    if (v.gradeVolumes.size() == 2) {
+        CHECK(v.gradeVolumes[0].name == "attic" && v.gradeVolumes[1].name == "cellar");  // by priority
+        const GradeVolume& c = v.gradeVolumes[1];
+        CHECK(c.blend == 32 && c.blendTime == 1.5 && c.priority == 2 && c.brushes.size() == 1 && c.brushes[0].size() == 6);
+        // worldspawn grade is off, so the volume inherits neutral settings, not the 0.5 saturation
+        CHECK(c.params.temperature == -0.8 && c.params.saturation == 1 && c.lut && c.lut != v.gradeLut);
+        // weights: centre of the box (64 inside the nearest wall: full), 16 inside (half), outside (none)
+        const float mid[3] = {128, 128, 64}, edge[3] = {16, 128, 64}, out[3] = {-10, 128, 64};
+        CHECK(gradevol::targetWeight(c.brushes, 32, mid) == 1.0f);
+        CHECK(std::fabs(gradevol::targetWeight(c.brushes, 32, edge) - 0.5f) < 1e-4f);
+        CHECK(gradevol::targetWeight(c.brushes, 32, out) == 0.0f);
+        CHECK(gradevol::approach(0, 1, 2, 0.5f) == 0.25f && gradevol::approach(0.5f, 0, 0, 0.1f) == 0.0f);
+        std::vector<uint8_t> a{0, 100, 200}, b{200, 100, 0};
+        gradevol::blendInto(a, b, 0.5f);
+        CHECK(a[0] == 100 && a[1] == 100 && a[2] == 100);
+    }
+    const std::string withVols = volumetricConfig(d);
+    CHECK(withVols.find("\ngrade 1\n") != std::string::npos && withVols.find("\ngradevolume 0 32 1.5 0\n") != std::string::npos &&
+          withVols.find("\ngradevolume 1 ") != std::string::npos);
+    size_t volRows = 0, planes = 0;
+    for (size_t at = withVols.find("\nvollutrow "); at != std::string::npos; at = withVols.find("\nvollutrow ", at + 1)) volRows++;
+    for (size_t at = withVols.find("\nvolplane "); at != std::string::npos; at = withVols.find("\nvolplane ", at + 1)) planes++;
+    CHECK(volRows == 2 * 32 * 32 && planes == 12);
+    // With the worldspawn grade on, volumes inherit its settings.
+    d.ents[0].set("volumetric_grade", "1");
+    v = readVolumetric(d);
+    CHECK(v.gradeVolumes.size() == 2 && v.gradeVolumes[1].params.saturation == 0.5 && v.gradeVolumes[0].params.saturation == 0);
+
+    // Depth of field.
+    d.ents[0].set("volumetric_dof", "1");
+    d.ents[0].set("volumetric_dof_far_start", "800");
+    d.ents[0].set("volumetric_dof_far_end", "300");  // before the start: clamped up to it
+    d.ents[0].set("volumetric_dof_near_blur", "99");
+    d.ents[0].set("volumetric_dof_auto", "1");
+    v = readVolumetric(d);
+    CHECK(v.dof && v.dofAuto && v.dofFarStart == 800 && v.dofFarEnd == 800 && v.dofNearBlur == 32 && v.dofWeapon == 24);
+    const std::string dofCfg = volumetricConfig(d);
+    CHECK(dofCfg.find("\ndof 1\ndofnear 0 0\ndoffar 800 800\ndofblur 32 4\ndofweapon 24\ndofauto 1\n") != std::string::npos);
+
+    // Sun flare, glare, weather (+ trigger_weather shelters).
+    d.ents[0].set("volumetric_flare", "1");
+    d.ents[0].set("volumetric_flare_ghosts", "2");
+    d.ents[0].set("volumetric_glare", "1");
+    d.ents[0].set("volumetric_glare_radius", "200");  // clamped to 64
+    d.ents[0].set("volumetric_weather", "2");
+    d.ents[0].set("volumetric_weather_wind", "40 -10 0");
+    Entity tw;
+    tw.set("classname", "trigger_weather");
+    tw.set("targetname", "porch");
+    tw.set("weather_intensity", "0.25");
+    tw.brushes.push_back(makeBox({0, 0, 0}, {128, 128, 96}, "trigger"));
+    d.ents.push_back(tw);
+    v = readVolumetric(d);
+    CHECK(v.flare && v.flareGhosts == 2 && v.glare && v.glareRadius == 64 && v.weather == 2 && v.weatherWind[0] == 40 &&
+          v.weatherWind[1] == -10 && v.weatherOpacity == 0.85);
+    CHECK(v.weatherVolumes.size() == 1 && v.weatherVolumes[0].name == "porch" && v.weatherVolumes[0].intensity == 0.25 &&
+          v.weatherVolumes[0].brushes.size() == 1 && v.weatherVolumes[0].brushes[0].size() == 6);
+    const std::string fxCfg = volumetricConfig(d);
+    CHECK(fxCfg.find("\nflare 1\nflareparm 1 1 2 0.5\n") != std::string::npos && fxCfg.find("\nglare 1\nglareparm 0.8 0.6 64 0.3\n") != std::string::npos);
+    CHECK(fxCfg.find("\nweather 2\nweatherparm 1 1 1200\nweatherwind 40 -10\n") != std::string::npos &&
+          fxCfg.find("\nwxvolume 0 64 0.5 0.25\nwxbrush 0\n") != std::string::npos);
+
+    // Local light shafts: a point light, a spotlight aimed by target, one by angles, one left out, one shaft-only.
+    auto addLight = [&](const char* origin, std::initializer_list<std::pair<const char*, const char*>> keys) {
+        Entity l;
+        l.set("classname", "light");
+        l.set("origin", origin);
+        for (const auto& kv : keys) l.set(kv.first, kv.second);
+        d.ents.push_back(l);
+    };
+    addLight("0 0 100", {{"radius", "200"}, {"_color", "1 0.5 0.25"}, {"intensity", "2"}, {"volumetric_flicker", "0.5"}});
+    addLight("100 0 100", {{"target", "spotaim"}, {"fov_outer", "30"}});
+    addLight("100 0 0", {{"targetname", "spotaim"}, {"classname", "info_null"}});
+    addLight("0 100 100", {{"fov_outer", "40"}, {"fov_inner", "10"}, {"angles", "0 90 0"}});
+    addLight("0 200 100", {{"volumetric", "0"}});
+    addLight("0 300 100", {{"volumetric_only", "1"}, {"volumetric_intensity", "3"}});
+    const std::vector<PointLight> pls = readLights(d);
+    CHECK(pls.size() == 5);
+    if (pls.size() == 5) {
+        CHECK(!pls[0].spot && pls[0].radius == 200 && pls[0].color.y == 1 && pls[0].flicker == 0.5);
+        CHECK(pls[1].spot && std::fabs(pls[1].spotDir.z + 1) < 1e-9 && std::fabs(pls[1].cosOuter - std::cos(30 * 3.14159265358979 / 180)) < 1e-9 &&
+              std::fabs(pls[1].cosInner - std::cos(24 * 3.14159265358979 / 180)) < 1e-9);
+        CHECK(pls[2].spot && std::fabs(pls[2].spotDir.y - 1) < 1e-9 && std::fabs(pls[2].cosInner - std::cos(10 * 3.14159265358979 / 180)) < 1e-9);
+        CHECK(!pls[3].shafts && pls[4].bake == false && pls[4].shaftScale == 3);
+    }
+    v = readVolumetric(d);
+    CHECK(!v.lights && v.volLights.empty());  // off until volumetric_lights
+    d.ents[0].set("volumetric_lights", "1");
+    d.ents[0].set("volumetric_lights_max", "40");  // clamped to 16
+    v = readVolumetric(d);
+    CHECK(v.lights && v.volLights.size() == 4 && v.lightsMax == 16 && v.volLights[3].color.x == 3);
+    const std::string lCfg = volumetricConfig(d);
+    CHECK(lCfg.find("\nlights 1\nlightsparm 1 0.8 16 4000\n") != std::string::npos &&
+          lCfg.find("\nllight 0.00 0.00 100.00 2.0000 1.0000 0.5000 200 0.00000 0.00000 0.00000 -2.00000 -2.00000 0.5\n") != std::string::npos &&
+          lCfg.find("\nllight 100.00 0.00 100.00 1.0000 1.0000 1.0000 300 0.00000 0.00000 -1.00000 0.86603 ") != std::string::npos);
+    fs::remove_all(dir);
+}
+
 int main() {
     testBox();
     testResize();
@@ -2401,6 +2630,7 @@ int main() {
     testLargeClipMapTree();
     testGfxWorldCompile();
     testLightingBake();
+    testPostSettings();
     testCustomMapScript();
     testWeaponPackLevel();
     testSurfaceTypes();

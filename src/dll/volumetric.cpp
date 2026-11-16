@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "dll/postshaders.h"
+#include "light/gradevolume.h"
 
 namespace volumetric {
 namespace {
@@ -55,6 +56,46 @@ struct Settings {
     // Sun occluders: world-space triangles (9 floats each) from the map's player clip brushes, drawn
     // black into the shaft mask (the game doesn't draw them, so the sky shows through).
     std::shared_ptr<const std::vector<float>> occ;
+    // Ambient occlusion (off unless "ssao 1").
+    bool ssao = false;
+    float ssaoRadius = 64, ssaoIntensity = 1.5f, ssaoBias = 0.1f, ssaoNear = 20, ssaoFar = 3000;
+    // Colour grading: a baked RGB8 table ("lut <size>" + size*size "lutrow <b> <g> <hex rgb...>" lines).
+    bool grade = false;
+    float vignette = 0;
+    int lutSize = 0;
+    std::shared_ptr<const std::vector<uint8_t>> lut;
+    // trigger_grade volumes: their own tables, blended over the base by the camera position.
+    struct GradeVol {
+        std::vector<gradevol::Brush> brushes;
+        float blend = 64, blendTime = 0, vignette = 0;
+        std::vector<uint8_t> lut;
+        int rows = 0;
+    };
+    std::shared_ptr<const std::vector<GradeVol>> vols;
+    // Depth of field.
+    bool dof = false, dofAuto = false;
+    float dofNear[2] = {0, 0}, dofFar[2] = {1000, 4000}, dofBlur[2] = {6, 4}, dofWeapon = 24, dofAutoSpeed = 4;
+    // Sun flare ("flare 1") and glare ("glare 1": bloom of bright pixels + veiling glare near the sun).
+    bool flare = false, glare = false;
+    float flareIntensity = 1, flareHalo = 1, flareGhosts = 1, flareStreak = 0.5f;
+    float flareColor[3] = {1, 0.95f, 0.85f};
+    float glareThreshold = 0.8f, glareIntensity = 0.6f, glareRadius = 24, glareSun = 0.3f;
+    // Screen-space weather: 0 off, 1 rain, 2 snow; trigger_weather volumes scale it by the camera position.
+    int weather = 0;
+    float wxIntensity = 1, wxSpeed = 1, wxDistance = 1200, wxWind[2] = {0, 0}, wxColor[3] = {0.7f, 0.74f, 0.8f}, wxOpacity = 0.35f;
+    struct WxVol {
+        std::vector<gradevol::Brush> brushes;
+        float blend = 64, blendTime = 0.5f, intensity = 0;
+    };
+    std::shared_ptr<const std::vector<WxVol>> wxVols;
+    // Local light shafts ("lights 1" + "llight" lines).
+    bool lights = false;
+    float lightsIntensity = 1, lightsShadows = 0.8f, lightsDistance = 4000;
+    int lightsMax = 8;
+    struct Light {
+        float pos[3], color[3], radius, dir[3], cosOuter, cosInner, flicker;
+    };
+    std::shared_ptr<const std::vector<Light>> lightList;
 };
 
 std::mutex g_mx;
@@ -69,21 +110,97 @@ bool readSettings(const std::string& path, Settings& s) {
     s = Settings{};
     s.enabled = true;
     auto occ = std::make_shared<std::vector<float>>();
-    char line[512];
+    std::shared_ptr<std::vector<uint8_t>> lut;
+    int lutRows = 0;
+    auto vols = std::make_shared<std::vector<Settings::GradeVol>>();
+    auto wxVols = std::make_shared<std::vector<Settings::WxVol>>();
+    auto lightList = std::make_shared<std::vector<Settings::Light>>();
+    auto nib = [](char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; };
+    // Reads n*3 hex bytes into row; false on a short or bad line.
+    auto hexRow = [&](const char* h, uint8_t* row, int n) {
+        for (int i = 0; i < n * 3; i++) {
+            const int hi = nib(h[i * 2]), lo = hi < 0 ? -1 : nib(h[i * 2 + 1]);
+            if (hi < 0 || lo < 0) return false;
+            row[i] = static_cast<uint8_t>(hi * 16 + lo);
+        }
+        return true;
+    };
+    char line[1024];
     while (std::fgets(line, sizeof line, f)) {
+        int lb = 0, lg = 0, at = 0, vi = -1;
+        if (std::sscanf(line, " vollutrow %d %d %d %n", &vi, &lb, &lg, &at) == 3 && at > 0) {
+            const int n = s.lutSize;
+            if (vi >= 0 && vi < int(vols->size()) && lb >= 0 && lb < n && lg >= 0 && lg < n) {
+                Settings::GradeVol& gv = (*vols)[vi];
+                if (gv.lut.size() == static_cast<size_t>(n) * n * n * 3 && hexRow(line + at, &gv.lut[((static_cast<size_t>(lb) * n + lg) * n) * 3], n))
+                    gv.rows++;
+            }
+            continue;
+        }
+        float gb[3];
+        if (std::sscanf(line, " gradevolume %d %f %f %f", &vi, &gb[0], &gb[1], &gb[2]) == 4) {
+            if (vi >= 0 && vi < 16 && s.lutSize >= 2) {
+                if (int(vols->size()) <= vi) vols->resize(vi + 1);
+                Settings::GradeVol& gv = (*vols)[vi];
+                gv.blend = std::max(0.0f, gb[0]), gv.blendTime = std::max(0.0f, gb[1]), gv.vignette = std::max(0.0f, std::min(1.0f, gb[2]));
+                gv.lut.assign(static_cast<size_t>(s.lutSize) * s.lutSize * s.lutSize * 3, 0);
+            }
+            continue;
+        }
+        if (std::sscanf(line, " wxvolume %d %f %f %f", &vi, &gb[0], &gb[1], &gb[2]) == 4) {
+            if (vi >= 0 && vi < 16) {
+                if (int(wxVols->size()) <= vi) wxVols->resize(vi + 1);
+                Settings::WxVol& wv = (*wxVols)[vi];
+                wv.blend = std::max(0.0f, gb[0]), wv.blendTime = std::max(0.0f, gb[1]), wv.intensity = std::max(0.0f, gb[2]);
+            }
+            continue;
+        }
+        if (std::sscanf(line, " wxbrush %d", &vi) == 1) {
+            if (vi >= 0 && vi < int(wxVols->size())) (*wxVols)[vi].brushes.emplace_back();
+            continue;
+        }
+        float wp[4];
+        if (std::sscanf(line, " wxplane %d %f %f %f %f", &vi, &wp[0], &wp[1], &wp[2], &wp[3]) == 5) {
+            if (vi >= 0 && vi < int(wxVols->size()) && !(*wxVols)[vi].brushes.empty())
+                (*wxVols)[vi].brushes.back().push_back({{wp[0], wp[1], wp[2]}, wp[3]});
+            continue;
+        }
+        if (std::sscanf(line, " volbrush %d", &vi) == 1) {
+            if (vi >= 0 && vi < int(vols->size())) (*vols)[vi].brushes.emplace_back();
+            continue;
+        }
+        float pl[4];
+        if (std::sscanf(line, " volplane %d %f %f %f %f", &vi, &pl[0], &pl[1], &pl[2], &pl[3]) == 5) {
+            if (vi >= 0 && vi < int(vols->size()) && !(*vols)[vi].brushes.empty())
+                (*vols)[vi].brushes.back().push_back({{pl[0], pl[1], pl[2]}, pl[3]});
+            continue;
+        }
+        if (std::sscanf(line, " lutrow %d %d %n", &lb, &lg, &at) == 2 && at > 0) {
+            const int n = s.lutSize;
+            if (lut && lb >= 0 && lb < n && lg >= 0 && lg < n) {
+                if (hexRow(line + at, &(*lut)[((static_cast<size_t>(lb) * n + lg) * n) * 3], n)) lutRows++;
+            }
+            continue;
+        }
+        Settings::Light lt{};
+        if (std::sscanf(line, " llight %f %f %f %f %f %f %f %f %f %f %f %f %f", &lt.pos[0], &lt.pos[1], &lt.pos[2], &lt.color[0], &lt.color[1],
+                        &lt.color[2], &lt.radius, &lt.dir[0], &lt.dir[1], &lt.dir[2], &lt.cosOuter, &lt.cosInner, &lt.flicker) == 13) {
+            if (lt.radius > 1 && lightList->size() < 4096) lightList->push_back(lt);
+            continue;
+        }
         float t[9];
         if (std::sscanf(line, " occluder %f %f %f %f %f %f %f %f %f", &t[0], &t[1], &t[2], &t[3], &t[4], &t[5], &t[6], &t[7], &t[8]) == 9) {
             occ->insert(occ->end(), t, t + 9);
             continue;
         }
         char key[64] = "";
-        float v[3] = {0, 0, 0};
-        int n = std::sscanf(line, " %63s %f %f %f", key, &v[0], &v[1], &v[2]);
+        float v[4] = {0, 0, 0, 0};
+        int n = std::sscanf(line, " %63s %f %f %f %f", key, &v[0], &v[1], &v[2], &v[3]);
         if (n < 2 || key[0] == '/' || key[0] == '#') continue;
         auto is = [&](const char* k) { return _stricmp(key, k) == 0; };
         if (is("enabled")) s.enabled = v[0] != 0;
-        else if (is("sun") && n == 4) std::memcpy(s.sun, v, sizeof v);
-        else if (is("color") && n == 4) std::memcpy(s.color, v, sizeof v);
+        else if (is("sun") && n == 4) std::memcpy(s.sun, v, 3 * sizeof(float));
+        else if (is("color") && n == 4) std::memcpy(s.color, v, 3 * sizeof(float));
         else if (is("intensity")) s.intensity = v[0];
         else if (is("density")) s.density = v[0];
         else if (is("decay")) s.decay = v[0];
@@ -99,16 +216,70 @@ bool readSettings(const std::string& path, Settings& s) {
         else if (is("fogdensity")) s.fogDensity = v[0];
         else if (is("fogfalloff")) s.fogFalloff = v[0];
         else if (is("fogheight")) s.fogHeight = v[0];
-        else if (is("fogcolor") && n == 4) std::memcpy(s.fogColor, v, sizeof v);
+        else if (is("fogcolor") && n == 4) std::memcpy(s.fogColor, v, 3 * sizeof(float));
         else if (is("fogsun")) s.fogSun = v[0];
         else if (is("fogg")) s.fogG = std::max(-0.95f, std::min(0.95f, v[0]));
         else if (is("fogstart")) s.fogStart = v[0];
         else if (is("fogmax")) s.fogMax = v[0];
         else if (is("fogsky")) s.fogSky = v[0];
         else if (is("fogskydist")) s.fogSkyDist = v[0];
+        else if (is("ssao")) s.ssao = v[0] != 0;
+        else if (is("ssaoradius")) s.ssaoRadius = std::max(1.0f, v[0]);
+        else if (is("ssaointensity")) s.ssaoIntensity = std::max(0.0f, v[0]);
+        else if (is("ssaobias")) s.ssaoBias = std::max(0.0f, std::min(0.95f, v[0]));
+        else if (is("ssaonear")) s.ssaoNear = std::max(0.0f, v[0]);
+        else if (is("ssaofar")) s.ssaoFar = std::max(1.0f, v[0]);
+        else if (is("grade")) s.grade = v[0] != 0;
+        else if (is("dof")) s.dof = v[0] != 0;
+        else if (is("dofnear") && n >= 3) s.dofNear[0] = std::max(0.0f, v[0]), s.dofNear[1] = std::max(0.0f, v[1]);
+        else if (is("doffar") && n >= 3) s.dofFar[0] = std::max(0.0f, v[0]), s.dofFar[1] = std::max(v[0], v[1]);
+        else if (is("dofblur") && n >= 3) s.dofBlur[0] = std::max(0.0f, std::min(32.0f, v[0])), s.dofBlur[1] = std::max(0.0f, std::min(32.0f, v[1]));
+        else if (is("dofweapon")) s.dofWeapon = std::max(0.0f, v[0]);
+        else if (is("dofauto")) s.dofAuto = v[0] != 0;
+        else if (is("dofautospeed")) s.dofAutoSpeed = std::max(0.01f, v[0]);
+        else if (is("flare")) s.flare = v[0] != 0;
+        else if (is("flareparm") && n >= 5)
+            s.flareIntensity = std::max(0.0f, v[0]), s.flareHalo = std::max(0.0f, v[1]), s.flareGhosts = std::max(0.0f, v[2]),
+            s.flareStreak = std::max(0.0f, v[3]);
+        else if (is("flarecolor") && n >= 4) std::memcpy(s.flareColor, v, 3 * sizeof(float));
+        else if (is("glare")) s.glare = v[0] != 0;
+        else if (is("glareparm") && n >= 5)
+            s.glareThreshold = std::max(0.0f, std::min(0.98f, v[0])), s.glareIntensity = std::max(0.0f, v[1]),
+            s.glareRadius = std::max(1.0f, std::min(64.0f, v[2])), s.glareSun = std::max(0.0f, v[3]);
+        else if (is("weather")) s.weather = std::max(0, std::min(2, static_cast<int>(v[0])));
+        else if (is("weatherparm") && n >= 4)
+            s.wxIntensity = std::max(0.0f, v[0]), s.wxSpeed = std::max(0.0f, v[1]), s.wxDistance = std::max(32.0f, v[2]);
+        else if (is("weatherwind") && n >= 3) s.wxWind[0] = v[0], s.wxWind[1] = v[1];
+        else if (is("weathercolor") && n >= 5)
+            std::memcpy(s.wxColor, v, 3 * sizeof(float)), s.wxOpacity = std::max(0.0f, std::min(1.0f, v[3]));
+        else if (is("lights")) s.lights = v[0] != 0;
+        else if (is("lightsparm") && n >= 5)
+            s.lightsIntensity = std::max(0.0f, v[0]), s.lightsShadows = std::max(0.0f, std::min(1.0f, v[1])),
+            s.lightsMax = std::max(1, std::min(16, static_cast<int>(v[2]))), s.lightsDistance = std::max(64.0f, v[3]);
+        else if (is("vignette")) s.vignette = std::max(0.0f, std::min(1.0f, v[0]));
+        else if (is("lut")) {
+            const int n = static_cast<int>(v[0]);
+            if (n >= 2 && n <= 64) {
+                s.lutSize = n;
+                lut = std::make_shared<std::vector<uint8_t>>(static_cast<size_t>(n) * n * n * 3, 0);
+                lutRows = 0;
+            }
+        }
     }
     std::fclose(f);
     if (!occ->empty()) s.occ = std::move(occ);
+    if (lut && lutRows == s.lutSize * s.lutSize) s.lut = std::move(lut);
+    else s.lutSize = 0;
+    if (!s.lut) s.grade = false;
+    // Keep only complete volumes.
+    vols->erase(std::remove_if(vols->begin(), vols->end(),
+                               [&](const Settings::GradeVol& gv) { return !s.lut || gv.rows != s.lutSize * s.lutSize || gv.brushes.empty(); }),
+                vols->end());
+    if (!vols->empty()) s.vols = std::move(vols);
+    wxVols->erase(std::remove_if(wxVols->begin(), wxVols->end(), [](const Settings::WxVol& wv) { return wv.brushes.empty(); }), wxVols->end());
+    if (!wxVols->empty()) s.wxVols = std::move(wxVols);
+    if (!lightList->empty()) s.lightList = std::move(lightList);
+    else s.lights = false;
     float l = std::sqrt(s.sun[0] * s.sun[0] + s.sun[1] * s.sun[1] + s.sun[2] * s.sun[2]);
     if (l > 1e-6f)
         for (float& c : s.sun) c /= l;
@@ -435,7 +606,40 @@ struct Gpu {
     IDirect3DStateBlock9* sb = nullptr;
     IDirect3DTexture9* floatz = nullptr;  // the game's, AddRef'd
     IDirect3DTexture9* depth = nullptr;   // INTZ texture standing in for the game's depth buffer
-    bool fogNoDepthLogged = false;
+    IDirect3DTexture9* ao[2] = {};        // full-res AO + blur ping-pong
+    IDirect3DSurface9* aoS[2] = {};
+    IDirect3DPixelShader9 *psAo = nullptr, *psAoBlur = nullptr, *psGrade = nullptr;
+    IDirect3DPixelShader9 *psDofFocus = nullptr, *psDofDown = nullptr, *psDofBlur = nullptr, *psDofComp = nullptr;
+    IDirect3DTexture9* focus[2] = {};  // 1x1 R32F auto-focus distance, ping-pong (this frame / last)
+    IDirect3DSurface9* focusS[2] = {};
+    int focusCur = 0;
+    bool focusValid = false;
+    ULONGLONG dofTick = 0;
+    IDirect3DVolumeTexture9* lut = nullptr;  // managed pool: survives Reset
+    int lutTexSize = 0;
+    // Grade volume blending (render thread).
+    const void* gradeSetId = nullptr;  // the settings' tables the weights belong to
+    std::vector<float> volW, volWUploaded;
+    bool lutUploaded = false;
+    ULONGLONG gradeTick = 0;
+    std::vector<uint8_t> lutWork;
+    float vignetteNow = 0;
+    // Flare visibility (1x1 R32F, vis + 1, ping-pong) and weather shelter weights.
+    IDirect3DPixelShader9 *psFlareVis = nullptr, *psFlare = nullptr, *psGlareDown = nullptr, *psGlareBlur = nullptr, *psGlareComp = nullptr,
+                          *psWeather = nullptr;
+    IDirect3DTexture9* vis[2] = {};
+    IDirect3DSurface9* visS[2] = {};
+    int visCur = 0;
+    bool visValid = false;
+    ULONGLONG flareTick = 0, wxTick = 0;
+    const void* wxSetId = nullptr;
+    std::vector<float> wxW;
+    float wxShelterNow = 1;
+    IDirect3DPixelShader9 *psLightScatter = nullptr, *psLightShaft = nullptr, *psLightComp = nullptr;
+    IDirect3DTexture9* lacc = nullptr;  // half-res accumulator of the local light shafts
+    IDirect3DSurface9* laccS = nullptr;
+    unsigned lightFrame = 0;
+    bool fogNoDepthLogged = false, aoNoDepthLogged = false;
     bool failed = false;
     unsigned frames = 0;
     unsigned rtLogged = 0;
@@ -449,7 +653,10 @@ template <class T> void rel(T*& p) {
 void releaseSized() {
     rel(g.sceneS);
     rel(g.scene);
-    for (int i = 0; i < 2; i++) rel(g.halfS[i]), rel(g.half[i]);
+    for (int i = 0; i < 2; i++) rel(g.halfS[i]), rel(g.half[i]), rel(g.aoS[i]), rel(g.ao[i]), rel(g.focusS[i]), rel(g.focus[i]);
+    for (int i = 0; i < 2; i++) rel(g.visS[i]), rel(g.vis[i]);
+    rel(g.laccS), rel(g.lacc);
+    g.focusValid = g.visValid = false;
     rel(g.sb);
     rel(g.floatz);
     g.w = g.h = 0;
@@ -468,6 +675,22 @@ bool createShaders(IDirect3DDevice9* d) {
               SUCCEEDED(d->CreatePixelShader(reinterpret_cast<const DWORD*>(volumetric_psFog), &g.psFog)) &&
               SUCCEEDED(d->CreateVertexShader(reinterpret_cast<const DWORD*>(volumetric_vsOccluder), &g.vsOcc)) &&
               SUCCEEDED(d->CreatePixelShader(reinterpret_cast<const DWORD*>(volumetric_psBlack), &g.psBlack)) &&
+              SUCCEEDED(d->CreatePixelShader(reinterpret_cast<const DWORD*>(volumetric_psAo), &g.psAo)) &&
+              SUCCEEDED(d->CreatePixelShader(reinterpret_cast<const DWORD*>(volumetric_psAoBlur), &g.psAoBlur)) &&
+              SUCCEEDED(d->CreatePixelShader(reinterpret_cast<const DWORD*>(volumetric_psGrade), &g.psGrade)) &&
+              SUCCEEDED(d->CreatePixelShader(reinterpret_cast<const DWORD*>(volumetric_psDofFocus), &g.psDofFocus)) &&
+              SUCCEEDED(d->CreatePixelShader(reinterpret_cast<const DWORD*>(volumetric_psDofDown), &g.psDofDown)) &&
+              SUCCEEDED(d->CreatePixelShader(reinterpret_cast<const DWORD*>(volumetric_psDofBlur), &g.psDofBlur)) &&
+              SUCCEEDED(d->CreatePixelShader(reinterpret_cast<const DWORD*>(volumetric_psDofComp), &g.psDofComp)) &&
+              SUCCEEDED(d->CreatePixelShader(reinterpret_cast<const DWORD*>(volumetric_psFlareVis), &g.psFlareVis)) &&
+              SUCCEEDED(d->CreatePixelShader(reinterpret_cast<const DWORD*>(volumetric_psFlare), &g.psFlare)) &&
+              SUCCEEDED(d->CreatePixelShader(reinterpret_cast<const DWORD*>(volumetric_psGlareDown), &g.psGlareDown)) &&
+              SUCCEEDED(d->CreatePixelShader(reinterpret_cast<const DWORD*>(volumetric_psGlareBlur), &g.psGlareBlur)) &&
+              SUCCEEDED(d->CreatePixelShader(reinterpret_cast<const DWORD*>(volumetric_psGlareComp), &g.psGlareComp)) &&
+              SUCCEEDED(d->CreatePixelShader(reinterpret_cast<const DWORD*>(volumetric_psWeather), &g.psWeather)) &&
+              SUCCEEDED(d->CreatePixelShader(reinterpret_cast<const DWORD*>(volumetric_psLightScatter), &g.psLightScatter)) &&
+              SUCCEEDED(d->CreatePixelShader(reinterpret_cast<const DWORD*>(volumetric_psLightShaft), &g.psLightShaft)) &&
+              SUCCEEDED(d->CreatePixelShader(reinterpret_cast<const DWORD*>(volumetric_psLightComp), &g.psLightComp)) &&
               SUCCEEDED(d->CreateVertexDeclaration(el, &g.decl)) && SUCCEEDED(d->CreateVertexDeclaration(el3, &g.declOcc));
     if (!ok) log("couldn't create the shaders; effect disabled");
     return ok;
@@ -529,8 +752,8 @@ struct Bindings {
     IDirect3DVertexDeclaration9* decl = nullptr;
     IDirect3DVertexShader9* vs = nullptr;
     IDirect3DPixelShader9* ps = nullptr;
-    IDirect3DBaseTexture9* tex[3] = {};
-    float vsc[6 * 4] = {}, psc[16 * 4] = {};
+    IDirect3DBaseTexture9* tex[5] = {};
+    float vsc[6 * 4] = {}, psc[39 * 4] = {};
 } g_saved;
 
 void saveBindings(IDirect3DDevice9* d) {
@@ -541,9 +764,9 @@ void saveBindings(IDirect3DDevice9* d) {
     d->GetVertexDeclaration(&b.decl);
     d->GetVertexShader(&b.vs);
     d->GetPixelShader(&b.ps);
-    for (DWORD i = 0; i < 3; i++) d->GetTexture(i, &b.tex[i]);
+    for (DWORD i = 0; i < 5; i++) d->GetTexture(i, &b.tex[i]);
     d->GetVertexShaderConstantF(0, b.vsc, 6);
-    d->GetPixelShaderConstantF(0, b.psc, 16);
+    d->GetPixelShaderConstantF(0, b.psc, 39);
 }
 
 void restoreBindings(IDirect3DDevice9* d) {
@@ -554,9 +777,9 @@ void restoreBindings(IDirect3DDevice9* d) {
     d->SetVertexDeclaration(b.decl);
     d->SetVertexShader(b.vs);
     d->SetPixelShader(b.ps);
-    for (DWORD i = 0; i < 3; i++) d->SetTexture(i, b.tex[i]);
+    for (DWORD i = 0; i < 5; i++) d->SetTexture(i, b.tex[i]);
     d->SetVertexShaderConstantF(0, b.vsc, 6);
-    d->SetPixelShaderConstantF(0, b.psc, 16);
+    d->SetPixelShaderConstantF(0, b.psc, 39);
     rel(b.vb);
     rel(b.ib);
     rel(b.decl);
@@ -597,30 +820,37 @@ bool solveClip(const float* VP, const float r[3], float x[3]) {
     return true;
 }
 
-// Height fog over the frame (reads the scene copy, writes the backbuffer).
-void fogPass(IDirect3DDevice9* d, const Settings& s, const ViewParms& vp, const float camOrigin[3], IDirect3DSurface9* bb) {
-    const float* VP = vp.vp;
+// The eye and the view rays at the screen corners (scaled to view z = 1) into c8..c10; false when
+// the matrix can't be solved.
+bool viewRays(IDirect3DDevice9* d, const Settings& s, const float* VP, const float camOrigin[3], float eye[3]) {
     // Camera origin: clip x = y = w = 0. Corner rays: clip (x, y, w) = (ndc x, ndc y, 1) with w = 0.
-    float eye[3], r00[3], r10[3], r01[3];
+    float r00[3], r10[3], r01[3];
     const float o[3] = {-VP[12], -VP[13], -VP[15]};
     const float c00[3] = {-1, 1, 1}, c10[3] = {1, 1, 1}, c01[3] = {-1, -1, 1};
-    if (!solveClip(VP, o, eye) || !solveClip(VP, c00, r00) || !solveClip(VP, c10, r10) || !solveClip(VP, c01, r01)) return;
+    if (!solveClip(VP, o, eye) || !solveClip(VP, c00, r00) || !solveClip(VP, c10, r10) || !solveClip(VP, c01, r01)) return false;
     // The game's matrices are camera-relative (eye solves to ~0): the origin is stored beside them.
-    if (std::fabs(eye[0]) + std::fabs(eye[1]) + std::fabs(eye[2]) < 1.0f) std::memcpy(eye, camOrigin, sizeof eye);
-    const bool intz = g.depth != nullptr;
-    const float cDepth[4] = {vp.p[10], vp.p[14], intz ? 1.0f : 2.0f, s.fogSkyDist};
+    if (std::fabs(eye[0]) + std::fabs(eye[1]) + std::fabs(eye[2]) < 1.0f) std::memcpy(eye, camOrigin, 3 * sizeof(float));
     const float cRay0[4] = {r00[0], r00[1], r00[2], s.skyDepth};
     const float cRayX[4] = {r10[0] - r00[0], r10[1] - r00[1], r10[2] - r00[2], 0};
     const float cRayY[4] = {r01[0] - r00[0], r01[1] - r00[1], r01[2] - r00[2], 0};
+    d->SetPixelShaderConstantF(8, cRay0, 1);
+    d->SetPixelShaderConstantF(9, cRayX, 1);
+    d->SetPixelShaderConstantF(10, cRayY, 1);
+    return true;
+}
+
+// Height fog over the frame (reads the scene copy, writes the backbuffer).
+void fogPass(IDirect3DDevice9* d, const Settings& s, const ViewParms& vp, const float camOrigin[3], IDirect3DSurface9* bb) {
+    float eye[3];
+    if (!viewRays(d, s, vp.vp, camOrigin, eye)) return;
+    const bool intz = g.depth != nullptr;
+    const float cDepth[4] = {vp.p[10], vp.p[14], intz ? 1.0f : 2.0f, s.fogSkyDist};
     const float cEye[4] = {eye[0], eye[1], eye[2], s.fogStart};
     const float cSunF[4] = {s.sun[0], s.sun[1], s.sun[2], s.fogG};
     const float cCol[4] = {s.fogColor[0], s.fogColor[1], s.fogColor[2], s.fogMax};
     const float cLight[4] = {s.color[0] * s.fogSun, s.color[1] * s.fogSun, s.color[2] * s.fogSun, s.fogSky};
     const float cParm[4] = {s.fogDensity, s.fogFalloff, s.fogHeight, s.debug == 3 ? 1.0f : 0.0f};
     d->SetPixelShaderConstantF(7, cDepth, 1);
-    d->SetPixelShaderConstantF(8, cRay0, 1);
-    d->SetPixelShaderConstantF(9, cRayX, 1);
-    d->SetPixelShaderConstantF(10, cRayY, 1);
     d->SetPixelShaderConstantF(11, cEye, 1);
     d->SetPixelShaderConstantF(12, cSunF, 1);
     d->SetPixelShaderConstantF(13, cCol, 1);
@@ -668,6 +898,507 @@ void drawOccluders(IDirect3DDevice9* d, const Settings& s, const float* VP, cons
         d->DrawPrimitiveUP(D3DPT_TRIANGLELIST, std::min<UINT>(20000, tris - first), s.occ->data() + first * 9, 12);
     d->SetVertexDeclaration(g.decl);
     d->SetVertexShader(g.vs);
+}
+
+// Ambient occlusion: AO into g.ao[0], blur across into g.ao[1], blur down multiplied into `bb`.
+bool aoPass(IDirect3DDevice9* d, const Settings& s, const ViewParms& vp, IDirect3DSurface9* bb) {
+    IDirect3DBaseTexture9* depthTex = g.depth ? static_cast<IDirect3DBaseTexture9*>(g.depth) : g.floatz;
+    if (!depthTex) return false;
+    for (int i = 0; i < 2; i++) {
+        if (g.ao[i]) continue;
+        if (FAILED(d->CreateTexture(g.w, g.h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &g.ao[i], nullptr))) {
+            log("ssao: couldn't create its render targets; off");
+            return false;
+        }
+        g.ao[i]->GetSurfaceLevel(0, &g.aoS[i]);
+    }
+    const bool intz = g.depth != nullptr;
+    const bool aoOnly = s.debug == 4;
+    const float cProj[4] = {vp.p[0], vp.p[5], vp.p[8], vp.p[9]};
+    const float cDepth[4] = {vp.p[10], vp.p[14], intz ? 1.0f : 2.0f, s.skyDepth};
+    const float cParm[4] = {s.ssaoRadius, s.ssaoIntensity, s.ssaoBias, aoOnly ? 1.0f : 0.0f};
+    const float cFade[4] = {s.ssaoNear, s.ssaoFar, 1.0f / g.w, 1.0f / g.h};
+    d->SetPixelShaderConstantF(16, cProj, 1);
+    d->SetPixelShaderConstantF(17, cDepth, 1);
+    d->SetPixelShaderConstantF(18, cParm, 1);
+    d->SetPixelShaderConstantF(19, cFade, 1);
+    sampler(d, 2, depthTex, false);
+    setTarget(d, g.aoS[0], g.w, g.h);
+    d->SetPixelShader(g.psAo);
+    quad(d, g.w, g.h);
+    const float bx[4] = {2.0f / g.w, 0, 0, 0}, by[4] = {0, 2.0f / g.h, 0, 0};
+    setTarget(d, g.aoS[1], g.w, g.h);
+    sampler(d, 0, g.ao[0], false);
+    d->SetPixelShaderConstantF(20, bx, 1);
+    d->SetPixelShader(g.psAoBlur);
+    quad(d, g.w, g.h);
+    setTarget(d, bb, g.w, g.h);
+    sampler(d, 0, g.ao[1], false);
+    d->SetPixelShaderConstantF(20, by, 1);
+    d->SetRenderState(D3DRS_ALPHABLENDENABLE, aoOnly ? FALSE : TRUE);  // frame * AO
+    d->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ZERO);
+    d->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_SRCCOLOR);
+    d->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
+    d->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+    d->SetRenderState(D3DRS_COLORWRITEENABLE, 0x7);
+    quad(d, g.w, g.h);
+    d->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+    d->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    sampler(d, 0, nullptr, false);
+    sampler(d, 2, nullptr, false);
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        char line[160];
+        std::snprintf(line, sizeof line, "ssao: on (%s depth), radius %g, intensity %g, P0 %g P5 %g", intz ? "INTZ" : "floatz", s.ssaoRadius,
+                      s.ssaoIntensity, vp.p[0], vp.p[5]);
+        log(line);
+    }
+    return true;
+}
+
+// Uploads an RGB8 table (size^3) into the grade volume texture.
+bool uploadLut(IDirect3DDevice9* d, const uint8_t* src, int size) {
+    const UINT n = static_cast<UINT>(size);
+    if (!g.lut || g.lutTexSize != size) {
+        rel(g.lut);
+        g.lutTexSize = 0;
+        if (FAILED(d->CreateVolumeTexture(n, n, n, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &g.lut, nullptr))) {
+            log("grade: couldn't create the 3D table; off");
+            return false;
+        }
+        g.lutTexSize = size;
+    }
+    D3DLOCKED_BOX lb;
+    if (FAILED(g.lut->LockBox(0, &lb, nullptr, 0))) return false;
+    for (UINT b = 0; b < n; b++)
+        for (UINT gg = 0; gg < n; gg++) {
+            auto* row = reinterpret_cast<uint8_t*>(lb.pBits) + b * lb.SlicePitch + gg * lb.RowPitch;
+            for (UINT r = 0; r < n; r++) {
+                const uint8_t* c = src + ((b * n + gg) * n + r) * 3;
+                row[r * 4 + 0] = c[2], row[r * 4 + 1] = c[1], row[r * 4 + 2] = c[0], row[r * 4 + 3] = 255;  // BGRA
+            }
+        }
+    g.lut->UnlockBox(0);
+    return true;
+}
+
+// The frame's grade: the base table with each trigger_grade volume blended over it by how far the
+// camera is inside (eased over its blend time). Re-uploads only when the weights move.
+bool ensureLut(IDirect3DDevice9* d, const Settings& s, const float eye[3]) {
+    if (!s.lut || s.lutSize < 2) return false;
+    const size_t nv = s.vols ? s.vols->size() : 0;
+    const void* id = s.vols ? static_cast<const void*>(s.vols.get()) : static_cast<const void*>(s.lut.get());
+    const ULONGLONG now = GetTickCount64();
+    const bool newSet = id != g.gradeSetId || g.volW.size() != nv;
+    if (newSet) {
+        g.gradeSetId = id;
+        g.volW.assign(nv, 0.0f);
+        g.volWUploaded.assign(nv, -1.0f);
+        g.lutUploaded = false;
+        g.gradeTick = now;
+    }
+    const float dt = std::min(0.25f, (now - g.gradeTick) / 1000.0f);
+    g.gradeTick = now;
+    bool changed = !g.lutUploaded;
+    for (size_t i = 0; i < nv; i++) {
+        const Settings::GradeVol& gv = (*s.vols)[i];
+        const float target = gradevol::targetWeight(gv.brushes, gv.blend, eye);
+        g.volW[i] = newSet ? target : gradevol::approach(g.volW[i], target, gv.blendTime, dt);
+        if (std::fabs(g.volW[i] - g.volWUploaded[i]) > 1.0f / 512 || (g.volW[i] == 0) != (g.volWUploaded[i] == 0)) changed = true;
+    }
+    if (!changed) return true;
+    g.lutWork.assign(s.lut->begin(), s.lut->end());
+    float vig = s.vignette;
+    int active = 0;
+    for (size_t i = 0; i < nv; i++) {
+        const float w = g.volW[i];
+        if (w <= 0) continue;
+        gradevol::blendInto(g.lutWork, (*s.vols)[i].lut, w);
+        vig += ((*s.vols)[i].vignette - vig) * w;
+        active++;
+    }
+    if (!uploadLut(d, g.lutWork.data(), s.lutSize)) return false;
+    g.vignetteNow = vig;
+    const bool first = !g.lutUploaded;
+    g.lutUploaded = true;
+    g.volWUploaded = g.volW;
+    if (first) {
+        char line[128];
+        std::snprintf(line, sizeof line, "grade: %dx%dx%d table uploaded, vignette %g, %zu grade volume(s)", s.lutSize, s.lutSize, s.lutSize,
+                      s.vignette, nv);
+        log(line);
+    }
+    static int lastActive = -1;
+    if (active != lastActive && nv) {
+        lastActive = active;
+        log("grade: " + std::to_string(active) + " grade volume(s) active at the camera");
+    }
+    return true;
+}
+
+// Colour grade over the frame (reads the scene copy, writes `bb`).
+void gradePass(IDirect3DDevice9* d, const Settings& s, IDirect3DSurface9* bb) {
+    const float cGrade[4] = {float(s.lutSize), g.vignetteNow, g_aspect.load(), 0};
+    d->SetPixelShaderConstantF(21, cGrade, 1);
+    setTarget(d, bb, g.w, g.h);
+    d->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    sampler(d, 0, g.scene, false);
+    d->SetTexture(3, g.lut);
+    for (D3DSAMPLERSTATETYPE a : {D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW}) d->SetSamplerState(3, a, D3DTADDRESS_CLAMP);
+    d->SetSamplerState(3, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    d->SetSamplerState(3, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    d->SetSamplerState(3, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+    d->SetSamplerState(3, D3DSAMP_SRGBTEXTURE, FALSE);
+    d->SetPixelShader(g.psGrade);
+    quad(d, g.w, g.h);
+    d->SetTexture(3, nullptr);
+}
+
+// Depth of field: (auto focus) -> half-res colour + blur size -> gather -> composite into `bb`.
+bool dofPass(IDirect3DDevice9* d, const Settings& s, const ViewParms& vp, IDirect3DSurface9* bb) {
+    IDirect3DBaseTexture9* depthTex = g.depth ? static_cast<IDirect3DBaseTexture9*>(g.depth) : g.floatz;
+    if (!depthTex) return false;
+    if (s.dofAuto)
+        for (int i = 0; i < 2; i++) {
+            if (g.focus[i]) continue;
+            if (FAILED(d->CreateTexture(1, 1, 1, D3DUSAGE_RENDERTARGET, D3DFMT_R32F, D3DPOOL_DEFAULT, &g.focus[i], nullptr))) {
+                log("dof: no R32F target for the auto focus; using the fixed distances");
+                break;
+            }
+            g.focus[i]->GetSurfaceLevel(0, &g.focusS[i]);
+        }
+    const bool autoOn = s.dofAuto && g.focus[0] && g.focus[1];
+    const UINT hw = g.w / 2, hh = g.h / 2;
+    const float hScale = g.h / 1080.0f * 0.5f;  // blur sizes are full-res pixels at 1080p; the gather runs at half res
+    const float cDepth[4] = {vp.p[10], vp.p[14], g.depth ? 1.0f : 2.0f, s.skyDepth};
+    const float cDist[4] = {s.dofNear[0], s.dofNear[1], s.dofFar[0], s.dofFar[1]};
+    const float cBlur[4] = {s.dofBlur[0] * hScale, s.dofBlur[1] * hScale, s.dofWeapon, s.debug == 5 ? 1.0f : 0.0f};
+    const float cStep[4] = {1.0f / hw, 1.0f / hh, 1.0f / g.w, 1.0f / g.h};
+    const ULONGLONG now = GetTickCount64();
+    const float dt = g.dofTick ? std::min(0.25f, (now - g.dofTick) / 1000.0f) : 0.0f;
+    g.dofTick = now;
+    const float cAuto[4] = {autoOn ? 1.0f : 0.0f, 1.0f - std::exp(-s.dofAutoSpeed * dt), std::max(s.dofFar[1] * 4, 20000.0f), 0};
+    d->SetPixelShaderConstantF(17, cDepth, 1);
+    d->SetPixelShaderConstantF(22, cDist, 1);
+    d->SetPixelShaderConstantF(23, cBlur, 1);
+    d->SetPixelShaderConstantF(24, cStep, 1);
+    d->SetPixelShaderConstantF(25, cAuto, 1);
+    sampler(d, 2, depthTex, false);
+    if (autoOn) {
+        const int prev = g.focusCur, cur = 1 - g.focusCur;
+        setTarget(d, g.focusS[cur], 1, 1);
+        sampler(d, 1, g.focusValid ? g.focus[prev] : nullptr, false);
+        if (!g.focusValid) {  // first frame: no history (the shader takes prev <= 0 as none)
+            d->SetRenderTarget(0, g.focusS[prev]);
+            d->Clear(0, nullptr, D3DCLEAR_TARGET, 0, 1, 0);
+            setTarget(d, g.focusS[cur], 1, 1);
+            sampler(d, 1, g.focus[prev], false);
+        }
+        d->SetPixelShader(g.psDofFocus);
+        quad(d, 1, 1);
+        g.focusCur = cur;
+        g.focusValid = true;
+        sampler(d, 4, g.focus[cur], false);
+    }
+    // half-res colour + blur size
+    setTarget(d, g.halfS[0], hw, hh);
+    sampler(d, 0, g.scene, true);
+    d->SetPixelShader(g.psDofDown);
+    quad(d, hw, hh);
+    // gather
+    setTarget(d, g.halfS[1], hw, hh);
+    sampler(d, 0, g.half[0], false);
+    d->SetPixelShader(g.psDofBlur);
+    quad(d, hw, hh);
+    // composite
+    setTarget(d, bb, g.w, g.h);
+    d->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    sampler(d, 0, g.scene, false);
+    sampler(d, 1, g.half[1], true);
+    d->SetPixelShader(g.psDofComp);
+    quad(d, g.w, g.h);
+    sampler(d, 1, nullptr, false);
+    sampler(d, 2, nullptr, false);
+    d->SetTexture(4, nullptr);
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        char line[200];
+        std::snprintf(line, sizeof line, "dof: on (%s depth), near %g-%g, far %g-%g, blur %g/%g px%s", g.depth ? "INTZ" : "floatz", s.dofNear[0],
+                      s.dofNear[1], s.dofFar[0], s.dofFar[1], s.dofBlur[0], s.dofBlur[1], autoOn ? ", auto focus" : "");
+        log(line);
+    }
+    return true;
+}
+
+// Glare: bright pixels -> half res -> wide blur across and down -> added onto `bb`.
+void glarePass(IDirect3DDevice9* d, const Settings& s, IDirect3DSurface9* bb) {
+    const UINT hw = g.w / 2, hh = g.h / 2;
+    const float step = s.glareRadius * (g.h / 1080.0f) * 0.5f / 6;  // 13 taps span the radius both ways (half-res px)
+    float cParm[4] = {s.glareThreshold, s.glareIntensity, 0, 0};
+    d->SetPixelShaderConstantF(30, cParm, 1);
+    setTarget(d, g.halfS[0], hw, hh);
+    sampler(d, 0, g.scene, true);
+    d->SetPixelShader(g.psGlareDown);
+    quad(d, hw, hh);
+    cParm[2] = step / hw, cParm[3] = 0;
+    d->SetPixelShaderConstantF(30, cParm, 1);
+    setTarget(d, g.halfS[1], hw, hh);
+    sampler(d, 0, g.half[0], true);
+    d->SetPixelShader(g.psGlareBlur);
+    quad(d, hw, hh);
+    cParm[2] = 0, cParm[3] = step / hh;
+    d->SetPixelShaderConstantF(30, cParm, 1);
+    setTarget(d, g.halfS[0], hw, hh);
+    sampler(d, 0, g.half[1], true);
+    quad(d, hw, hh);
+    setTarget(d, bb, g.w, g.h);
+    sampler(d, 0, g.half[0], true);
+    d->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    d->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
+    d->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
+    d->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
+    d->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+    d->SetPixelShader(g.psGlareComp);
+    quad(d, g.w, g.h);
+    d->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        char line[128];
+        std::snprintf(line, sizeof line, "glare: on, threshold %g, intensity %g, radius %g px", s.glareThreshold, s.glareIntensity, s.glareRadius);
+        log(line);
+    }
+}
+
+// Sun flare (and the glare's veil near the sun): visibility around the sun (1x1, eased) -> procedural
+// flare added onto `bb`. `strength` = on-screen fade; flare off = veil only.
+bool flarePass(IDirect3DDevice9* d, const Settings& s, const ViewParms& vp, float su, float sv, float strength, IDirect3DSurface9* bb) {
+    for (int i = 0; i < 2; i++) {
+        if (g.vis[i]) continue;
+        if (FAILED(d->CreateTexture(1, 1, 1, D3DUSAGE_RENDERTARGET, D3DFMT_R32F, D3DPOOL_DEFAULT, &g.vis[i], nullptr))) {
+            log("flare: no R32F target for the sun visibility; off");
+            return false;
+        }
+        g.vis[i]->GetSurfaceLevel(0, &g.visS[i]);
+    }
+    IDirect3DBaseTexture9* depthTex = g.depth ? static_cast<IDirect3DBaseTexture9*>(g.depth) : g.floatz;
+    const ULONGLONG now = GetTickCount64();
+    const float dt = g.flareTick ? std::min(0.25f, (now - g.flareTick) / 1000.0f) : 0.0f;
+    g.flareTick = now;
+    const float f = s.flare ? 1.0f : 0.0f;
+    const float cSun[4] = {su, sv, g_aspect.load(), strength};
+    const float cCol[4] = {s.flareColor[0] * s.flareIntensity, s.flareColor[1] * s.flareIntensity, s.flareColor[2] * s.flareIntensity,
+                           s.flareGhosts * f};
+    const float veil = s.glare ? s.glareSun / std::max(0.01f, s.flareIntensity) : 0.0f;
+    const float cParm[4] = {s.flareHalo * f, s.flareStreak * f, veil, 0.012f};
+    const float cMisc[4] = {1.0f - std::exp(-14.0f * dt), depthTex ? 0.0f : 1.0f, 0, 0};
+    const float cDepth[4] = {vp.p[10], vp.p[14], g.depth ? 1.0f : 2.0f, s.skyDepth};
+    d->SetPixelShaderConstantF(17, cDepth, 1);
+    d->SetPixelShaderConstantF(26, cSun, 1);
+    d->SetPixelShaderConstantF(27, cCol, 1);
+    d->SetPixelShaderConstantF(28, cParm, 1);
+    d->SetPixelShaderConstantF(29, cMisc, 1);
+    sampler(d, 2, depthTex, false);
+    const int prev = g.visCur, cur = 1 - g.visCur;
+    if (!g.visValid) {  // no history: 0 (the shader takes <= 0.5 as none)
+        d->SetRenderTarget(0, g.visS[prev]);
+        d->Clear(0, nullptr, D3DCLEAR_TARGET, 0, 1, 0);
+    }
+    setTarget(d, g.visS[cur], 1, 1);
+    sampler(d, 1, g.vis[prev], false);
+    d->SetPixelShader(g.psFlareVis);
+    quad(d, 1, 1);
+    g.visCur = cur;
+    g.visValid = true;
+    sampler(d, 1, nullptr, false);
+    sampler(d, 2, nullptr, false);
+    setTarget(d, bb, g.w, g.h);
+    sampler(d, 4, g.vis[cur], false);
+    d->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    d->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
+    d->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
+    d->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
+    d->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+    d->SetRenderState(D3DRS_COLORWRITEENABLE, 0x7);
+    d->SetPixelShader(g.psFlare);
+    quad(d, g.w, g.h);
+    d->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+    d->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    d->SetTexture(4, nullptr);
+    static bool logged = false;
+    if (!logged && s.flare) {
+        logged = true;
+        log(std::string("flare: on (") + (depthTex ? g.depth ? "INTZ" : "floatz" : "no depth: always visible") + ")");
+    }
+    return true;
+}
+
+// How much weather reaches the camera: trigger_weather volumes blended over 1 in order, eased.
+float weatherShelter(const Settings& s, const float eye[3]) {
+    const size_t nv = s.wxVols ? s.wxVols->size() : 0;
+    const ULONGLONG now = GetTickCount64();
+    const bool newSet = s.wxVols.get() != g.wxSetId || g.wxW.size() != nv;
+    const float dt = newSet || !g.wxTick ? 0.0f : std::min(0.25f, (now - g.wxTick) / 1000.0f);
+    g.wxTick = now;
+    if (newSet) g.wxSetId = s.wxVols.get(), g.wxW.assign(nv, 0.0f);
+    float m = 1;
+    for (size_t i = 0; i < nv; i++) {
+        const Settings::WxVol& wv = (*s.wxVols)[i];
+        const float target = gradevol::targetWeight(wv.brushes, wv.blend, eye);
+        g.wxW[i] = newSet ? target : gradevol::approach(g.wxW[i], target, wv.blendTime, dt);
+        m += (wv.intensity - m) * g.wxW[i];
+    }
+    return m;
+}
+
+// A light's brightness this frame: 1, or a flicker (a few out-of-step sines) for flickering ones.
+float lightFlicker(const Settings::Light& L, size_t index, double secs) {
+    if (L.flicker <= 0) return 1;
+    const double ph = index * 1.7;
+    const double n = 0.5 * std::sin(secs * 13.0 + ph) + 0.3 * std::sin(secs * 7.3 + 2 * ph) + 0.2 * std::sin(secs * 23.0 + 3 * ph);
+    return static_cast<float>(1 - L.flicker * (0.5 + 0.5 * n));
+}
+
+// Local light shafts: the lights that matter most at the camera, each scattered (half res) then
+// shadowed towards its screen position into an accumulator, which is added onto `bb`.
+bool lightsPass(IDirect3DDevice9* d, const Settings& s, const ViewParms& vp, const float camOrigin[3], IDirect3DSurface9* bb) {
+    IDirect3DBaseTexture9* depthTex = g.depth ? static_cast<IDirect3DBaseTexture9*>(g.depth) : g.floatz;
+    float eye[3];
+    if (!depthTex || !s.lightList || !viewRays(d, s, vp.vp, camOrigin, eye)) return false;
+    const UINT hw = g.w / 2, hh = g.h / 2;
+    if (!g.lacc) {
+        if (FAILED(d->CreateTexture(hw, hh, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &g.lacc, nullptr)) &&
+            FAILED(d->CreateTexture(hw, hh, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &g.lacc, nullptr))) {
+            log("lights: couldn't create the accumulator; off");
+            return false;
+        }
+        g.lacc->GetSurfaceLevel(0, &g.laccS);
+    }
+    // The matrices may be camera-relative (the offline test's aren't): positions go through VP less this.
+    float relEye[3] = {0, 0, 0};
+    {
+        float e0[3];
+        const float o[3] = {-vp.vp[12], -vp.vp[13], -vp.vp[15]};
+        if (solveClip(vp.vp, o, e0) && std::fabs(e0[0]) + std::fabs(e0[1]) + std::fabs(e0[2]) < 1.0f) std::memcpy(relEye, eye, sizeof relEye);
+    }
+    // Pick: in front of (or around) the camera, within the distance, brightest at the camera first.
+    struct Pick {
+        size_t i;
+        float score, clip[4];
+    };
+    std::vector<Pick> picks;
+    const auto& list = *s.lightList;
+    for (size_t i = 0; i < list.size(); i++) {
+        const Settings::Light& L = list[i];
+        const float dx = L.pos[0] - eye[0], dy = L.pos[1] - eye[1], dz = L.pos[2] - eye[2];
+        const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (dist - L.radius > s.lightsDistance) continue;
+        Pick pk{i, 0, {0, 0, 0, 0}};
+        const float p[3] = {L.pos[0] - relEye[0], L.pos[1] - relEye[1], L.pos[2] - relEye[2]};
+        for (int j = 0; j < 4; j++) pk.clip[j] = p[0] * vp.vp[j] + p[1] * vp.vp[4 + j] + p[2] * vp.vp[8 + j] + vp.vp[12 + j];
+        if (pk.clip[3] < -L.radius) continue;  // wholly behind the camera
+        if (pk.clip[3] > 0) {                  // off to the side by more than its radius (roughly)
+            const float sx = std::fabs(pk.clip[0]) / pk.clip[3], sy = std::fabs(pk.clip[1]) / pk.clip[3];
+            const float slack = 1 + L.radius / std::max(pk.clip[3], 1.0f) * std::max(vp.p[0], vp.p[5]);
+            if (dist > L.radius && (sx > slack || sy > slack)) continue;
+        }
+        const float lum = L.color[0] * 0.3f + L.color[1] * 0.59f + L.color[2] * 0.11f;
+        pk.score = lum * L.radius * L.radius / std::max(dist * dist, L.radius * L.radius);
+        picks.push_back(pk);
+    }
+    std::sort(picks.begin(), picks.end(), [](const Pick& a, const Pick& b) { return a.score > b.score; });
+    if (picks.size() > size_t(s.lightsMax)) picks.resize(s.lightsMax);
+    if (picks.empty()) return false;
+    const double secs = static_cast<double>(GetTickCount64() % 3600000ull) / 1000.0;
+    const float cEye[4] = {eye[0], eye[1], eye[2], 0};
+    const float cDepth[4] = {vp.p[10], vp.p[14], g.depth ? 1.0f : 2.0f, s.skyDepth};
+    d->SetPixelShaderConstantF(11, cEye, 1);
+    d->SetPixelShaderConstantF(17, cDepth, 1);
+    d->SetRenderTarget(0, g.laccS);
+    d->Clear(0, nullptr, D3DCLEAR_TARGET, 0, 1, 0);
+    sampler(d, 2, depthTex, false);
+    g.lightFrame++;
+    for (const Pick& pk : picks) {
+        const Settings::Light& L = list[pk.i];
+        const float k = 0.0007f * s.lightsIntensity * lightFlicker(L, pk.i, secs);
+        const float cPos[4] = {L.pos[0], L.pos[1], L.pos[2], L.radius};
+        const float cCol[4] = {L.color[0] * k, L.color[1] * k, L.color[2] * k, 0};
+        const float cSpot[4] = {L.dir[0], L.dir[1], L.dir[2], L.cosOuter};
+        const bool front = pk.clip[3] > 1;
+        const float cMisc[4] = {L.cosInner, s.lightsShadows, std::fmod(g.lightFrame * 0.618034f, 1.0f), front && s.lightsShadows > 0 ? 1.0f : 0.0f};
+        const float cScr[4] = {front ? 0.5f + 0.5f * pk.clip[0] / pk.clip[3] : 0.5f, front ? 0.5f - 0.5f * pk.clip[1] / pk.clip[3] : 0.5f, 0.9f, 0};
+        d->SetPixelShaderConstantF(34, cPos, 1);
+        d->SetPixelShaderConstantF(35, cCol, 1);
+        d->SetPixelShaderConstantF(36, cSpot, 1);
+        d->SetPixelShaderConstantF(37, cMisc, 1);
+        d->SetPixelShaderConstantF(38, cScr, 1);
+        setTarget(d, g.halfS[0], hw, hh);
+        d->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+        d->SetPixelShader(g.psLightScatter);
+        quad(d, hw, hh);
+        setTarget(d, g.laccS, hw, hh);
+        sampler(d, 0, g.half[0], true);
+        d->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+        d->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
+        d->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
+        d->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
+        d->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+        d->SetPixelShader(g.psLightShaft);
+        quad(d, hw, hh);
+        sampler(d, 0, nullptr, false);
+    }
+    sampler(d, 2, nullptr, false);
+    setTarget(d, bb, g.w, g.h);
+    sampler(d, 0, g.lacc, true);
+    d->SetRenderState(D3DRS_COLORWRITEENABLE, 0x7);
+    d->SetPixelShader(g.psLightComp);
+    quad(d, g.w, g.h);
+    d->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+    d->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    static size_t lastCount = ~size_t(0);
+    if (picks.size() != lastCount) {
+        lastCount = picks.size();
+        char line[128];
+        std::snprintf(line, sizeof line, "lights: %zu of %zu light(s) drawn (%s depth)", picks.size(), list.size(), g.depth ? "INTZ" : "floatz");
+        log(line);
+    }
+    return true;
+}
+
+// Rain / snow over the frame (reads the scene copy, writes `bb`).
+bool weatherPass(IDirect3DDevice9* d, const Settings& s, const ViewParms& vp, const float camOrigin[3], float shelter, IDirect3DSurface9* bb) {
+    IDirect3DBaseTexture9* depthTex = g.depth ? static_cast<IDirect3DBaseTexture9*>(g.depth) : g.floatz;
+    float eye[3];
+    if (!depthTex || !viewRays(d, s, vp.vp, camOrigin, eye)) return false;
+    const bool snow = s.weather == 2;
+    const double secs = static_cast<double>(GetTickCount64() % 3600000ull) / 1000.0;
+    const float fall = (snow ? 48.0f : 420.0f) * s.wxSpeed;
+    const float cDepth[4] = {vp.p[10], vp.p[14], g.depth ? 1.0f : 2.0f, s.skyDepth};
+    const float cParm[4] = {float(s.weather), std::min(1.0f, (snow ? 0.45f : 0.5f) * s.wxIntensity), static_cast<float>(secs), s.wxDistance};
+    const float cWind[4] = {s.wxWind[0], s.wxWind[1], fall, 2.0f / (std::max(0.1f, vp.p[5]) * g.h)};
+    const float cCol[4] = {s.wxColor[0], s.wxColor[1], s.wxColor[2], s.wxOpacity * std::min(1.0f, s.wxIntensity) * shelter};
+    d->SetPixelShaderConstantF(17, cDepth, 1);
+    d->SetPixelShaderConstantF(31, cParm, 1);
+    d->SetPixelShaderConstantF(32, cWind, 1);
+    d->SetPixelShaderConstantF(33, cCol, 1);
+    setTarget(d, bb, g.w, g.h);
+    d->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    sampler(d, 0, g.scene, false);
+    sampler(d, 2, depthTex, false);
+    d->SetPixelShader(g.psWeather);
+    quad(d, g.w, g.h);
+    sampler(d, 2, nullptr, false);
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        char line[160];
+        std::snprintf(line, sizeof line, "weather: %s, intensity %g, distance %g, %zu shelter volume(s)", snow ? "snow" : "rain", s.wxIntensity,
+                      s.wxDistance, s.wxVols ? s.wxVols->size() : size_t(0));
+        log(line);
+    }
+    return true;
 }
 
 // Draws the effect onto `bb` (a reference render() releases): the backbuffer at Present, or the
@@ -724,7 +1455,29 @@ void render(IDirect3DDevice9* d, const Settings& s, IDirect3DSurface9* bb) {
         g.fogNoDepthLogged = true;
         log("fog: no depth yet (the game made its depth buffer before the DLL loaded); run vid_restart once");
     }
-    if (!shaftsOn && !fogOn) {
+    IDirect3DBaseTexture9* aoDepthTex = g.depth ? static_cast<IDirect3DBaseTexture9*>(g.depth) : g.floatz;
+    const bool aoOn = s.ssao && aoDepthTex;
+    if (s.ssao && !aoDepthTex && !g.aoNoDepthLogged) {
+        g.aoNoDepthLogged = true;
+        log("ssao: no depth yet (the game made its depth buffer before the DLL loaded); run vid_restart once");
+    }
+    float eyeNow[3] = {0, 0, 0};
+    if (g_frameVPValid) std::memcpy(eyeNow, g_frameEye, sizeof eyeNow);
+    else readSelf(cam + kOriginOfs, eyeNow, sizeof eyeNow);
+    const bool gradeOn = s.grade && s.debug == 0 && ensureLut(d, s, eyeNow);
+    const bool dofOn = s.dof && aoDepthTex && (s.debug == 0 || s.debug == 5);
+    // The flare needs the sun on screen (it fades out as the sun leaves it); the glare's veil rides along.
+    float flareFade = 0;
+    if (facing > 0.02f) {
+        const float nx = su * 2 - 1, ny = 1 - sv * 2, off = std::max(std::fabs(nx), std::fabs(ny));
+        flareFade = std::min(1.0f, facing / 0.35f) * std::max(0.0f, std::min(1.0f, (1.15f - off) / 0.15f));
+    }
+    const bool flareOn = (s.flare || (s.glare && s.glareSun > 0)) && flareFade > 0 && s.debug == 0;
+    const bool glareOn = s.glare && s.glareIntensity > 0 && s.debug == 0;
+    const float shelter = s.weather ? weatherShelter(s, eyeNow) : 0.0f;
+    const bool wxOn = s.weather && aoDepthTex && shelter > 0.001f && s.wxIntensity > 0 && s.debug == 0;
+    const bool lightsOn = s.lights && s.lightList && aoDepthTex && s.lightsIntensity > 0 && s.debug == 0;
+    if (!shaftsOn && !fogOn && !aoOn && !gradeOn && !dofOn && !flareOn && !glareOn && !wxOn && !lightsOn) {
         bb->Release();
         return;
     }
@@ -784,9 +1537,41 @@ void render(IDirect3DDevice9* d, const Settings& s, IDirect3DSurface9* bb) {
     if (g_frameVPValid) std::memcpy(camOrigin, g_frameEye, sizeof camOrigin);
     else readSelf(cam + kOriginOfs, camOrigin, sizeof camOrigin);
 
-    if (fogOn) fogPass(d, s, vp, camOrigin, bb);
-    if (!shaftsOn) {
+    // Order: AO (darkens the lit scene) -> fog (covers it with distance) -> DOF -> local lights -> weather -> shafts ->
+    // glare -> flare -> grade (last).
+    // Each pass that reads the frame gets a fresh copy of what the one before drew.
+    auto recopy = [&] { d->StretchRect(bb, nullptr, g.sceneS, nullptr, D3DTEXF_NONE); };
+    auto finish = [&] {
+        if (glareOn) glarePass(d, s, bb);
+        if (flareOn) flarePass(d, s, vp, su, sv, flareFade, bb);
+        if (gradeOn) {
+            recopy();
+            gradePass(d, s, bb);
+        }
         finishRender(d, oldRT, oldZ, oldVp, bb);
+    };
+    if (aoOn && aoPass(d, s, vp, bb)) {
+        if (s.debug == 4) {
+            finishRender(d, oldRT, oldZ, oldVp, bb);
+            return;
+        }
+        recopy();
+    }
+    if (fogOn) {
+        fogPass(d, s, vp, camOrigin, bb);
+        recopy();
+    }
+    if (dofOn && dofPass(d, s, vp, bb)) {
+        if (s.debug == 5) {
+            finishRender(d, oldRT, oldZ, oldVp, bb);
+            return;
+        }
+        recopy();
+    }
+    if (lightsOn && lightsPass(d, s, vp, camOrigin, bb)) recopy();
+    if (wxOn && weatherPass(d, s, vp, camOrigin, shelter, bb)) recopy();
+    if (!shaftsOn) {
+        finish();
         return;
     }
 
@@ -839,7 +1624,9 @@ void render(IDirect3DDevice9* d, const Settings& s, IDirect3DSurface9* bb) {
         }
     }
     quad(d, g.w, g.h);
-    finishRender(d, oldRT, oldZ, oldVp, bb);
+    d->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    if (glareOn) recopy();
+    finish();
 }
 
 std::atomic<bool> g_inPresent{false};

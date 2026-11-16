@@ -106,12 +106,12 @@ iwmap 4
 }
 // brush 9
 {
- ( -272 -32 160 ) ( -272 32 160 ) ( -256 -32 160 ) airport_wall_interior01 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
- ( -272 -32 104 ) ( -256 -32 104 ) ( -272 32 104 ) airport_wall_interior01 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
- ( -272 -32 104 ) ( -272 -32 160 ) ( -256 -32 104 ) airport_wall_interior01 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
- ( -272 32 104 ) ( -256 32 104 ) ( -272 32 160 ) airport_wall_interior01 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
- ( -272 -32 104 ) ( -272 32 104 ) ( -272 -32 160 ) airport_wall_interior01 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
- ( -256 -32 104 ) ( -256 -32 160 ) ( -256 32 104 ) airport_wall_interior01 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
+ ( -272 -32 160 ) ( -272 32 160 ) ( -256 -32 160 ) airport_loading_bridge_white 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
+ ( -272 -32 104 ) ( -256 -32 104 ) ( -272 32 104 ) airport_loading_bridge_white 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
+ ( -272 -32 104 ) ( -272 -32 160 ) ( -256 -32 104 ) airport_loading_bridge_white 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
+ ( -272 32 104 ) ( -256 32 104 ) ( -272 32 160 ) airport_loading_bridge_white 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
+ ( -272 -32 104 ) ( -272 32 104 ) ( -272 -32 160 ) airport_loading_bridge_white 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
+ ( -256 -32 104 ) ( -256 -32 160 ) ( -256 32 104 ) airport_loading_bridge_white 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
 }
 // brush 10
 {
@@ -151,12 +151,12 @@ iwmap 4
 }
 // brush 14
 {
- ( -32 -272 160 ) ( -32 -256 160 ) ( 32 -272 160 ) airport_wall_interior01 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
- ( -32 -272 104 ) ( 32 -272 104 ) ( -32 -256 104 ) airport_wall_interior01 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
- ( -32 -272 104 ) ( -32 -272 160 ) ( 32 -272 104 ) airport_wall_interior01 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
- ( -32 -256 104 ) ( 32 -256 104 ) ( -32 -256 160 ) airport_wall_interior01 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
- ( -32 -272 104 ) ( -32 -256 104 ) ( -32 -272 160 ) airport_wall_interior01 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
- ( 32 -272 104 ) ( 32 -272 160 ) ( 32 -256 104 ) airport_wall_interior01 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
+ ( -32 -272 160 ) ( -32 -256 160 ) ( 32 -272 160 ) airport_loading_bridge_white 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
+ ( -32 -272 104 ) ( 32 -272 104 ) ( -32 -256 104 ) airport_loading_bridge_white 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
+ ( -32 -272 104 ) ( -32 -272 160 ) ( 32 -272 104 ) airport_loading_bridge_white 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
+ ( -32 -256 104 ) ( 32 -256 104 ) ( -32 -256 160 ) airport_loading_bridge_white 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
+ ( -32 -272 104 ) ( -32 -256 104 ) ( -32 -272 160 ) airport_loading_bridge_white 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
+ ( 32 -272 104 ) ( 32 -272 160 ) ( 32 -256 104 ) airport_loading_bridge_white 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
 }
 // brush 15
 {
@@ -196,12 +196,12 @@ iwmap 4
 }
 // brush 19
 {
- ( 256 -32 160 ) ( 256 32 160 ) ( 272 -32 160 ) airport_wall_interior01 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
- ( 256 -32 104 ) ( 272 -32 104 ) ( 256 32 104 ) airport_wall_interior01 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
- ( 256 -32 104 ) ( 256 -32 160 ) ( 272 -32 104 ) airport_wall_interior01 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
- ( 256 32 104 ) ( 272 32 104 ) ( 256 32 160 ) airport_wall_interior01 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
- ( 256 -32 104 ) ( 256 32 104 ) ( 256 -32 160 ) airport_wall_interior01 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
- ( 272 -32 104 ) ( 272 -32 160 ) ( 272 32 104 ) airport_wall_interior01 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
+ ( 256 -32 160 ) ( 256 32 160 ) ( 272 -32 160 ) airport_loading_bridge_white 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
+ ( 256 -32 104 ) ( 272 -32 104 ) ( 256 32 104 ) airport_loading_bridge_white 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
+ ( 256 -32 104 ) ( 256 -32 160 ) ( 272 -32 104 ) airport_loading_bridge_white 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
+ ( 256 32 104 ) ( 272 32 104 ) ( 256 32 160 ) airport_loading_bridge_white 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
+ ( 256 -32 104 ) ( 256 32 104 ) ( 256 -32 160 ) airport_loading_bridge_white 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
+ ( 272 -32 104 ) ( 272 -32 160 ) ( 272 32 104 ) airport_loading_bridge_white 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
 }
 // brush 20
 {
@@ -241,12 +241,12 @@ iwmap 4
 }
 // brush 24
 {
- ( -32 256 160 ) ( -32 272 160 ) ( 32 256 160 ) airport_wall_interior01 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
- ( -32 256 104 ) ( 32 256 104 ) ( -32 272 104 ) airport_wall_interior01 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
- ( -32 256 104 ) ( -32 256 160 ) ( 32 256 104 ) airport_wall_interior01 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
- ( -32 272 104 ) ( 32 272 104 ) ( -32 272 160 ) airport_wall_interior01 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
- ( -32 256 104 ) ( -32 272 104 ) ( -32 256 160 ) airport_wall_interior01 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
- ( 32 256 104 ) ( 32 256 160 ) ( 32 272 104 ) airport_wall_interior01 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
+ ( -32 256 160 ) ( -32 272 160 ) ( 32 256 160 ) airport_loading_bridge_white 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
+ ( -32 256 104 ) ( 32 256 104 ) ( -32 272 104 ) airport_loading_bridge_white 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
+ ( -32 256 104 ) ( -32 256 160 ) ( 32 256 104 ) airport_loading_bridge_white 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
+ ( -32 272 104 ) ( 32 272 104 ) ( -32 272 160 ) airport_loading_bridge_white 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
+ ( -32 256 104 ) ( -32 272 104 ) ( -32 256 160 ) airport_loading_bridge_white 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
+ ( 32 256 104 ) ( 32 256 160 ) ( 32 272 104 ) airport_loading_bridge_white 256 256 0 0 0 0 lightmap_gray 16384 16384 0 0 0 0
 }
 // brush 25
 {

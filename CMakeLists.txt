@@ -52,6 +52,7 @@ add_library(iw4r_core STATIC
   src/zone/mapimport.cpp
   src/zone/zonebuild.cpp
   src/light/lightbake.cpp
+  src/light/colorgrade.cpp
   src/zone/skysource.cpp
   src/zone/matdefs.cpp
   src/zone/modelbuild.cpp
