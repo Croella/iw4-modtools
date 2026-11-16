@@ -14,6 +14,8 @@
 #include "zone/iw4.h"
 #include "zone/mapimport.h"
 #include "zone/zonebuild.h"
+#include "patch.h"
+#include "worldgeom.h"
 #include "zone/zonedump.h"
 #include "zone/zonesim.h"
 #include "model/imageio.h"
@@ -535,7 +537,7 @@ static void testBrushTriggers() {
     std::vector<Brush> cyl = shapes::make(shapes::Shape::Cylinder, {-64, -64, 0}, {64, 64, 128}, {}, "trigger");
     for (Brush& b : cyl) u.brushes.push_back(b);
     d.ents.push_back(u);
-    Entity bm;  // not a trigger: warned, left out
+    Entity bm;  // not a trigger: a brush model "*1"
     bm.set("classname", "script_brushmodel");
     bm.brushes.push_back(makeBox({0, 0, 0}, {8, 8, 8}, "caulk"));
     d.ents.push_back(bm);
@@ -555,7 +557,7 @@ static void testBrushTriggers() {
     CHECK(*e.ents[1].find("model") == "?0" && *e.ents[2].find("model") == "?1");
     CHECK(*e.ents[1].find("origin") == "200 200 32");  // the brushes' centre
     CHECK(*e.ents[2].find("origin") == "0 0 100");     // kept
-    CHECK(!e.ents[3].find("model"));
+    CHECK(e.ents[3].find("model") && *e.ents[3].find("model") == "*1" && *e.ents[3].find("origin") == "4 4 4");
     if (cm.triggerHulls.size() == 3) {
         const clip::TriggerHull& h0 = cm.triggerHulls[0];
         CHECK(h0.slabCount == 0 && h0.bounds.midPoint[0] == -50 && h0.bounds.midPoint[1] == 0 && h0.bounds.midPoint[2] == 0 &&
@@ -2397,9 +2399,298 @@ static void testZoneSourceModel() {
                   mt->textureTable[0].u.image->texture.loadDef->resourceSize == 4 * 4 * 4);
         }
     }
-    // the misc_model became a script_model in the entity lump
+    // the misc_model became a static model (not an entity)
     auto* me = static_cast<const iw4::MapEnts*>(sim.find(IW4_MAPENTS));
-    CHECK(me && std::string(me->entityString).find("\"classname\" \"script_model\"") != std::string::npos);
+    CHECK(me && std::string(me->entityString).find("misc_model") == std::string::npos);
+    auto* gw = static_cast<const iw4::GfxWorld*>(sim.find(IW4_GFXWORLD));
+    // (the draw inst names the model by reference; the game resolves it to the asset above)
+    CHECK(gw && gw->dpvs.smodelCount == 1 && gw->dpvs.smodelDrawInsts && gw->dpvs.smodelDrawInsts[0].model &&
+          std::string(gw->dpvs.smodelDrawInsts[0].model->name) == ",iw4r_test_crate");
+    fs::remove_all(dir);
+}
+
+// Patches (parse, tessellate, faces, collision), brush models ("*N": cmodel + GfxBrushModel,
+// origin-relative), static models (GfxWorld draw insts, clipMap static models + tree, player clip)
+// and model collision surfaces, end to end through the loader simulation.
+static const char* kCurvePatch =
+    "{\n curve\n {\n  contents detail;\n  wc/me_concrete\n  lightmap_gray\n  3 3 16 8\n"
+    "  (\n   v 0 -64 0 t 0 0 0 0\n   v 0 0 0 t 0 256 0 0\n   v 0 64 0 t 0 512 0 0\n  )\n"
+    "  (\n   v 128 -64 0 t 256 0\n   v 128 0 0 c 255 0 0 128 t 256 256\n   v 128 64 0 t 256 512\n  )\n"
+    "  (\n   v 128 -64 128 t 512 0 1 1\n   v 128 0 128 t 512 256 1 1\n   v 128 64 128 t 512 512 1 1\n  )\n }\n}\n";
+
+static void testPatches() {
+    patch::Patch p;
+    std::string err;
+    CHECK(patch::parse(kCurvePatch, p, &err));
+    if (!err.empty()) std::printf("  patch parse: %s\n", err.c_str());
+    CHECK(p.curve && p.rows == 3 && p.cols == 3 && p.verts.size() == 9 && p.material == "wc/me_concrete" && !p.nonColliding);
+    CHECK(p.hasColor && p.at(1, 1).rgba[0] == 255 && p.at(1, 1).rgba[1] == 0 && p.at(1, 1).rgba[3] == 128);
+    CHECK(p.at(2, 0).p.z == 128 && p.at(1, 2).st[1] == 512);
+    // columns run along y (flat), rows bend from the floor up the wall: subdivided only that way
+    patch::Grid g = patch::tessellate(p, [](const std::string&, double& w, double& h) { w = h = 256; });
+    CHECK(g.w == 2 && g.h > 3 && g.h <= 17);
+    // corners interpolate, uv normalized by the texture size
+    CHECK(length(g.p[g.at(0, 0)] - Vec3{0, -64, 0}) < 1e-9 && length(g.p[g.at(g.h - 1, g.w - 1)] - Vec3{128, 64, 128}) < 1e-9);
+    CHECK(std::fabs(g.uv[2 * g.at(g.h - 1, g.w - 1)] - 2.0) < 1e-9 && std::fabs(g.uv[2 * g.at(g.h - 1, g.w - 1) + 1] - 2.0) < 1e-9);
+    // front = cross(d/dcol, d/drow): +y x +x = -z on the floor part, +y x +z = +x up the wall
+    CHECK(g.n[g.at(0, 0)].z < -0.9 && g.n[g.at(g.h - 1, 0)].x > 0.9);
+    std::vector<Face> fs = patch::faces(g, p.material);
+    CHECK(!fs.empty());
+    bool ok = true;
+    for (const Face& f : fs) {
+        ok &= f.uvs.size() == 2 * f.winding.size() && f.vnormals.size() == f.winding.size() && f.colors.size() == f.winding.size();
+        for (const Vec3& v : f.winding) ok &= std::fabs(dot(f.normal, v) - f.dist) < 0.05;
+        ok &= dot(f.normal, f.vnormals[0]) > 0.5;  // smooth normals on the same side as the face
+    }
+    CHECK(ok);
+    std::vector<Brush> cb = patch::collisionBrushes(p);
+    CHECK(!cb.empty() && cb.size() <= 2 * 4 * 1 + 8);
+    for (const Brush& b : cb) CHECK(b.bounds.valid());
+    // a mesh keeps its grid; a non-colliding one has no brushes
+    const std::string mesh = "{\n mesh\n {\n  contents nonColliding;\n  caulk\n  lightmap_gray\n  2 2 16 8\n"
+                             "  (\n   v 0 0 0 t 0 0\n   v 64 0 0 t 64 0\n  )\n  (\n   v 0 64 0 t 0 64\n   v 64 64 0 t 64 64\n  )\n }\n}\n";
+    patch::Patch m;
+    CHECK(patch::parse(mesh, m, &err) && !m.curve && m.nonColliding && patch::collisionBrushes(m).empty());
+    patch::Grid mg = patch::tessellate(m, nullptr);
+    CHECK(mg.w == 2 && mg.h == 2 && patch::faces(mg, "caulk").size() == 1);  // one planar quad
+    CHECK(mg.n[0].z > 0.9);                                                // x then y: +z
+    patch::Patch bad;
+    CHECK(!patch::parse("{\n curve\n {\n  caulk\n  lightmap_gray\n  2 2 16 8\n }\n}\n", bad, &err));
+
+    // 26-DOP hull
+    Brush hull;
+    std::vector<Vec3> cube;
+    for (int i = 0; i < 8; i++) cube.push_back({i & 1 ? 10.0 : -10.0, i & 2 ? 20.0 : -20.0, i & 4 ? 5.0 : 0.0});
+    CHECK(worldgeom::dopBrush(cube, "clip", hull) && hull.faces.size() == 6 && hull.bounds.maxs.y == 20 && hull.bounds.mins.z == 0);
+
+    // placement: CoD AnglesToAxis (yaw 90: forward = +y)
+    Entity pe;
+    pe.set("origin", "1 2 3");
+    pe.set("angles", "0 90 0");
+    pe.set("modelscale", "2");
+    worldgeom::Placement pl = worldgeom::entityPlacement(pe);
+    CHECK(std::fabs(pl.axis[0].y - 1) < 1e-9 && std::fabs(pl.axis[1].x + 1) < 1e-9 && pl.scale == 2);
+    CHECK(length(pl.apply({1, 0, 0}) - Vec3{1, 4, 3}) < 1e-9);
+}
+
+// The bake covers patches and brush models, and static-model occluders cast shadows: patch faces
+// get lightmaps, brush-model faces keep the sun baked in (they're drawn without a primary light),
+// an occluder above the floor leaves a sun shadow under it.
+static void testGeometryBake() {
+    Document d;
+    d.ents[0].set("sundirection", "-89 0 0");  // straight down
+    d.ents[0].set("sunlight", "1.2");
+    d.addBrush(makeBox({-512, -512, -16}, {512, 512, 0}, "wc/me_concrete"));
+    d.ents[0].rawBlocks.push_back(kCurvePatch);
+    Entity door;
+    door.set("classname", "script_brushmodel");
+    door.brushes.push_back(makeBox({300, -32, 0}, {340, 32, 40}, "wc/me_concrete"));
+    d.ents.push_back(door);
+    light::Settings s;
+    s.skySamples = 8;
+    s.bounces = 0;
+    s.gpu = false;
+    // A static model's triangles: a 200x200 roof at z 64 over (-350..-150, -350..-150)
+    const Vec3 a{-350, -350, 64}, b{-150, -350, 64}, c{-150, -150, 64}, e{-350, -150, 64};
+    s.occluders.push_back({a, b, c});
+    s.occluders.push_back({a, c, e});
+    light::Bake bk;
+    std::string err;
+    CHECK(light::bake(d, s, bk, err));
+    if (!err.empty()) std::printf("  bake: %s\n", err.c_str());
+    const std::vector<Face> pf = worldgeom::worldPatchFaces(d);
+    bool all = !pf.empty();
+    for (const Face& f : pf) all &= bk.find(f) != nullptr;
+    CHECK(all);
+    // luxel light at a point of a face
+    auto luxel = [&](const Face& f, const Vec3& p, float* rgb, uint8_t* vis) {
+        const light::FaceMap* m = bk.find(f);
+        if (!m) return false;
+        const int x = m->x + static_cast<int>((p[m->axisU] - m->minU) / bk.luxelSize);
+        const int y = m->y + static_cast<int>((p[m->axisV] - m->minV) / bk.luxelSize);
+        const size_t i = static_cast<size_t>(y) * bk.width + x;
+        for (int k = 0; k < 3; k++) rgb[k] = bk.light[3 * i + k];
+        *vis = bk.sunVis[static_cast<size_t>(2 * y) * (2 * bk.width) + 2 * x];
+        return true;
+    };
+    Brush floor = d.ents[0].brushes[0];
+    CHECK(floor.rebuild());
+    const Face* top = nullptr;
+    for (const Face& f : floor.faces)
+        if (f.normal.z > 0.9) top = &f;
+    Brush db = d.ents[1].brushes[0];
+    CHECK(db.rebuild());
+    const Face* doorTop = nullptr;
+    for (const Face& f : db.faces)
+        if (f.normal.z > 0.9) doorTop = &f;
+    float open[3], shade[3], dl[3];
+    uint8_t vOpen = 0, vShade = 0, vDoor = 0;
+    CHECK(top && doorTop && luxel(*top, {0, -300, 0}, open, &vOpen) && luxel(*top, {-250, -250, 0}, shade, &vShade) &&
+          luxel(*doorTop, {320, 0, 40}, dl, &vDoor));
+    CHECK(vOpen == 255 && vShade == 0);  // the occluder's shadow
+    // world floor: direct sun left to the game (excluded); the brush model's top keeps it
+    CHECK(dl[0] > open[0] + 0.5f);
+    const light::FaceMap* dm = bk.find(*doorTop);
+    CHECK(dm && dm->primary == -1);
+}
+
+static void testWorldGeometry() {
+    namespace fs = std::filesystem;
+    const std::string trainer = std::string(kGame) + "/zone/english/trainer.ff";
+    if (!fs::exists(trainer)) {
+        std::printf("world geometry: skipped (no game install)\n");
+        return;
+    }
+    std::string err;
+    fs::path dir = fs::temp_directory_path() / "iw4r_geo_test";
+    fs::create_directories(dir / "zone_source" / "xmodels");
+    { std::ofstream(dir / "zone_source" / "xmodels" / "iw4r_geo_crate.xmodel_export") << cubeXModelExport("crate", "c:/art/crate_col.png"); }
+    std::ifstream in(trainer, std::ios::binary);
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    Fastfile tz;
+    CHECK(readFastfile(bytes, tz, err));
+    auto lib = std::make_shared<matdef::Library>();
+    matdef::scan(tz.zone, *lib);
+
+    Document d;
+    d.addBrush(makeBox({-512, -512, -16}, {512, 512, 0}, "wc/me_concrete"));
+    d.ents[0].rawBlocks.push_back(kCurvePatch);
+    Entity door;
+    door.set("classname", "script_brushmodel");
+    door.set("targetname", "door");
+    door.brushes.push_back(makeBox({200, -32, 0}, {204, 32, 96}, "wc/me_concrete"));
+    door.brushes.push_back(makeBox({196, -40, 96}, {208, 40, 100}, "clip"));  // collision only
+    d.ents.push_back(door);
+    Entity hidden;  // collision-only brush model: no surfaces
+    hidden.set("classname", "script_brushmodel");
+    hidden.set("origin", "0 300 0");
+    hidden.brushes.push_back(makeBox({-16, 284, 0}, {16, 316, 32}, "clip"));
+    d.ents.push_back(hidden);
+    const char* modes[3] = {"", "box", "none"};
+    for (int i = 0; i < 3; i++) {
+        Sel s = d.addPointEntity("misc_model", {-200.0, -150.0 + 100 * i, 0});
+        d.ents[s.ent].set("model", "iw4r_geo_crate");
+        d.ents[s.ent].set("angles", "0 30 0");
+        if (modes[i][0]) d.ents[s.ent].set("collision", modes[i]);
+    }
+    Sel st = d.addPointEntity("misc_model", {0, -300, 0});
+    d.ents[st.ent].set("model", "com_barrel_benzin");  // stock: by name, no collision
+    Sel named = d.addPointEntity("misc_model", {0, -400, 0});  // scripts can find it: stays an entity
+    d.ents[named.ent].set("model", "iw4r_geo_crate");
+    d.ents[named.ent].set("targetname", "named_crate");
+
+    CompileOptions o = kNoBake;
+    o.materials = lib;
+    o.zoneSourceDir = (dir / "zone_source").string();
+    std::vector<std::string> warnings;
+    o.warnings = &warnings;
+    std::vector<uint8_t> ff;
+    CHECK(compileMapToFastfile(d, "mp_geo", ff, err, MapTarget::MP, o));
+    if (!err.empty()) std::printf("  compile: %s\n", err.c_str());
+    Fastfile zf;
+    CHECK(readFastfile(ff, zf, err));
+    zone::SimulatedZone sim;
+    CHECK(zone::simulateLoad(zf.zone, sim, err));
+    if (!err.empty()) std::printf("  simulateLoad (geometry): %s\n", err.c_str());
+    auto* gw = static_cast<const iw4::GfxWorld*>(sim.find(IW4_GFXWORLD));
+    auto* cm = static_cast<const iw4::clipMap_t*>(sim.find(IW4_CLIPMAP_MP));
+    auto* me = static_cast<const iw4::MapEnts*>(sim.find(IW4_MAPENTS));
+    auto* xm = static_cast<const iw4::XModel*>(sim.find(IW4_XMODEL));
+    CHECK(gw && cm && me && xm);
+    if (!gw || !cm || !me || !xm) return;
+
+    // model collision surface: the cube's hull (12 triangles), barycentric s/t on its corners
+    CHECK(xm->numCollSurfs == 1 && xm->collSurfs && xm->collLod == 0 && xm->contents == 1 && xm->lodInfo[0].dist >= 1e5f);
+    if (xm->collSurfs) {
+        const iw4::XModelCollSurf_s& c = xm->collSurfs[0];
+        CHECK(c.numCollTris == 12 && c.contents == 1);
+        bool bary = true;
+        for (int t = 0; t < c.numCollTris; t++) {
+            const iw4::XModelCollTri_s& r = c.collTris[t];
+            // the triangle's corners lie on its plane with s, t in {0, 1}
+            int corners = 0;
+            for (int i = 0; i < 8; i++) {
+                const float p[3] = {i & 1 ? 16.f : -16.f, i & 2 ? 16.f : -16.f, i & 4 ? 32.f : 0.f};
+                const float pd = r.plane[0] * p[0] + r.plane[1] * p[1] + r.plane[2] * p[2] - r.plane[3];
+                if (std::fabs(pd) > 0.01f) continue;
+                const float sv = r.svec[0] * p[0] + r.svec[1] * p[1] + r.svec[2] * p[2] - r.svec[3];
+                const float tv = r.tvec[0] * p[0] + r.tvec[1] * p[1] + r.tvec[2] * p[2] - r.tvec[3];
+                if (sv > -0.01f && tv > -0.01f && sv + tv < 1.01f) corners++;
+            }
+            bary &= corners == 3;
+        }
+        CHECK(bary);
+    }
+
+    // brush models: GfxWorld models 1..2 after the world; surfaces after the static ones
+    CHECK(gw->modelCount == 3 && cm->numSubModels == 3);
+    const unsigned statics = gw->dpvs.staticSurfaceCount;
+    CHECK(gw->models[0].surfaceCount == statics && gw->surfaceCount > statics);
+    const iw4::GfxBrushModel& dm = gw->models[1];
+    CHECK(dm.surfaceCount >= 1 && dm.startSurfIndex == statics);
+    if (dm.surfaceCount && dm.startSurfIndex < gw->surfaceCount) {
+        // origin = the door brushes' centre (202 0 50): vertices are local
+        const iw4::GfxSurface& s = gw->dpvs.surfaces[dm.startSurfIndex];
+        const iw4::GfxWorldVertex& v = gw->draw.vd.vertices[s.tris.firstVertex];
+        CHECK(std::fabs(v.xyz[0]) <= 2.01f && std::fabs(v.xyz[1]) <= 32.01f && v.xyz[2] >= -50.01f && v.xyz[2] <= 46.01f);
+        CHECK(s.laf.fields.primaryLightIndex == 0);
+    }
+    CHECK(gw->models[2].surfaceCount == 0 && gw->models[2].startSurfIndex == 0xFFFF);
+    const std::string ents = me->entityString;
+    CHECK(ents.find("\"model\" \"*1\"") != std::string::npos && ents.find("\"model\" \"*2\"") != std::string::npos);
+    CHECK(ents.find("\"origin\" \"202 0 50\"") != std::string::npos && ents.find("misc_model") == std::string::npos);
+    CHECK(ents.find("\"targetname\" \"named_crate\"") != std::string::npos && ents.find("\"classname\" \"script_model\"") != std::string::npos);
+    // collision: cmodel 1's leaf lists its two brushes, relative to the origin
+    const iw4::cmodel_t& c1 = cm->cmodels[1];
+    CHECK(c1.leaf.leafBrushNode > 0 && std::fabs(c1.bounds.midPoint[0]) < 4 && std::fabs(c1.bounds.halfSize[0] - 7) < 0.01f);
+    if (c1.leaf.leafBrushNode > 0) {
+        const iw4::cLeafBrushNode_s& n = cm->leafbrushNodes[c1.leaf.leafBrushNode];
+        CHECK(n.leafBrushCount == 2);
+        if (n.leafBrushCount == 2) {
+            const iw4::Bounds& bb = cm->brushBounds[n.data.leaf.brushes[0]];
+            CHECK(std::fabs(bb.midPoint[0]) < 0.01f && std::fabs(bb.midPoint[2] + 2) < 0.01f);
+        }
+    }
+    const iw4::cmodel_t& c2 = cm->cmodels[2];
+    CHECK(std::fabs(c2.bounds.midPoint[1]) < 0.01f && std::fabs(c2.bounds.midPoint[2] - 16) < 0.01f);
+
+    // static models: 4 draw insts (custom ones share one XModel), the stock one by name
+    const iw4::GfxWorldDpvsStatic& v = gw->dpvs;
+    CHECK(v.smodelCount == 4 && v.smodelInsts && v.smodelDrawInsts && v.smodelVisDataCount == 4);
+    if (v.smodelCount == 4) {
+        // by-name references (resolved by the game), one per distinct model, shared through its slot
+        const iw4::XModel* r0 = v.smodelDrawInsts[0].model;
+        CHECK(r0 && std::string(r0->name) == ",iw4r_geo_crate" && v.smodelDrawInsts[1].model == r0 && v.smodelDrawInsts[2].model == r0);
+        CHECK(v.smodelDrawInsts[3].model && std::string(v.smodelDrawInsts[3].model->name) == ",com_barrel_benzin");
+        const iw4::GfxStaticModelDrawInst& d0 = v.smodelDrawInsts[0];
+        CHECK(d0.placement.origin[0] == -200 && d0.placement.scale == 1 && std::fabs(d0.placement.axis[0][1] - 0.5f) < 1e-5f &&
+              d0.cullDist == 0);
+        // world bounds of the rotated 32x32x32 cube: half-extent 16*(cos30 + sin30)
+        CHECK(std::fabs(v.smodelInsts[0].bounds.halfSize[0] - 16 * (0.8660254f + 0.5f)) < 0.01f &&
+              std::fabs(v.smodelInsts[0].lightingOrigin[2] - 16) < 0.01f);
+    }
+    const iw4::GfxAabbTree& tree = gw->aabbTrees[0].aabbTree[0];
+    CHECK(tree.smodelIndexCount == 4 && tree.smodelIndexes && tree.smodelIndexes[3] == 3);
+    // clipMap: the two crates with collision (not "none", not the stock one), one leaf node
+    CHECK(cm->numStaticModels == 2 && cm->staticModelList && cm->smodelNodeCount == 1);
+    if (cm->numStaticModels == 2) {
+        const iw4::cStaticModel_s& s0 = cm->staticModelList[0];
+        CHECK(s0.xmodel == v.smodelDrawInsts[0].model && cm->smodelNodes[0].childCount == 2 && cm->smodelNodes[0].firstChild == 0);
+        // invScaledAxis[r][c] = axis[c][r] / scale
+        CHECK(std::fabs(s0.invScaledAxis[1][0] - 0.5f) < 1e-5f && std::fabs(s0.invScaledAxis[0][1] + 0.5f) < 1e-5f);
+    }
+    // player clip: world brushes include the patch prisms and one clip brush per colliding crate
+    int playerClip = 0;
+    for (unsigned i = 0; i < cm->numBrushes; i++) playerClip += (cm->brushContents[i] & 0x30000) && !(cm->brushContents[i] & 1);
+    CHECK(playerClip >= 2 + 1);  // 2 crates + the door's clip brush
+    bool found = false;
+    for (const std::string& w : warnings) found |= w.find("com_barrel_benzin") != std::string::npos;
+    CHECK(found);
+    // the patch is drawn: some world vertex sits on the curve's wall top (x 128, z 128)
+    bool wall = false;
+    for (unsigned i = 0; i < gw->draw.vertexCount; i++)
+        wall |= std::fabs(gw->draw.vd.vertices[i].xyz[0] - 128) < 0.01f && std::fabs(gw->draw.vd.vertices[i].xyz[2] - 128) < 0.01f;
+    CHECK(wall);
     fs::remove_all(dir);
 }
 
@@ -2936,6 +3227,9 @@ int main() {
     testFxPreview();
     testSkeletonConvert();
     testZoneSourceModel();
+    testPatches();
+    testWorldGeometry();
+    testGeometryBake();
     testSkyCompile();
     testMaterialEmbed();
     testDumpFastfile();

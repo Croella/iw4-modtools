@@ -1,4 +1,5 @@
 #include "light/lightbake.h"
+#include "worldgeom.h"
 
 #include <algorithm>
 #include <cctype>
@@ -212,6 +213,7 @@ namespace {
 struct LitFace {
     Face face;
     FaceMap map;
+    bool bakeSun = false;  // brush-model face: no real-time light in game, the sun stays baked in
     std::vector<double> pu, pv;  // winding projected onto (axisU, axisV)
     double cu = 0, cv = 0;       // centroid in that projection
 };
@@ -1164,9 +1166,11 @@ uint64_t sceneHash(const Document& doc) {
     };
     for (size_t e = 0; e < doc.ents.size(); e++) {
         const Entity& ent = doc.ents[e];
-        if (e != 0 && lower(ent.classname()) != "light") continue;
+        const bool model = e != 0 && !ent.brushes.empty() && worldgeom::isBrushModelClass(ent.classname());
+        if (e != 0 && lower(ent.classname()) != "light" && !model) continue;
         for (const KeyValue& kv : ent.kv) mixStr(kv.key), mixStr(kv.value);
-        if (e == 0)
+        for (const std::string& raw : ent.rawBlocks) mixStr(raw);
+        if (e == 0 || model)
             for (const Brush& b : ent.brushes)
                 for (const Face& f : b.faces) {
                     for (const Vec3& p : f.p)
@@ -1213,30 +1217,50 @@ bool bake(const Document& doc, const Settings& settings, Bake& out, std::string&
     // Gather faces: lit ones get a lightmap, every light-blocking one goes into the scene.
     auto scene = std::make_shared<Scene>();
     std::vector<LitFace> lit;
+    // World brushes, world patches, and brush models at their placed position (lit with the sun
+    // baked in: the game draws them without a primary light).
+    auto addFace = [&](const Face& f, bool bakeSun) {
+        if (f.winding.size() < 3 || !blocksLight(f.material) || inMaterialSet(settings.unlitMaterials, f.material)) return;
+        int litIndex = -1;
+        const bool sky = isSkyMaterial(f.material);
+        if (sky && bakeSun) return;
+        if (!sky && !gfx::isToolMaterial(f.material)) {
+            litIndex = static_cast<int>(lit.size());
+            LitFace lf;
+            lf.face = f;
+            lf.bakeSun = bakeSun;
+            lit.push_back(std::move(lf));
+        }
+        for (size_t k = 1; k + 1 < f.winding.size(); k++) {
+            Tri t;
+            t.a = f3(f.winding[0]);
+            t.e1 = f3(f.winding[k] - f.winding[0]);
+            t.e2 = f3(f.winding[k + 1] - f.winding[0]);
+            t.face = litIndex;
+            t.sky = sky;
+            scene->tris.push_back(t);
+        }
+    };
     for (const Brush& src : doc.ents[0].brushes) {
         Brush b = src;
         if (!b.rebuild()) continue;
-        for (const Face& f : b.faces) {
-            if (f.winding.size() < 3 || !blocksLight(f.material) || inMaterialSet(settings.unlitMaterials, f.material))
-                continue;
-            int litIndex = -1;
-            const bool sky = isSkyMaterial(f.material);
-            if (!sky && !gfx::isToolMaterial(f.material)) {
-                litIndex = static_cast<int>(lit.size());
-                LitFace lf;
-                lf.face = f;
-                lit.push_back(std::move(lf));
-            }
-            for (size_t k = 1; k + 1 < f.winding.size(); k++) {
-                Tri t;
-                t.a = f3(f.winding[0]);
-                t.e1 = f3(f.winding[k] - f.winding[0]);
-                t.e2 = f3(f.winding[k + 1] - f.winding[0]);
-                t.face = litIndex;
-                t.sky = sky;
-                scene->tris.push_back(t);
-            }
+        for (const Face& f : b.faces) addFace(f, false);
+    }
+    for (const Face& f : worldgeom::worldPatchFaces(doc)) addFace(f, false);
+    for (size_t e : worldgeom::brushModelEntities(doc))
+        for (const Brush& src : doc.ents[e].brushes) {
+            Brush b = src;
+            if (!b.rebuild()) continue;
+            for (const Face& f : b.faces) addFace(f, true);
         }
+    for (const auto& o : settings.occluders) {
+        Tri t;
+        t.a = f3(o[0]);
+        t.e1 = f3(o[1] - o[0]);
+        t.e2 = f3(o[2] - o[0]);
+        t.face = -1;
+        t.sky = false;
+        scene->tris.push_back(t);
     }
     if (lit.empty()) {
         error = "nothing to light (no drawn faces in worldspawn)";
@@ -1298,7 +1322,7 @@ bool bake(const Document& doc, const Settings& settings, Bake& out, std::string&
         }
     for (LitFace& lf : lit) {
         lf.map.primary = -1;
-        if (primaryLight.empty()) continue;
+        if (primaryLight.empty() || lf.bakeSun) continue;
         const Face& f = lf.face;
         Vec3 c;
         for (const Vec3& p : f.winding) c += p;
@@ -1467,7 +1491,7 @@ bool bake(const Document& doc, const Settings& settings, Bake& out, std::string&
             for (int x = 0; x < m.w; x++) {
                 size_t i = (static_cast<size_t>(m.y + y) * W + (m.x + x)) * 3;
                 for (int k = 0; k < 3; k++) {
-                    double v = scene->direct[i + k] - excl[i + k] + indirect[i + k] + env.ambient[k];
+                    double v = scene->direct[i + k] - (lf.bakeSun ? 0.0f : excl[i + k]) + indirect[i + k] + env.ambient[k];
                     out.light[i + k] = static_cast<float>(std::max(0.0, v));
                 }
             }

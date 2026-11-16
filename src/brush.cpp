@@ -221,6 +221,13 @@ Face mirroredFace(const Face& f) {
     m.normal = -f.normal;
     m.dist = -f.dist;
     std::swap(m.p[0], m.p[2]);
+    std::reverse(m.vnormals.begin(), m.vnormals.end());
+    for (Vec3& n : m.vnormals) n = -n;
+    std::reverse(m.colors.begin(), m.colors.end());
+    for (size_t i = 0, n = m.uvs.size() / 2; i < n / 2; i++) {
+        std::swap(m.uvs[2 * i], m.uvs[2 * (n - 1 - i)]);
+        std::swap(m.uvs[2 * i + 1], m.uvs[2 * (n - 1 - i) + 1]);
+    }
     return m;
 }
 

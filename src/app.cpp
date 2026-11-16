@@ -633,7 +633,7 @@ void App::compileDialog(MapTarget target) {
     MessageBoxA(hwnd,
                 ("Wrote " + path + " for " + gameName + "\n\nLoader check passed.\n" + details +
                  "\nLoad it in-game with:  devmap " + (packNote.empty() ? mapName : packNote) +
-                 "\n\nNot compiled yet: brush entities, patches, models, real lighting.")
+                 "\n\nStock models placed as misc_model are referenced by name: they only show if another loaded zone has them.")
                     .c_str(),
                 "Compile to .ff", MB_OK | MB_ICONINFORMATION);
 }

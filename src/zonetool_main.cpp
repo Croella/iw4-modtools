@@ -334,8 +334,8 @@ int compile(const std::string& mapPath, const std::string& outPath) {
     std::printf("  wrote %s (%zu bytes): ComWorld, FxWorld, GfxWorld, %s, clipMap (+MapEnts, %zu entities)\n",
                 outPath.c_str(), ff.size(), target == MapTarget::SP ? "GameWorldSp" : "GameWorldMp",
                 doc.ents.size());
-    std::printf("  not yet in the zone: non-world/unknown materials (by name), brush-entity\n"
-                "  submodels, patches, static models\n");
+    std::printf("  not yet in the zone: non-world/unknown materials (by name), stock models' geometry\n"
+                "  (static models using them are by-name references, no collision)\n");
     return 0;
 }
 int importMap(const std::string& in, const std::string& outMap) {

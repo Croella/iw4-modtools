@@ -6,6 +6,7 @@
 #include <map>
 #include "light/lightbake.h"
 #include "zone/skysource.h"
+#include "worldgeom.h"
 
 namespace gfx {
 namespace {
@@ -396,8 +397,24 @@ bool isToolMaterial(const std::string& raw) {
     return n.rfind("sky", 0) == 0;
 }
 
+// Tangent (texture u direction) and binormal sign for a face with its own texture coordinates
+// (patch faces), from its first triangle's uv gradient.
+void explicitTangent(const Face& f, Vec3& t, float& sign) {
+    const Vec3 e1 = f.winding[1] - f.winding[0], e2 = f.winding[2] - f.winding[0];
+    const double du1 = f.uvs[2] - f.uvs[0], dv1 = f.uvs[3] - f.uvs[1], du2 = f.uvs[4] - f.uvs[0], dv2 = f.uvs[5] - f.uvs[1];
+    const double det = du1 * dv2 - du2 * dv1;
+    if (std::fabs(det) < 1e-12) {
+        t = normalize(e1);
+        sign = 1;
+        return;
+    }
+    const Vec3 tu = (e1 * dv2 - e2 * dv1) * (1.0 / det), tv = (e2 * du1 - e1 * du2) * (1.0 / det);
+    t = length(tu) > 1e-12 ? normalize(tu) : normalize(e1);
+    sign = dot(cross(f.normal, t), tv) < 0 ? -1.0f : 1.0f;
+}
+
 bool buildGfxWorldData(const Document& doc, GfxWorldData& out, std::string& error, const light::Bake* bake,
-                       bool includeSky, const std::set<std::string>* unlitMaterials) {
+                       bool includeSky, const std::set<std::string>* unlitMaterials, const BuildExtras* extras) {
     out = GfxWorldData{};
     if (doc.ents.empty()) {
         error = "map has no worldspawn";
@@ -405,7 +422,7 @@ bool buildGfxWorldData(const Document& doc, GfxWorldData& out, std::string& erro
     }
     // Faces to draw, grouped by material (std::map keeps the material order stable). Sky faces
     // all share the embedded sky material.
-    std::map<std::string, std::vector<std::pair<Brush, size_t>>> byMaterial;
+    std::map<std::string, std::vector<Face>> byMaterial;
     std::vector<LmFrame> lmFrames;  // lightmapped faces' tangent frames (directional lightmap)
     // Reflection probes: reflection_probe entities; none: one at the first spawn point (48 up).
     std::vector<Vec3> probes;
@@ -425,30 +442,29 @@ bool buildGfxWorldData(const Document& doc, GfxWorldData& out, std::string& erro
         }
     AABB world;
     std::string skySource;  // first sky face's material, picks the sky image
+    auto addDrawFace = [&](const Face& f, bool twoSided, std::map<std::string, std::vector<Face>>& groups, bool allowSky) {
+        if (f.winding.size() < 3) return;
+        if (light::isSkyMaterial(f.material)) {
+            if (!includeSky || !allowSky) return;
+            if (skySource.empty() || lower(skySource) == "sky") skySource = f.material;
+            groups[kSkyMaterial].push_back(f);
+            if (twoSided) groups[kSkyMaterial].push_back(mirroredFace(f));
+            return;
+        }
+        if (isToolMaterial(f.material)) return;
+        groups[f.material].push_back(f);
+        // Two-sided brushes also emit every face mirrored (seen from inside the brush).
+        if (twoSided) groups[f.material].push_back(mirroredFace(f));
+    };
     for (const Brush& src : doc.ents[0].brushes) {
         Brush b = src;
         if (!b.rebuild()) continue;
         world.add(b.bounds);
-        // Two-sided brushes also emit every face mirrored (seen from inside the brush).
-        Brush back;
-        if (b.twoSided()) {
-            back = b;
-            for (Face& f : back.faces) f = mirroredFace(f);
-        }
-        for (size_t i = 0; i < b.faces.size(); i++) {
-            const Face& f = b.faces[i];
-            if (f.winding.size() < 3) continue;
-            if (light::isSkyMaterial(f.material)) {
-                if (!includeSky) continue;
-                if (skySource.empty() || lower(skySource) == "sky") skySource = f.material;
-                byMaterial[kSkyMaterial].push_back({b, i});
-                if (!back.faces.empty()) byMaterial[kSkyMaterial].push_back({back, i});
-                continue;
-            }
-            if (isToolMaterial(f.material)) continue;
-            byMaterial[f.material].push_back({b, i});
-            if (!back.faces.empty()) byMaterial[f.material].push_back({back, i});
-        }
+        for (const Face& f : b.faces) addDrawFace(f, b.twoSided(), byMaterial, true);
+    }
+    for (const Face& f : worldgeom::worldPatchFaces(doc, extras ? extras->texSize : nullptr)) {
+        for (const Vec3& p : f.winding) world.add(p);
+        addDrawFace(f, false, byMaterial, true);
     }
     if (includeSky && byMaterial.count(kSkyMaterial)) {
         // worldspawn "sky" picks the sky by name (e.g. "sky_mp_boneyard"); else the sky faces' material.
@@ -457,25 +473,39 @@ bool buildGfxWorldData(const Document& doc, GfxWorldData& out, std::string& erro
     }
     if (!world.valid()) world = AABB{{-64, -64, -64}, {64, 64, 64}};
     if (probes.empty()) probes.push_back(world.center());
-    auto probeOf = [&](const Face& f) -> uint8_t {
-        Vec3 c;
-        for (const Vec3& p : f.winding) c += p;
-        c = c * (1.0 / std::max<size_t>(1, f.winding.size()));
+    auto nearestProbe = [&](const Vec3& c) -> uint8_t {
         size_t best = 0;
         for (size_t i = 1; i < probes.size(); i++)
             if (length(probes[i] - c) < length(probes[best] - c)) best = i;
         return static_cast<uint8_t>(best);
     };
+    auto probeOf = [&](const Face& f) -> uint8_t {
+        Vec3 c;
+        for (const Vec3& p : f.winding) c += p;
+        return nearestProbe(c * (1.0 / std::max<size_t>(1, f.winding.size())));
+    };
 
-    for (auto& [material, faces] : byMaterial) {
-        uint32_t matIndex = static_cast<uint32_t>(out.materials.size());
-        out.materials.push_back(material);
+    std::map<std::string, uint32_t> materialIndex;
+    auto materialOf = [&](const std::string& m) {
+        auto it = materialIndex.find(m);
+        if (it != materialIndex.end()) return it->second;
+        const uint32_t i = static_cast<uint32_t>(out.materials.size());
+        out.materials.push_back(m);
+        materialIndex[m] = i;
+        if (m == kSkyMaterial) out.skyMaterial = static_cast<int>(i);
+        return i;
+    };
+    // Emits one material's faces as surfaces (split by primary light, probe and lightmap page).
+    // offset: subtracted from positions (brush models are stored relative to their origin);
+    // model: brush-model surfaces (no real-time primary light).
+    auto emit = [&](const std::string& material, std::vector<Face>& faces, std::vector<Surface>& surfaces, const Vec3& offset,
+                    bool model) {
+        uint32_t matIndex = materialOf(material);
         const bool skyGroup = material == kSkyMaterial;
         const bool unlitGroup = unlitMaterials && light::inMaterialSet(*unlitMaterials, material);
-        if (skyGroup) out.skyMaterial = static_cast<int>(matIndex);
         // Engine primary light of a face: its primary spotlight, else the sun (lightmapped faces).
         auto primaryOf = [&](const Face& f) -> uint8_t {
-            if (!bake || skyGroup || unlitGroup) return 0;
+            if (!bake || skyGroup || unlitGroup || model) return 0;
             const light::FaceMap* m = bake->find(f);
             if (m && m->primary >= 0) return static_cast<uint8_t>(2 + m->primary);
             return bake->env.hasSun ? 1 : 0;
@@ -485,50 +515,64 @@ bool buildGfxWorldData(const Document& doc, GfxWorldData& out, std::string& erro
             return m ? static_cast<uint8_t>(m->page) : 0;
         };
         auto groupOf = [&](const Face& f) { return (primaryOf(f) * 256 + probeOf(f)) * 256 + pageOf(f); };
-        std::stable_sort(faces.begin(), faces.end(), [&](const auto& a, const auto& b) {
-            return groupOf(a.first.faces[a.second]) < groupOf(b.first.faces[b.second]);
-        });
+        std::stable_sort(faces.begin(), faces.end(), [&](const Face& a, const Face& b) { return groupOf(a) < groupOf(b); });
         Surface* s = nullptr;
-        for (auto& [brush, fi] : faces) {
-            const Face& f = brush.faces[fi];
+        for (const Face& f : faces) {
             size_t n = f.winding.size();
             const uint8_t prim = primaryOf(f), probe = probeOf(f), page = pageOf(f);
             if (!s || s->vertexCount + n > 65535 || s->primaryLight != prim || s->probe != probe || s->lightmap != page) {
-                out.surfaces.push_back(Surface{});
-                s = &out.surfaces.back();
+                surfaces.push_back(Surface{});
+                s = &surfaces.back();
                 s->firstVertex = static_cast<uint32_t>(out.vertices.size());
                 s->baseIndex = static_cast<uint32_t>(out.indices.size());
                 s->material = matIndex;
                 s->sky = skyGroup;
                 s->unlit = unlitGroup;
-                if (skyGroup) out.skySurfaces.push_back(static_cast<uint32_t>(out.surfaces.size() - 1));
+                if (skyGroup && !model) out.skySurfaces.push_back(static_cast<uint32_t>(surfaces.size() - 1));
                 for (int k = 0; k < 3; k++) {
                     s->mins[k] = 1e30f;
                     s->maxs[k] = -1e30f;
                 }
             }
-            Vec3 t = texGradient(f, false), bt = texGradient(f, true);
-            float sign = dot(cross(f.normal, t), bt) < 0 ? -1.0f : 1.0f;
+            const bool explicitData = f.uvs.size() == 2 * n && f.vnormals.size() == n;
+            Vec3 t;
+            float sign;
+            if (explicitData) {
+                explicitTangent(f, t, sign);
+            } else {
+                t = texGradient(f, false);
+                const Vec3 bt = texGradient(f, true);
+                sign = dot(cross(f.normal, t), bt) < 0 ? -1.0f : 1.0f;
+            }
             const light::FaceMap* lm = (bake && !skyGroup && !unlitGroup) ? bake->find(f) : nullptr;
             if (lm) lmFrames.push_back({lm, t, cross(f.normal, t) * sign, f.normal});
             s->primaryLight = prim;
             s->probe = probe;
             s->lightmap = page;
             uint16_t base = s->vertexCount;
-            for (const Vec3& p : f.winding) {
+            for (size_t i = 0; i < n; i++) {
+                const Vec3& p = f.winding[i];
                 Vertex v{};
-                v.xyz[0] = static_cast<float>(p.x);
-                v.xyz[1] = static_cast<float>(p.y);
-                v.xyz[2] = static_cast<float>(p.z);
+                v.xyz[0] = static_cast<float>(p.x - offset.x);
+                v.xyz[1] = static_cast<float>(p.y - offset.y);
+                v.xyz[2] = static_cast<float>(p.z - offset.z);
                 v.binormalSign = sign;
-                v.color = 0xFFFFFFFFu;
-                faceUV(f, p, v.texCoord[0], v.texCoord[1]);
+                v.color = f.colors.size() == n ? f.colors[i] : 0xFFFFFFFFu;
+                if (explicitData) {
+                    v.texCoord[0] = f.uvs[2 * i];
+                    v.texCoord[1] = f.uvs[2 * i + 1];
+                } else {
+                    faceUV(f, p, v.texCoord[0], v.texCoord[1]);
+                }
                 if (lm)
                     bake->lmapCoordPage(*lm, p, v.lmapCoord[0], v.lmapCoord[1]);
                 else
                     v.lmapCoord[0] = v.lmapCoord[1] = 0.5f;  // uniform lightmap (or an unbaked face)
-                v.normal = packUnitVec(f.normal);
-                v.tangent = packUnitVec(t);
+                const Vec3 vn = explicitData ? f.vnormals[i] : f.normal;
+                v.normal = packUnitVec(vn);
+                // Tangent kept perpendicular to a smooth normal.
+                const Vec3 vt = explicitData ? normalize(t - vn * dot(t, vn)) : t;
+                v.tangent = packUnitVec(length(vt) > 0.5 ? vt : t);
                 out.vertices.push_back(v);
                 for (int k = 0; k < 3; k++) {
                     s->mins[k] = std::min(s->mins[k], v.xyz[k]);
@@ -544,9 +588,44 @@ bool buildGfxWorldData(const Document& doc, GfxWorldData& out, std::string& erro
             }
             s->vertexCount = static_cast<uint16_t>(s->vertexCount + n);
         }
-    }
+    };
+    for (auto& [material, faces] : byMaterial) emit(material, faces, out.surfaces, Vec3{}, false);
     if (out.surfaces.size() > 65535) {
         error = "too many world surfaces (>65535)";
+        return false;
+    }
+    // Brush models: their faces at the placed position (lightmap lookup), stored origin-relative.
+    for (size_t e : worldgeom::brushModelEntities(doc)) {
+        const Entity& ent = doc.ents[e];
+        const Vec3 origin = worldgeom::brushModelOrigin(ent);
+        BrushModel bm;
+        bm.firstSurface = static_cast<uint32_t>(out.modelSurfaces.size());
+        std::map<std::string, std::vector<Face>> groups;
+        AABB local;
+        for (const Brush& src : ent.brushes) {
+            Brush b = src;
+            if (!b.rebuild()) continue;
+            local.add(b.bounds.mins - origin);
+            local.add(b.bounds.maxs - origin);
+            for (const Face& f : b.faces) addDrawFace(f, b.twoSided(), groups, false);
+        }
+        for (auto& [material, faces] : groups) emit(material, faces, out.modelSurfaces, origin, true);
+        bm.surfaceCount = static_cast<uint32_t>(out.modelSurfaces.size()) - bm.firstSurface;
+        AABB drawn;
+        for (uint32_t i = bm.firstSurface; i < bm.firstSurface + bm.surfaceCount; i++)
+            for (int k = 0; k < 3; k++) {
+                drawn.mins[k] = std::min(drawn.mins[k], static_cast<double>(out.modelSurfaces[i].mins[k]));
+                drawn.maxs[k] = std::max(drawn.maxs[k], static_cast<double>(out.modelSurfaces[i].maxs[k]));
+            }
+        const AABB& bb = bm.surfaceCount ? drawn : local;
+        for (int k = 0; k < 3; k++) {
+            bm.mins[k] = bb.valid() ? static_cast<float>(bb.mins[k]) : 0.0f;
+            bm.maxs[k] = bb.valid() ? static_cast<float>(bb.maxs[k]) : 0.0f;
+        }
+        out.brushModels.push_back(bm);
+    }
+    if (out.surfaces.size() + out.modelSurfaces.size() > 65535) {
+        error = "too many world + brush model surfaces (>65535)";
         return false;
     }
     for (int k = 0; k < 3; k++) {
@@ -574,7 +653,26 @@ bool buildGfxWorldData(const Document& doc, GfxWorldData& out, std::string& erro
         out.probeOrigins.push_back({static_cast<float>(probes[i].x), static_cast<float>(probes[i].y), static_cast<float>(probes[i].z)});
     }
 
-    buildLightGrid(lightGridRegion(out.vertices, world), out.lightGrid, error, bake);
+    // Static models: nearest probe; primary light (sun / spot / none) from a light-grid sample at
+    // the lighting origin (their bounds' centre), as models are lit from the grid.
+    AABB gridRegion = lightGridRegion(out.vertices, world);
+    if (extras && !extras->staticModels.empty()) {
+        out.staticModels = extras->staticModels;
+        std::vector<Vec3> centres;
+        for (StaticModel& m : out.staticModels) {
+            const Vec3 c{(m.mins[0] + m.maxs[0]) * 0.5, (m.mins[1] + m.maxs[1]) * 0.5, (m.mins[2] + m.maxs[2]) * 0.5};
+            centres.push_back(c);
+            m.probe = nearestProbe(c);
+            m.primaryLight = bake && bake->env.hasSun ? 1 : 0;
+            gridRegion.add(Vec3{m.mins[0], m.mins[1], m.mins[2]});
+            gridRegion.add(Vec3{m.maxs[0], m.maxs[1], m.maxs[2]});
+        }
+        if (bake && bake->scene) {
+            const std::vector<light::GridSample> gs = light::sampleGrid(*bake, centres, 16);
+            for (size_t i = 0; i < gs.size(); i++) out.staticModels[i].primaryLight = static_cast<uint8_t>(gs[i].primary);
+        }
+    }
+    buildLightGrid(gridRegion, out.lightGrid, error, bake);
     if (bake)
         for (const light::PointLight& L : bake->primaries) out.primaries.push_back(makePrimaryLight(L));
     fillShadowCasters(out);

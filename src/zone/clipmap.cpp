@@ -1,4 +1,5 @@
 #include "clipmap.h"
+#include "worldgeom.h"
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -304,8 +305,73 @@ uint32_t buildLeafBrushTree(ClipMapData& out, std::vector<uint32_t> idx, int dep
     return self;
 }
 
+namespace {
+
+// Static model aabb tree (see ClipMapData::smodelNodes): median splits down to leaves of <= 8.
+void buildSModelTree(ClipMapData& out) {
+    const size_t n = out.staticModels.size();
+    if (!n) return;
+    struct Pending {
+        std::vector<uint16_t> models;
+        size_t node;
+    };
+    auto boundsOf = [&](const std::vector<uint16_t>& ms) {
+        double lo[3] = {1e30, 1e30, 1e30}, hi[3] = {-1e30, -1e30, -1e30};
+        for (uint16_t m : ms)
+            for (int k = 0; k < 3; k++) {
+                const Bounds& b = out.staticModels[m].absBounds;
+                lo[k] = std::min(lo[k], static_cast<double>(b.midPoint[k] - b.halfSize[k]));
+                hi[k] = std::max(hi[k], static_cast<double>(b.midPoint[k] + b.halfSize[k]));
+            }
+        Bounds r{};
+        for (int k = 0; k < 3; k++) {
+            r.midPoint[k] = static_cast<float>((lo[k] + hi[k]) * 0.5);
+            r.halfSize[k] = static_cast<float>((hi[k] - lo[k]) * 0.5);
+        }
+        return r;
+    };
+    // Breadth-first so each node's children are consecutive.
+    std::vector<uint16_t> all(n);
+    for (size_t i = 0; i < n; i++) all[i] = static_cast<uint16_t>(i);
+    // Leaves must list their models as one consecutive run, so the models are reordered by the
+    // tree: collect the final order first, then remap.
+    out.smodelNodes.push_back(ClipMapData::SModelNode{});
+    std::vector<Pending> queue{{all, 0}};
+    std::vector<uint16_t> order;
+    for (size_t q = 0; q < queue.size(); q++) {
+        std::vector<uint16_t> ms = queue[q].models;
+        const size_t self = queue[q].node;
+        out.smodelNodes[self].bounds = boundsOf(ms);
+        if (ms.size() <= 8) {
+            out.smodelNodes[self].firstChild = static_cast<uint16_t>(order.size());  // a run in `order`
+            out.smodelNodes[self].childCount = static_cast<uint16_t>(ms.size());
+            order.insert(order.end(), ms.begin(), ms.end());
+            continue;
+        }
+        const Bounds& b = out.smodelNodes[self].bounds;
+        int axis = b.halfSize[1] > b.halfSize[0] ? 1 : 0;
+        if (b.halfSize[2] > b.halfSize[axis]) axis = 2;
+        std::sort(ms.begin(), ms.end(), [&](uint16_t a, uint16_t c) {
+            return out.staticModels[a].absBounds.midPoint[axis] < out.staticModels[c].absBounds.midPoint[axis];
+        });
+        const size_t half = ms.size() / 2;
+        const size_t first = out.smodelNodes.size();
+        out.smodelNodes.push_back(ClipMapData::SModelNode{});
+        out.smodelNodes.push_back(ClipMapData::SModelNode{});
+        out.smodelNodes[self].firstChild = static_cast<uint16_t>(n + first);
+        out.smodelNodes[self].childCount = 2;
+        queue.push_back({std::vector<uint16_t>(ms.begin(), ms.begin() + static_cast<std::ptrdiff_t>(half)), first});
+        queue.push_back({std::vector<uint16_t>(ms.begin() + static_cast<std::ptrdiff_t>(half), ms.end()), first + 1});
+    }
+    std::vector<ClipMapData::StaticModel> sorted;
+    for (uint16_t m : order) sorted.push_back(out.staticModels[m]);
+    out.staticModels = std::move(sorted);
+}
+
+}  // namespace
+
 bool buildClipMapData(const Document& doc, ClipMapData& out, std::string& error,
-                      const std::set<std::string>* nonSolid) {
+                      const std::set<std::string>* nonSolid, const ClipExtras* extras) {
     out = ClipMapData{};
     if (doc.ents.empty()) {
         error = "map has no worldspawn";
@@ -316,13 +382,11 @@ bool buildClipMapData(const Document& doc, ClipMapData& out, std::string& error,
 
     Builder b(out, nonSolid);
     for (const ::Brush& br : doc.ents[0].brushes) b.addBrush(br);
-
-    // leafBrushes holds u16 brush indices, so the map can have at most 65535 collision brushes.
-    if (out.brushes.size() > 65535) {
-        error = "too many collision brushes (" + std::to_string(out.brushes.size()) +
-                " > 65535); the leaf-brush index is 16-bit";
-        return false;
-    }
+    for (const patch::Patch& p : worldgeom::worldPatches(doc))
+        for (const ::Brush& br : patch::collisionBrushes(p)) b.addBrush(br);
+    if (extras)
+        for (const ::Brush& br : extras->worldBrushes) b.addBrush(br);
+    const size_t worldBrushes = out.brushes.size();
 
     uint32_t allContents = 0;
     std::vector<uint32_t> allIdx;
@@ -353,6 +417,59 @@ bool buildClipMapData(const Document& doc, ClipMapData& out, std::string& error,
     worldModel.radius = std::sqrt(wb.halfSize[0] * wb.halfSize[0] + wb.halfSize[1] * wb.halfSize[1] +
                                   wb.halfSize[2] * wb.halfSize[2]);
     out.cmodels.push_back(worldModel);  // world model: empty leaf, traces walk the tree
+
+    // Brush models "*1"..: brushes relative to the origin, after the world's (not in its tree).
+    for (size_t e : worldgeom::brushModelEntities(doc)) {
+        const Entity& ent = doc.ents[e];
+        const Vec3 origin = worldgeom::brushModelOrigin(ent);
+        const size_t first = out.brushes.size();
+        AABB local;
+        for (const ::Brush& src : ent.brushes) {
+            ::Brush br = src;
+            br.translate(-origin);
+            ::Brush rebuilt = br;
+            if (rebuilt.rebuild()) local.add(rebuilt.bounds);
+            b.addBrush(br);
+        }
+        CModel m;
+        std::vector<uint32_t> idx;
+        uint32_t contents = 0;
+        for (size_t i = first; i < out.brushes.size(); i++) {
+            idx.push_back(static_cast<uint32_t>(i));
+            contents |= out.brushes[i].contents;
+        }
+        if (!local.valid()) local = AABB{{-1, -1, -1}, {1, 1, 1}};
+        // Stock: cmodel bounds are the brushes' padded by 1; radius reaches the farthest corner.
+        AABB padded = local;
+        padded.mins = padded.mins - Vec3{1, 1, 1};
+        padded.maxs = padded.maxs + Vec3{1, 1, 1};
+        m.bounds = toBounds(padded);
+        double r2 = 0;
+        for (int k = 0; k < 3; k++) {
+            const double c = std::max(std::fabs(padded.mins[k]), std::fabs(padded.maxs[k]));
+            r2 += c * c;
+        }
+        m.radius = static_cast<float>(std::sqrt(r2));
+        m.leaf.brushContents = contents;
+        m.leaf.bounds = toBounds(local);
+        if (!idx.empty()) m.leaf.leafBrushNode = buildLeafBrushTree(out, std::move(idx), 0);
+        out.cmodels.push_back(m);
+    }
+    (void)worldBrushes;
+    // leafBrushes holds u16 brush indices, so the map can have at most 65535 collision brushes.
+    if (out.brushes.size() > 65535) {
+        error = "too many collision brushes (" + std::to_string(out.brushes.size()) +
+                " > 65535); the leaf-brush index is 16-bit";
+        return false;
+    }
+    if (extras && !extras->staticModels.empty()) {
+        if (extras->staticModels.size() > 32000) {
+            error = "too many static models with collision (> 32000)";
+            return false;
+        }
+        out.staticModels = extras->staticModels;
+        buildSModelTree(out);
+    }
 
     uint32_t h = 2166136261u;
     for (const Plane& p : out.planes) h = fnv1a(h, &p, sizeof(p));
@@ -411,15 +528,18 @@ int addTriggerModel(ClipMapData& out, const std::vector<::Brush>& brushes, const
 }
 
 void buildTriggers(Document& doc, ClipMapData& out, std::vector<std::string>* warnings) {
-    int others = 0;
+    int models = 0;
     for (size_t i = 1; i < doc.ents.size(); i++) {
         Entity& e = doc.ents[i];
         if (e.brushes.empty()) continue;
         const std::string cls = e.classname();
-        if (!isBrushTriggerClass(cls)) {
-            others++;
+        if (worldgeom::isBrushModelClass(cls)) {  // "*N", numbered as buildClipMapData's cmodels
+            Vec3 o;
+            if (!e.origin(o)) e.setOrigin(worldgeom::brushModelOrigin(e));
+            e.set("model", "*" + std::to_string(++models));
             continue;
         }
+        if (!isBrushTriggerClass(cls)) continue;
         AABB all;
         for (const ::Brush& b : e.brushes)
             for (const Face& f : b.faces)
@@ -434,9 +554,7 @@ void buildTriggers(Document& doc, ClipMapData& out, std::vector<std::string>* wa
         const int n = addTriggerModel(out, e.brushes, origin);
         e.set("model", "?" + std::to_string(n));
     }
-    if (others && warnings)
-        warnings->push_back(std::to_string(others) +
-                            " brush entit(ies) other than triggers (script_brushmodel...) aren't compiled yet: left out of collision and rendering");
+    if (models && warnings) warnings->push_back("brush models: " + std::to_string(models) + " (script_brushmodel...) as *1..*" + std::to_string(models));
 }
 
 }  // namespace clip

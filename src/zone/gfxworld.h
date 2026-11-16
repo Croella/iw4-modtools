@@ -6,6 +6,7 @@
 #include <vector>
 #include "clipmap.h"
 #include "document.h"
+#include "patch.h"
 
 namespace light {
 struct Bake;
@@ -102,6 +103,26 @@ struct PrimaryLight {
     std::vector<uint16_t> shadowSurfs;  // sorted surface indices
 };
 
+// A brush model's render geometry ("*N", N = index + 1): surfaces [firstSurface, +surfaceCount)
+// of GfxWorldData::modelSurfaces, vertices relative to the entity origin; bounds local. Models
+// without drawn faces keep surfaceCount 0 and their collision bounds (stock: startSurfIndex 65535).
+struct BrushModel {
+    uint32_t firstSurface = 0, surfaceCount = 0;
+    float mins[3] = {}, maxs[3] = {};
+};
+
+// A static model (misc_model). Stock values (mp_rust, boneyard): placement = origin, AnglesToAxis
+// rows, scale; smodelInst bounds = the world AABB, lighting origin its centre; cullDist =
+// scale * the last LOD's distance (0 when that is "infinite"); lightingHandle / cacheId runtime;
+// flags 0.
+struct StaticModel {
+    std::string model;  // XModel asset name
+    float origin[3] = {}, axis[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}, scale = 1;
+    float mins[3] = {}, maxs[3] = {};
+    uint16_t cullDist = 0;
+    uint8_t probe = 0, primaryLight = 0;
+};
+
 struct GfxWorldData {
     std::vector<Vertex> vertices;
     std::vector<uint16_t> indices;
@@ -127,6 +148,16 @@ struct GfxWorldData {
     // Surfaces [0, opaqueSurfaceCount) are dpvs "lit opaque", the rest "lit trans" (see
     // sortSurfaces). Default: everything opaque.
     uint32_t opaqueSurfaceCount = UINT32_MAX;
+    // Brush models 1.. and their surfaces (written after the static world surfaces; not sorted).
+    std::vector<BrushModel> brushModels;
+    std::vector<Surface> modelSurfaces;
+    std::vector<StaticModel> staticModels;
+};
+
+// Inputs besides the document (all optional).
+struct BuildExtras {
+    std::vector<StaticModel> staticModels;  // probe / primaryLight are filled in by the build
+    patch::TexSizeFn texSize;               // patch texture coordinates (default 512 texels)
 };
 
 // Orders surfaces like stock GfxWorlds: ascending material sort key (sortKeys[material]); keys
@@ -144,7 +175,7 @@ bool isToolMaterial(const std::string& name);
 // unlitMaterials: lower-case editor names drawn without lightmap/sun (additive effects).
 bool buildGfxWorldData(const Document& doc, GfxWorldData& out, std::string& error,
                        const light::Bake* bake = nullptr, bool includeSky = false,
-                       const std::set<std::string>* unlitMaterials = nullptr);
+                       const std::set<std::string>* unlitMaterials = nullptr, const BuildExtras* extras = nullptr);
 // The material name GfxWorld uses for the embedded sky.
 constexpr const char* kSkyMaterial = "wc/iw4r_sky";
 

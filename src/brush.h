@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <string>
 #include <vector>
 #include "math3d.h"
@@ -16,6 +17,11 @@ struct Face {
     Vec3 normal;
     double dist = 0;
     std::vector<Vec3> winding;
+    // Explicit per-winding-vertex data (patch faces, see patch.h); empty for brush faces, which
+    // use the texture projection (faceUV) and the flat normal.
+    std::vector<float> uvs;         // 2 per vertex
+    std::vector<Vec3> vnormals;     // smooth normals
+    std::vector<uint32_t> colors;   // GfxColor bytes r g b a
 };
 
 // A convex solid defined by the intersection of its face planes.

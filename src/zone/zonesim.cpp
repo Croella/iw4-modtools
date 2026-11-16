@@ -652,13 +652,25 @@ private:
         if (auto* s = array(v.surfaces, g.surfaceCount, kAlign4))
             for (unsigned i = 0; i < g.surfaceCount; i++) materialPtr(s[i].material);
         array(v.surfacesBounds, g.surfaceCount, kAlign4);
-        if (v.smodelDrawInsts && lenient_) {
-            // Static model draw instances carry inline XModels, which this port doesn't load.
-            stopped_ = "GfxWorld.dpvs.smodelDrawInsts (inline XModels)";
-            pop();
-            return;
+        // smodelDrawInsts (88 each on x64, align 4), then each one's XModel (Load_XModelPtr). Stock map
+        // zones carry inline XModels here that may use features this port doesn't load: partial
+        // loads stop at the first one that fails (the instance array itself is already read).
+        if (auto* di = array(v.smodelDrawInsts, v.smodelCount, kAlign4)) {
+            const size_t depth = stack_.size();
+            for (unsigned i = 0; i < v.smodelCount; i++) {
+                try {
+                    xmodelPtr(di[i].model);
+                } catch (const Fail& e) {
+                    if (!lenient_) throw;
+                    while (stack_.size() > depth) pop();
+                    stopped_ = std::string("GfxWorld.dpvs.smodelDrawInsts[") + std::to_string(i) + "].model: " + e.what();
+                    for (unsigned k = i; k < v.smodelCount; k++) di[k].model = nullptr;
+                    smodelsStopped_ = true;
+                    pop();
+                    return;
+                }
+            }
         }
-        requireNull(v.smodelDrawInsts, "dpvs.smodelDrawInsts");
         runtime(v.surfaceMaterials, 8ull * g.surfaceCount, kAlign8);
         runtime(v.surfaceCastsSunShadow, 4ull * v.surfaceVisDataCount, 127);
         // dpvsDyn (0x11b760)
@@ -1235,6 +1247,7 @@ private:
     std::vector<Saved> stack_;
     // partial loads
     bool lenient_ = false;
+    bool smodelsStopped_ = false;
     bool anchorPending_ = false;
     uint32_t anchorValue_ = 0;
     std::string stopped_;

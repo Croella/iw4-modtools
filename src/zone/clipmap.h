@@ -135,25 +135,49 @@ struct ClipMapData {
     std::vector<LeafBrushNode> leafBrushNodes;
     std::vector<CModel> cmodels;
     std::vector<Brush> brushes;
+    // Static models with bullet collision (stock cStaticModel_s): the XModel's collision surfaces
+    // are traced in model space through invScaledAxis[r][c] = axis[c][r] / scale (checked against
+    // mp_rust). smodelNodes: an aabb tree over them; a node's children are nodes
+    // firstChild - staticModels.size() .. when firstChild >= staticModels.size(), else static models
+    // firstChild .. (stock encoding, mp_rust: the leaves list every model exactly once).
+    struct StaticModel {
+        std::string model;
+        float origin[3] = {}, invScaledAxis[3][3] = {};
+        Bounds absBounds{};
+    };
+    struct SModelNode {
+        Bounds bounds{};
+        uint16_t firstChild = 0, childCount = 0;
+    };
+    std::vector<StaticModel> staticModels;
+    std::vector<SModelNode> smodelNodes;
     uint32_t checksum = 0;
 };
 
 // Contents for a material name (clip, sky, non-colliding tool materials). 0 = no collision.
 uint32_t contentsForMaterial(const std::string& name);
 
-// Compiles worldspawn's brushes. Brush entities (submodels) are not compiled yet.
+// Collision besides the document's brushes.
+struct ClipExtras {
+    std::vector<::Brush> worldBrushes;  // world space, e.g. player clip around static models
+    std::vector<ClipMapData::StaticModel> staticModels;
+};
+
+// Compiles worldspawn's brushes and patches (thin prism brushes) into the world, and every brush
+// model entity (worldgeom::brushModelEntities) into cmodels 1.. with its brushes relative to its
+// origin (stock layout: a leaf whose leaf-brush node lists them, bounds local, +1 padded).
 // nonSolid: lower-case editor material names with no collision (additive effect materials such
 // as atmos_particles_dust, which stock maps use as nonsolid sheets/volumes).
 bool buildClipMapData(const Document& doc, ClipMapData& out, std::string& error,
-                      const std::set<std::string>* nonSolid = nullptr);
+                      const std::set<std::string>* nonSolid = nullptr, const ClipExtras* extras = nullptr);
 
 // True for brush entity classes the game links as brush triggers ("?N" models).
 bool isBrushTriggerClass(const std::string& classname);
 // Adds a trigger model for these brushes (relative to origin); returns its index.
 int addTriggerModel(ClipMapData& out, const std::vector<::Brush>& brushes, const Vec3& origin);
 // Every brush trigger entity in doc (isBrushTriggerClass, with brushes) gets a trigger model:
-// "model" "?N", and an "origin" (its brushes' centre) when it has none. Other brush entities
-// (script_brushmodel...) aren't compiled yet: warned about.
+// "model" "?N", and an "origin" (its brushes' centre) when it has none. Brush model entities get
+// "model" "*N" (and an origin) matching buildClipMapData's cmodels.
 void buildTriggers(Document& doc, ClipMapData& out, std::vector<std::string>* warnings);
 
 }  // namespace clip

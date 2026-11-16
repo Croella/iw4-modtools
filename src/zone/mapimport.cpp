@@ -8,6 +8,8 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <set>
+#include <sstream>
 #include "fastfile.h"
 #include "iw4.h"
 #include "gfxworld.h"
@@ -29,6 +31,166 @@ uint32_t rd32(const std::vector<uint8_t>& z, size_t o) {
     if (o + 4 <= z.size()) std::memcpy(&v, z.data() + o, 4);
     return v;
 }
+
+// Debug (IW4R_DUMP_SMODELS): how a stock map stores static models, brush models and model collision.
+void dumpModels(const iw4::GfxWorld* g, const iw4::clipMap_t* cm, const iw4::MapEnts* me) {
+    auto model = [](const iw4::XModel* m) {
+        if (!m || !m->name) return;
+        std::printf("    xmodel %s: bones %u surfs %u lods %u collLod %d flags %x contents %x collSurfs %d radius %.1f bounds mid %.1f %.1f %.1f half %.1f %.1f %.1f phys %s collmap %p\n",
+                    m->name, m->numBones, m->numsurfs, m->numLods, static_cast<signed char>(m->collLod), m->flags, m->contents, m->numCollSurfs,
+                    m->radius, m->bounds.midPoint[0], m->bounds.midPoint[1], m->bounds.midPoint[2], m->bounds.halfSize[0], m->bounds.halfSize[1],
+                    m->bounds.halfSize[2], m->physPreset && m->physPreset->name ? m->physPreset->name : "-", static_cast<const void*>(m->physCollmap));
+        for (int i = 0; i < m->numCollSurfs && i < 3 && m->collSurfs; i++) {
+            const iw4::XModelCollSurf_s& c = m->collSurfs[i];
+            std::printf("      collSurf %d: tris %d bone %d contents %x surfFlags %x mid %.2f %.2f %.2f half %.2f %.2f %.2f\n", i, c.numCollTris,
+                        c.boneIdx, c.contents, c.surfFlags, c.bounds.midPoint[0], c.bounds.midPoint[1], c.bounds.midPoint[2], c.bounds.halfSize[0],
+                        c.bounds.halfSize[1], c.bounds.halfSize[2]);
+            for (int t = 0; t < c.numCollTris && t < 8 && c.collTris; t++) {
+                const iw4::XModelCollTri_s& r = c.collTris[t];
+                std::printf("        tri %d plane %.3f %.3f %.3f %.2f svec %.4f %.4f %.4f %.3f tvec %.4f %.4f %.4f %.3f\n", t, r.plane[0], r.plane[1],
+                            r.plane[2], r.plane[3], r.svec[0], r.svec[1], r.svec[2], r.svec[3], r.tvec[0], r.tvec[1], r.tvec[2], r.tvec[3]);
+            }
+        }
+        for (int l = 0; l < 4; l++)
+            std::printf("      lod %d dist %.0f surfs %u surfIndex %u lod %d smc %d %d %d\n", l, m->lodInfo[l].dist, m->lodInfo[l].numsurfs,
+                        m->lodInfo[l].surfIndex, m->lodInfo[l].lod, m->lodInfo[l].smcBaseIndexPlusOne, m->lodInfo[l].smcSubIndexMask,
+                        m->lodInfo[l].smcBucket);
+    };
+    if (g) {
+        const iw4::GfxWorldDpvsStatic& v = g->dpvs;
+        std::printf("smodels: %u visDataCount %u surfaces %u models %d cells %d\n", v.smodelCount, v.smodelVisDataCount, g->surfaceCount, g->modelCount,
+                    g->dpvsPlanes.cellCount);
+        std::set<const iw4::XModel*> shown;
+        for (unsigned i = 0; i < v.smodelCount && v.smodelDrawInsts; i++) {
+            const iw4::GfxStaticModelDrawInst& d = v.smodelDrawInsts[i];
+            if (i < 12 || (d.model && shown.size() < 6 && !shown.count(d.model))) {
+                const iw4::GfxPackedPlacement& p = d.placement;
+                std::printf("  smodel %u: %s origin %.1f %.1f %.1f scale %.3f axis0 %.3f %.3f %.3f axis2 %.3f %.3f %.3f cull %u lightH %u probe %u primary %u flags %x skin %u ground %08x cache %u %u %u %u\n",
+                            i, d.model && d.model->name ? d.model->name : "?", p.origin[0], p.origin[1], p.origin[2], p.scale, p.axis[0][0], p.axis[0][1],
+                            p.axis[0][2], p.axis[2][0], p.axis[2][1], p.axis[2][2], d.cullDist, d.lightingHandle, d.reflectionProbeIndex,
+                            d.primaryLightIndex, d.flags, d.firstMtlSkinIndex, d.groundLighting.packed, d.cacheId[0], d.cacheId[1], d.cacheId[2],
+                            d.cacheId[3]);
+                if (v.smodelInsts) {
+                    const iw4::GfxStaticModelInst& s = v.smodelInsts[i];
+                    std::printf("    inst mid %.1f %.1f %.1f half %.1f %.1f %.1f lightingOrigin %.1f %.1f %.1f\n", s.bounds.midPoint[0],
+                                s.bounds.midPoint[1], s.bounds.midPoint[2], s.bounds.halfSize[0], s.bounds.halfSize[1], s.bounds.halfSize[2],
+                                s.lightingOrigin[0], s.lightingOrigin[1], s.lightingOrigin[2]);
+                }
+                if (d.model && !shown.count(d.model)) shown.insert(d.model), model(d.model);
+            }
+        }
+        std::map<unsigned, unsigned> flagCount;
+        for (unsigned i = 0; i < v.smodelCount && v.smodelDrawInsts; i++) flagCount[v.smodelDrawInsts[i].flags]++;
+        for (auto [f, n] : flagCount) std::printf("  flags %x: %u\n", f, n);
+        for (int c = 0; c < g->dpvsPlanes.cellCount && c < 2 && g->aabbTrees && g->aabbTreeCounts; c++) {
+            const int nt = g->aabbTreeCounts[c].aabbTreeCount;
+            unsigned withSm = 0, totalSm = 0;
+            for (int k = 0; k < nt; k++)
+                totalSm += g->aabbTrees[c].aabbTree[k].smodelIndexCount, withSm += g->aabbTrees[c].aabbTree[k].smodelIndexCount > 0;
+            std::printf("  cell %d: %d trees, %u with smodels, %u smodel refs\n", c, nt, withSm, totalSm);
+            for (int k = 0; k < nt && k < 6; k++) {
+                const iw4::GfxAabbTree& t = g->aabbTrees[c].aabbTree[k];
+                std::printf("    tree %d: children %u off %d surfs %u@%u nodecal %u@%u smodels %u:", k, t.childCount, t.childrenOffset, t.surfaceCount,
+                            t.startSurfIndex, t.surfaceCountNoDecal, t.startSurfIndexNoDecal, t.smodelIndexCount);
+                for (unsigned j = 0; j < t.smodelIndexCount && j < 8 && t.smodelIndexes; j++) std::printf(" %u", t.smodelIndexes[j]);
+                std::printf("\n");
+            }
+        }
+        for (unsigned i = 0; i < g->primaryLightCount && i < 4 && g->shadowGeom; i++)
+            std::printf("  shadowGeom %u: surfs %u smodels %u\n", i, g->shadowGeom[i].surfaceCount, g->shadowGeom[i].smodelCount);
+        for (int i = 0; i < g->modelCount && i < 8 && g->models; i++) {
+            const iw4::GfxBrushModel& m = g->models[i];
+            std::printf("  gfx model %d: surfs %u start %u nodecal %u mid %.1f %.1f %.1f half %.1f %.1f %.1f writable mid %.1f half %.1f radius %.1f\n", i,
+                        m.surfaceCount, m.startSurfIndex, m.surfaceCountNoDecal, m.bounds.midPoint[0], m.bounds.midPoint[1], m.bounds.midPoint[2],
+                        m.bounds.halfSize[0], m.bounds.halfSize[1], m.bounds.halfSize[2], m.writable.bounds.midPoint[0], m.writable.bounds.halfSize[0],
+                        m.radius);
+            if (i > 0 && m.surfaceCount && g->dpvs.surfaces && g->draw.vd.vertices) {
+                const iw4::GfxSurface& s = g->dpvs.surfaces[m.startSurfIndex];
+                const iw4::GfxWorldVertex& vx = g->draw.vd.vertices[s.tris.firstVertex];
+                std::printf("    first surf %s lmap %u primary %u flags %x vert %.1f %.1f %.1f\n",
+                            s.material && s.material->info.name ? s.material->info.name : "?", s.laf.fields.lightmapIndex,
+                            s.laf.fields.primaryLightIndex, s.laf.fields.flags, vx.xyz[0], vx.xyz[1], vx.xyz[2]);
+            }
+        }
+    }
+    if (cm) {
+        std::printf("clip static models %u, smodelNodes %u, submodels %u, partitions %u aabbTrees %u verts %u tris %u leafsurfaces %u\n",
+                    cm->numStaticModels, cm->smodelNodeCount, cm->numSubModels, cm->partitionCount, cm->aabbTreeCount, cm->vertCount, cm->triCount,
+                    cm->numLeafSurfaces);
+        for (unsigned i = 0; i < cm->numStaticModels && i < 6 && cm->staticModelList; i++) {
+            const iw4::cStaticModel_s& s = cm->staticModelList[i];
+            std::printf("  cstatic %u: %s origin %.1f %.1f %.1f invAxis0 %.4f %.4f %.4f abs mid %.1f %.1f %.1f half %.1f %.1f %.1f\n", i,
+                        s.xmodel && s.xmodel->name ? s.xmodel->name : "?", s.origin[0], s.origin[1], s.origin[2], s.invScaledAxis[0][0],
+                        s.invScaledAxis[0][1], s.invScaledAxis[0][2], s.absBounds.midPoint[0], s.absBounds.midPoint[1], s.absBounds.midPoint[2],
+                        s.absBounds.halfSize[0], s.absBounds.halfSize[1], s.absBounds.halfSize[2]);
+            for (int r = 0; r < 3; r++)
+                std::printf("    inv[%d] %.4f %.4f %.4f\n", r, s.invScaledAxis[r][0], s.invScaledAxis[r][1], s.invScaledAxis[r][2]);
+            for (unsigned j = 0; g && j < g->dpvs.smodelCount && g->dpvs.smodelDrawInsts; j++) {
+                const iw4::GfxPackedPlacement& p = g->dpvs.smodelDrawInsts[j].placement;
+                if (std::fabs(p.origin[0] - s.origin[0]) + std::fabs(p.origin[1] - s.origin[1]) + std::fabs(p.origin[2] - s.origin[2]) > 0.01f)
+                    continue;
+                std::printf("    = smodel %u scale %.4f model %s\n", j, p.scale,
+                            g->dpvs.smodelDrawInsts[j].model && g->dpvs.smodelDrawInsts[j].model->name ? g->dpvs.smodelDrawInsts[j].model->name : "?");
+                for (int r = 0; r < 3; r++) std::printf("    axis[%d] %.4f %.4f %.4f\n", r, p.axis[r][0], p.axis[r][1], p.axis[r][2]);
+                break;
+            }
+        }
+        // Static model aabb tree: check the encoding (child index >= numStaticModels -> node).
+        unsigned leaves = 0, leafModels = 0, inner = 0, bad = 0;
+        for (unsigned i = 0; i < cm->smodelNodeCount && cm->smodelNodes; i++) {
+            const iw4::SModelAabbNode& n = cm->smodelNodes[i];
+            if (n.firstChild >= cm->numStaticModels) {
+                inner++;
+                if (n.firstChild - cm->numStaticModels + n.childCount > cm->smodelNodeCount) bad++;
+            } else {
+                leaves++;
+                leafModels += n.childCount;
+            }
+        }
+        std::printf("  smodel tree: %u inner, %u leaves listing %u models (of %u), %u bad\n", inner, leaves, leafModels, cm->numStaticModels, bad);
+        for (unsigned i = 0; i < cm->smodelNodeCount && i < 6 && cm->smodelNodes; i++) {
+            const uint8_t* n = reinterpret_cast<const uint8_t*>(&cm->smodelNodes[i]);
+            std::printf("  smodelNode %u:", i);
+            for (size_t b = 0; b + 4 <= sizeof(iw4::SModelAabbNode); b += 4) {
+                float f;
+                uint32_t u;
+                std::memcpy(&f, n + b, 4);
+                std::memcpy(&u, n + b, 4);
+                std::printf(" %g/%08x", f, u);
+            }
+            std::printf("\n");
+        }
+        for (unsigned i = 0; i < cm->numSubModels && i < 8 && cm->cmodels; i++) {
+            const iw4::cmodel_t& m = cm->cmodels[i];
+            std::printf("  cmodel %u: mid %.1f %.1f %.1f half %.1f %.1f %.1f radius %.1f leaf brushNode %d contents %x terrain %x aabb %u@%u leafmid %.1f %.1f %.1f\n",
+                        i, m.bounds.midPoint[0], m.bounds.midPoint[1], m.bounds.midPoint[2], m.bounds.halfSize[0], m.bounds.halfSize[1],
+                        m.bounds.halfSize[2], m.radius, m.leaf.leafBrushNode, m.leaf.brushContents, m.leaf.terrainContents, m.leaf.collAabbCount,
+                        m.leaf.firstCollAabbIndex, m.leaf.bounds.midPoint[0], m.leaf.bounds.midPoint[1], m.leaf.bounds.midPoint[2]);
+            if (i > 0 && cm->leafbrushNodes && m.leaf.leafBrushNode > 0) {
+                const iw4::cLeafBrushNode_s& n = cm->leafbrushNodes[m.leaf.leafBrushNode];
+                std::printf("    node axis %u count %d contents %x", n.axis, n.leafBrushCount, n.contents);
+                if (n.leafBrushCount > 0 && n.data.leaf.brushes && cm->brushBounds) {
+                    const unsigned b = n.data.leaf.brushes[0];
+                    std::printf(" brush %u mid %.1f %.1f %.1f half %.1f %.1f %.1f", b, cm->brushBounds[b].midPoint[0], cm->brushBounds[b].midPoint[1],
+                                cm->brushBounds[b].midPoint[2], cm->brushBounds[b].halfSize[0], cm->brushBounds[b].halfSize[1],
+                                cm->brushBounds[b].halfSize[2]);
+                }
+                std::printf("\n");
+            }
+        }
+    }
+    if (me && me->entityString) {  // entities using brush models
+        std::istringstream in(me->entityString);
+        std::string line, block;
+        int shown = 0;
+        while (std::getline(in, line) && shown < 8) {
+            if (line == "{") block.clear();
+            block += line + " ";
+            if (line == "}" && block.find("\"model\" \"*") != std::string::npos) std::printf("  ent: %s\n", block.c_str()), shown++;
+        }
+    }
+}
+
 bool isVirtualRef(uint64_t p) { return p && p < (1ull << 32) && ((p - 1) >> 28) == 3; }
 uint32_t refOffset(uint64_t p) { return static_cast<uint32_t>((p - 1) & 0x0FFFFFFF); }
 
@@ -574,6 +736,7 @@ bool importFastfile(const std::string& ffPath, Document& doc, ImportStats& st, s
             }
         }
     }
+    if (std::getenv("IW4R_DUMP_SMODELS")) dumpModels(g, cm, me);
     std::shared_ptr<RefMesh> mesh = g ? convertGfxWorld(*g, st) : nullptr;
     fillDocument(doc, me, cm, mesh, st, error);
     error.clear();

@@ -1,4 +1,5 @@
 #include "zonebuild.h"
+#include "worldgeom.h"
 #include <cstddef>
 #include <cstdint>
 #include <algorithm>
@@ -544,8 +545,47 @@ struct ModelMaterialPlan {
 // verts in VERTEX, rigid vertex list (single-bone models), indices in INDEX; boneInfo per bone;
 // no phys preset/collmap. Single-bone layout matches stock viewmodel_nvg, skinned matches
 // viewmodel_base_viewhands (deformed surfaces, no rigid lists).
+// XModelCollTri_s for a triangle (a, b, c) clockwise seen from outside (normal n): the plane, and
+// svec / tvec with s = dot(svec.xyz, p) - svec.w, t likewise, the barycentric coordinates along
+// b - a and c - a (decoded from stock mp_rust foliage: s, t in [0,1], s + t <= 1 on the triangle).
+iw4::XModelCollTri_s collTri(const Vec3& a, const Vec3& b, const Vec3& c, const Vec3& n) {
+    iw4::XModelCollTri_s t{};
+    const Vec3 e1 = b - a, e2 = c - a;
+    const Vec3 u0 = cross(e2, n), w0 = cross(e1, n);
+    const Vec3 u = u0 * (1.0 / dot(e1, u0)), w = w0 * (1.0 / dot(e2, w0));
+    for (int k = 0; k < 3; k++) t.plane[k] = static_cast<float>(n[k]), t.svec[k] = static_cast<float>(u[k]), t.tvec[k] = static_cast<float>(w[k]);
+    t.plane[3] = static_cast<float>(dot(n, a));
+    t.svec[3] = static_cast<float>(dot(u, a));
+    t.tvec[3] = static_cast<float>(dot(w, a));
+    return t;
+}
+
+// Bullet collision for a rigid model: one collision surface, its convex hull (26-DOP) as triangles.
+std::vector<iw4::XModelCollTri_s> modelCollision(const modelbuild::Model& md, iw4::Bounds& bounds) {
+    std::vector<iw4::XModelCollTri_s> tris;
+    if (md.skinned) return tris;
+    std::vector<Vec3> pts;
+    for (const modelbuild::Surface& s : md.surfaces)
+        for (const modelbuild::PackedVertex& v : s.verts) pts.push_back({v.xyz[0], v.xyz[1], v.xyz[2]});
+    Brush hull;
+    if (!worldgeom::dopBrush(pts, "collision", hull)) return tris;
+    for (const Face& f : hull.faces)
+        for (size_t k = 1; k + 1 < f.winding.size(); k++) {
+            const Vec3 &a = f.winding[0], &b = f.winding[k], &c = f.winding[k + 1];
+            if (length(cross(b - a, c - a)) < 1e-6) continue;
+            tris.push_back(collTri(a, b, c, f.normal));
+        }
+    for (int k = 0; k < 3; k++) {
+        bounds.midPoint[k] = static_cast<float>((hull.bounds.mins[k] + hull.bounds.maxs[k]) * 0.5);
+        bounds.halfSize[k] = static_cast<float>((hull.bounds.maxs[k] - hull.bounds.mins[k]) * 0.5);
+    }
+    return tris;
+}
+
 ZoneAsset buildXModel(const modelbuild::Model& md, std::vector<uint16_t> boneNameIndex, std::vector<ModelMaterialPlan> mats) {
-    return {IW4_XMODEL, [md, boneNameIndex, mats](ZoneWriter& w) {
+    iw4::Bounds collBounds{};
+    const std::vector<iw4::XModelCollTri_s> collTris = modelCollision(md, collBounds);
+    return {IW4_XMODEL, [md, boneNameIndex, mats, collTris, collBounds](ZoneWriter& w) {
                 using namespace zone;
                 const uint32_t n = static_cast<uint32_t>(md.surfaces.size());
                 const size_t nb = md.bones.size(), nr = static_cast<size_t>(md.numRootBones), nonRoot = nb - nr;
@@ -567,12 +607,17 @@ ZoneAsset buildXModel(const modelbuild::Model& md, std::vector<uint16_t> boneNam
                 m.partClassification = follow<unsigned char>();
                 m.baseMat = follow<iw4::DObjAnimMat>();
                 m.materialHandles = follow<iw4::Material*>();
-                m.lodInfo[0].dist = 1000.0f;
+                m.lodInfo[0].dist = 1000000.0f;  // one LOD: always drawn (stock "infinite" last LOD)
                 m.lodInfo[0].numsurfs = static_cast<unsigned short>(n);
                 m.lodInfo[0].modelSurfs = reinterpret_cast<iw4::XModelSurfs*>(static_cast<uintptr_t>(kPtrInsert));
                 for (int k = 0; k < 6; k++) m.lodInfo[0].partBits[k] = static_cast<int>(partBits[k]);
                 m.numLods = 1;
-                m.collLod = 0xFF;  // -1: no collision lod
+                m.collLod = collTris.empty() ? 0xFF : 0;  // -1: no collision lod
+                if (!collTris.empty()) {
+                    m.collSurfs = follow<iw4::XModelCollSurf_s>();
+                    m.numCollSurfs = 1;
+                    m.contents = 1;  // solid
+                }
                 m.boneInfo = follow<iw4::XBoneInfo>();
                 m.radius = md.radius;
                 for (int k = 0; k < 3; k++) {
@@ -680,6 +725,20 @@ ZoneAsset buildXModel(const modelbuild::Model& md, std::vector<uint16_t> boneNam
                     }
                     ww.pop();
                 });
+                if (!collTris.empty()) {  // collSurfs (48 each), then each one's collTris (48 each)
+                    static_assert(sizeof(iw4::XModelCollSurf_s) == 48 && sizeof(iw4::XModelCollTri_s) == 48, "coll");
+                    w.align(kAlign4);
+                    iw4::XModelCollSurf_s cs{};
+                    cs.collTris = follow<iw4::XModelCollTri_s>();
+                    cs.numCollTris = static_cast<int>(collTris.size());
+                    cs.bounds = collBounds;
+                    cs.boneIdx = 0;
+                    cs.contents = 1;
+                    cs.surfFlags = 0;
+                    w.writeStruct(cs);
+                    w.align(kAlign4);
+                    w.write(collTris.data(), collTris.size() * sizeof(iw4::XModelCollTri_s));
+                }
                 w.align(kAlign4);
                 for (const modelbuild::Bone& b : md.bones) {
                     iw4::XBoneInfo bi{};
@@ -701,8 +760,8 @@ void put64At(std::vector<uint8_t>& b, size_t at, uint64_t v) { std::memcpy(b.dat
 
 // Load_XModelPtr for a by-name reference: XModel with only its name (",name"); DB_AddXAsset
 // resolves it to the loaded model (ours, written earlier in this zone, or another zone's).
-void writeXModelRef(ZoneWriter& w, const std::string& name) {
-    loadAssetPtr(w, zone::kPtrInsert, [&](ZoneWriter& ww) {
+uint64_t writeXModelRef(ZoneWriter& w, const std::string& name) {
+    return loadAssetPtr(w, zone::kPtrInsert, [&](ZoneWriter& ww) {
         iw4::XModel m{};
         m.name = follow<const char>();
         ww.writeStruct(m);
@@ -1337,8 +1396,11 @@ ZoneAsset buildClipMap(const std::string& name, const clip::ClipMapData& cm,
                 c.brushBounds = nb ? follow<iw4::Bounds>() : nullptr;
                 c.brushContents = nb ? follow<int>() : nullptr;
                 c.mapEnts = ref<iw4::MapEnts>(kPtrInsert);  // inline + added as its own asset
-                // One empty static-model AABB node, so a walk from node 0 finds nothing to test.
-                c.smodelNodeCount = 1;
+                // Static models with collision + their aabb tree (none: one empty node, so a walk
+                // from node 0 finds nothing to test).
+                c.numStaticModels = static_cast<unsigned>(cm.staticModels.size());
+                c.staticModelList = cm.staticModels.empty() ? nullptr : follow<iw4::cStaticModel_s>();
+                c.smodelNodeCount = static_cast<unsigned short>(cm.smodelNodes.empty() ? 1 : cm.smodelNodes.size());
                 c.smodelNodes = follow<iw4::SModelAabbNode>();
                 c.checksum = cm.checksum;
                 w.writeStruct(c);
@@ -1348,6 +1410,27 @@ ZoneAsset buildClipMap(const std::string& name, const clip::ClipMapData& cm,
 
                 uint32_t planesAt = sharedPlanes ? shared->planesAt : 0;
                 if (!cm.planes.empty() && !sharedPlanes) planesAt = writePlanes(w, cm.planes);
+                if (!cm.staticModels.empty()) {
+                    // 80 bytes each, then Load_XModelPtr per element: GfxWorld's slot for the model
+                    // (it loads first), else a by-name reference here.
+                    static_assert(sizeof(iw4::cStaticModel_s) == 80, "cStaticModel_s");
+                    w.align(kAlign4);
+                    std::vector<bool> inlineRef;
+                    for (const clip::ClipMapData::StaticModel& m : cm.staticModels) {
+                        iw4::cStaticModel_s g{};
+                        uint64_t slot = kPtrInsert;
+                        if (shared)
+                            if (auto it = shared->modelSlots.find(m.model); it != shared->modelSlots.end()) slot = it->second;
+                        inlineRef.push_back(slot == kPtrInsert);
+                        g.xmodel = ref<iw4::XModel>(slot);
+                        std::memcpy(g.origin, m.origin, sizeof m.origin);
+                        std::memcpy(g.invScaledAxis, m.invScaledAxis, sizeof m.invScaledAxis);
+                        g.absBounds = toGame(m.absBounds);
+                        w.writeStruct(g);
+                    }
+                    for (size_t i = 0; i < cm.staticModels.size(); i++)
+                        if (inlineRef[i]) writeXModelRef(w, cm.staticModels[i].model);
+                }
                 if (!cm.materials.empty()) {
                     w.align(kAlign4);
                     for (const clip::Material& m : cm.materials) {
@@ -1446,7 +1529,14 @@ ZoneAsset buildClipMap(const std::string& name, const clip::ClipMapData& cm,
                     for (const clip::Brush& b : cm.brushes) w.i32(static_cast<int>(b.contents));
                 }
                 w.align(kAlign4);
-                w.writeStruct(iw4::SModelAabbNode{});
+                if (cm.smodelNodes.empty()) w.writeStruct(iw4::SModelAabbNode{});
+                for (const clip::ClipMapData::SModelNode& n : cm.smodelNodes) {
+                    iw4::SModelAabbNode g{};
+                    g.bounds = toGame(n.bounds);
+                    g.firstChild = n.firstChild;
+                    g.childCount = n.childCount;
+                    w.writeStruct(g);
+                }
                 // Load_MapEntsPtr (0x11cd50), nested: the entity lump becomes its own asset.
                 loadAssetPtr(w, kPtrInsert, [&](ZoneWriter& ww) { writeMapEnts(ww, name, entityString, withDefaultStage, &cm); });
                 // dynEnt def/pose/client/coll lists: none.
@@ -1519,7 +1609,9 @@ ZoneAsset buildGfxWorld(const std::string& name, const std::string& baseName, co
                            materials](ZoneWriter& w) {
                 using namespace zone;
                 const auto rt = follow<unsigned int>();  // RUNTIME arrays: allocated + zeroed
-                const uint32_t ns = static_cast<uint32_t>(gw.surfaces.size());
+                const uint32_t ns = static_cast<uint32_t>(gw.surfaces.size());  // static (world) surfaces
+                const uint32_t nAll = ns + static_cast<uint32_t>(gw.modelSurfaces.size());  // + brush models'
+                const uint32_t nsm = static_cast<uint32_t>(gw.staticModels.size());
                 const uint32_t cellCount = 1, primaryLights = 2 + static_cast<uint32_t>(gw.primaries.size());
                 const uint32_t visCount = (ns + 63) >> 5;
                 iw4::GfxWorld g{};
@@ -1527,7 +1619,7 @@ ZoneAsset buildGfxWorld(const std::string& name, const std::string& baseName, co
                 g.baseName = follow<const char>();
                 g.planeCount = static_cast<int>(planes.size());
                 g.nodeCount = 1;
-                g.surfaceCount = ns;
+                g.surfaceCount = nAll;
                 const bool hasSky = skySrc && gw.skyMaterial >= 0 && !gw.skySurfaces.empty();
                 g.skyCount = hasSky ? 1 : 0;
                 g.skies = hasSky ? follow<iw4::GfxSky>() : nullptr;
@@ -1575,7 +1667,7 @@ ZoneAsset buildGfxWorld(const std::string& name, const std::string& baseName, co
                 g.lightGrid.entries = follow<iw4::GfxLightGridEntry>();
                 g.lightGrid.colorCount = lg.colorCount;
                 g.lightGrid.colors = follow<iw4::GfxLightGridColors>();
-                g.modelCount = 1;
+                g.modelCount = 1 + static_cast<int>(gw.brushModels.size());
                 g.models = follow<iw4::GfxBrushModel>();
                 for (int k = 0; k < 3; k++) {
                     g.bounds.midPoint[k] = (gw.mins[k] + gw.maxs[k]) * 0.5f;
@@ -1594,7 +1686,7 @@ ZoneAsset buildGfxWorld(const std::string& name, const std::string& baseName, co
                 g.shadowGeom = follow<iw4::GfxShadowGeometry>();
                 g.lightRegion = follow<iw4::GfxLightRegion>();
                 iw4::GfxWorldDpvsStatic& v = g.dpvs;
-                v.smodelCount = 0;
+                v.smodelCount = nsm;
                 v.staticSurfaceCount = v.staticSurfaceCountNoDecal = ns;
                 const uint32_t opaque = std::min(gw.opaqueSurfaceCount, ns);
                 v.litOpaqueSurfsBegin = 0;
@@ -1602,15 +1694,18 @@ ZoneAsset buildGfxWorld(const std::string& name, const std::string& baseName, co
                 v.litTransSurfsEnd = ns;
                 v.shadowCasterSurfsBegin = v.shadowCasterSurfsEnd = ns;
                 v.emissiveSurfsBegin = v.emissiveSurfsEnd = ns;
-                v.smodelVisDataCount = (0 + 63) >> 5;
+                // Stock (mp_rust 3356 -> 108, boneyard 27981 -> 876): 4 words per 128 models.
+                v.smodelVisDataCount = nsm ? ((nsm + 127) >> 7) << 2 : 1;
                 v.surfaceVisDataCount = visCount;
                 for (int k = 0; k < 3; k++) {
                     v.smodelVisData[k] = follow<unsigned char>();
                     v.surfaceVisData[k] = follow<unsigned char>();
                 }
                 v.sortedSurfIndex = ns ? follow<unsigned short>() : nullptr;
-                v.surfaces = ns ? follow<iw4::GfxSurface>() : nullptr;
-                v.surfacesBounds = ns ? follow<iw4::GfxSurfaceBounds>() : nullptr;
+                v.surfaces = nAll ? follow<iw4::GfxSurface>() : nullptr;
+                v.surfacesBounds = nAll ? follow<iw4::GfxSurfaceBounds>() : nullptr;
+                v.smodelInsts = nsm ? follow<iw4::GfxStaticModelInst>() : nullptr;
+                v.smodelDrawInsts = nsm ? follow<iw4::GfxStaticModelDrawInst>() : nullptr;
                 v.surfaceMaterials = follow<iw4::GfxDrawSurf>();
                 v.surfaceCastsSunShadow = rt;
                 for (int k = 0; k < 2; k++) {
@@ -1664,7 +1759,13 @@ ZoneAsset buildGfxWorld(const std::string& name, const std::string& baseName, co
                     t.surfaceCount = t.surfaceCountNoDecal = static_cast<unsigned short>(ns);
                     t.startSurfIndex = 0;
                     t.startSurfIndexNoDecal = static_cast<unsigned short>(ns);  // second half
+                    t.smodelIndexCount = static_cast<unsigned short>(nsm);
+                    t.smodelIndexes = nsm ? follow<unsigned short>() : nullptr;
                     w.writeStruct(t);
+                    if (nsm) {
+                        w.align(kAlign2);
+                        for (uint32_t i = 0; i < nsm; i++) w.write(&i, 2);
+                    }
                 }
                 // cells: one, no portals, sees reflection probe 0.
                 w.align(kAlign4);
@@ -1741,6 +1842,20 @@ ZoneAsset buildGfxWorld(const std::string& name, const std::string& baseName, co
                                          g.bounds.halfSize[2] * g.bounds.halfSize[2]);
                     m.surfaceCount = m.surfaceCountNoDecal = static_cast<unsigned short>(ns);
                     w.writeStruct(m);
+                    // Brush models "*1"..: local bounds; surfaces after the static ones (stock:
+                    // models without drawn faces have startSurfIndex 65535).
+                    for (const gfx::BrushModel& bm : gw.brushModels) {
+                        iw4::GfxBrushModel o{};
+                        for (int k = 0; k < 3; k++) {
+                            o.bounds.midPoint[k] = (bm.mins[k] + bm.maxs[k]) * 0.5f;
+                            o.bounds.halfSize[k] = (bm.maxs[k] - bm.mins[k]) * 0.5f;
+                        }
+                        o.radius = std::sqrt(o.bounds.halfSize[0] * o.bounds.halfSize[0] + o.bounds.halfSize[1] * o.bounds.halfSize[1] +
+                                             o.bounds.halfSize[2] * o.bounds.halfSize[2]);
+                        o.surfaceCount = o.surfaceCountNoDecal = static_cast<unsigned short>(bm.surfaceCount);
+                        o.startSurfIndex = bm.surfaceCount ? static_cast<unsigned short>(ns + bm.firstSurface) : 0xFFFF;
+                        w.writeStruct(o);
+                    }
                 }
                 // materialMemory: each material once, as a by-name reference.
                 std::vector<uint64_t> matSlot(gw.materials.size());
@@ -1812,14 +1927,30 @@ ZoneAsset buildGfxWorld(const std::string& name, const std::string& baseName, co
                     w.writeStruct(h);
                 }
                 // dpvs (0x11bb30)
-                for (int k = 0; k < 3; k++) runtimeArray(w, kAlign1, 0);   // smodelVisData
+                for (int k = 0; k < 3; k++) runtimeArray(w, kAlign1, nsm);  // smodelVisData
                 for (int k = 0; k < 3; k++) runtimeArray(w, kAlign1, ns);  // surfaceVisData
                 if (ns) {
                     w.align(kAlign2);
                     for (int half = 0; half < 2; half++)
                         for (uint32_t i = 0; i < ns; i++) w.write(&i, 2);  // sortedSurfIndex
+                    if (nsm) {  // smodelInsts: world bounds, lit from their centre
+                        w.align(kAlign4);
+                        for (const gfx::StaticModel& m : gw.staticModels) {
+                            iw4::GfxStaticModelInst si{};
+                            for (int k = 0; k < 3; k++) {
+                                si.bounds.midPoint[k] = (m.mins[k] + m.maxs[k]) * 0.5f;
+                                si.bounds.halfSize[k] = (m.maxs[k] - m.mins[k]) * 0.5f;
+                                si.lightingOrigin[k] = si.bounds.midPoint[k];
+                            }
+                            w.writeStruct(si);
+                        }
+                    }
                     w.align(kAlign4);
-                    for (const gfx::Surface& s : gw.surfaces) {
+                    std::vector<const gfx::Surface*> allSurfs;
+                    for (const gfx::Surface& s : gw.surfaces) allSurfs.push_back(&s);
+                    for (const gfx::Surface& s : gw.modelSurfaces) allSurfs.push_back(&s);
+                    for (const gfx::Surface* sp : allSurfs) {
+                        const gfx::Surface& s = *sp;
                         iw4::GfxSurface o{};
                         o.tris.vertexLayerData = 0;
                         o.tris.firstVertex = s.firstVertex;
@@ -1834,7 +1965,8 @@ ZoneAsset buildGfxWorld(const std::string& name, const std::string& baseName, co
                         w.writeStruct(o);
                     }
                     w.align(kAlign4);
-                    for (const gfx::Surface& s : gw.surfaces) {
+                    for (const gfx::Surface* sp : allSurfs) {
+                        const gfx::Surface& s = *sp;
                         iw4::GfxSurfaceBounds b{};
                         for (int k = 0; k < 3; k++) {
                             b.bounds.midPoint[k] = (s.mins[k] + s.maxs[k]) * 0.5f;
@@ -1843,7 +1975,38 @@ ZoneAsset buildGfxWorld(const std::string& name, const std::string& baseName, co
                         w.writeStruct(b);
                     }
                 }
-                runtimeArray(w, kAlign8, 8ull * ns);           // surfaceMaterials (game-built sort keys)
+                if (nsm) {
+                    // smodelDrawInsts (88 bytes on x64), then each one's XModel: a by-name reference the first time a
+                    // model is used (+ insert slot), its slot after (clipMap's static models too).
+                    static_assert(sizeof(iw4::GfxStaticModelDrawInst) == 88 && offsetof(iw4::GfxStaticModelDrawInst, model) == 56,
+                                  "GfxStaticModelDrawInst");
+                    const uint32_t at = w.align(kAlign4);
+                    for (const gfx::StaticModel& m : gw.staticModels) {
+                        iw4::GfxStaticModelDrawInst d{};
+                        std::memcpy(d.placement.origin, m.origin, sizeof m.origin);
+                        std::memcpy(d.placement.axis, m.axis, sizeof m.axis);
+                        d.placement.scale = m.scale;
+                        d.model = ref<iw4::XModel>(kPtrInsert);
+                        d.cullDist = m.cullDist;
+                        d.reflectionProbeIndex = m.probe;
+                        d.primaryLightIndex = m.primaryLight;
+                        w.writeStruct(d);
+                    }
+                    const size_t fileAt = w.bytes().size() - 88ull * nsm;
+                    (void)at;
+                    std::map<std::string, uint64_t> localSlots;
+                    std::map<std::string, uint64_t>& slots = shared ? shared->modelSlots : localSlots;
+                    for (uint32_t i = 0; i < nsm; i++) {
+                        const std::string& name = gw.staticModels[i].model;
+                        auto it = slots.find(name);
+                        if (it != slots.end()) {
+                            std::memcpy(w.bytes().data() + fileAt + 88ull * i + 56, &it->second, 8);
+                            continue;
+                        }
+                        slots[name] = writeXModelRef(w, name);
+                    }
+                }
+                runtimeArray(w, kAlign8, 8ull * nAll);         // surfaceMaterials (game-built sort keys)
                 runtimeArray(w, 127, 4ull * visCount);         // surfaceCastsSunShadow
                 // dpvsDyn (0x11b760): no dyn ents, all sizes 0.
                 for (int k = 0; k < 2; k++) runtimeArray(w, kAlign4, 0);
@@ -2840,6 +3003,132 @@ std::string mapScriptSource(const std::string& mapName, MapTarget target) {
            "\tgame[\"defenders\"] = \"axis\";\n}\n";
 }
 
+namespace {
+
+// misc_model entities -> static models. Custom (zone_source) models have real geometry: tight
+// world bounds, lightmap shadows (bake occluders), bullet collision (clipMap static model: the
+// XModel's hull collision surface) and player clip ("collision": hull = 26-DOP brush, default;
+// box = the model's oriented bounds; mesh = a thin prism per triangle; none). Stock models are
+// by-name references the game resolves only if another loaded zone has them; their size is
+// unknown here (a 64-unit box), and they get no collision.
+struct StaticModelPlan {
+    std::vector<gfx::StaticModel> models;
+    clip::ClipExtras clip;
+    std::vector<std::array<Vec3, 3>> occluders;
+    std::vector<std::string> stockNames;
+};
+
+// A misc_model scripts can find (targetname, script_noteworthy, ...) stays an entity: a
+// script_model, as custom misc_models always were before static models were compiled.
+bool scriptReachable(const Entity& e) {
+    for (const char* k : {"targetname", "script_noteworthy", "script_linkname", "target"})
+        if (const std::string* v = e.find(k); v && !v->empty()) return true;
+    return false;
+}
+
+StaticModelPlan planStaticModels(const Document& doc, const std::vector<modelbuild::Model>& custom) {
+    StaticModelPlan plan;
+    std::map<std::string, const modelbuild::Model*> byName;
+    for (const modelbuild::Model& m : custom) byName[matdef::key(m.name)] = &m;
+    for (size_t i = 1; i < doc.ents.size(); i++) {
+        const Entity& e = doc.ents[i];
+        if (e.classname() != "misc_model" || scriptReachable(e)) continue;
+        const std::string* name = e.find("model");
+        if (!name || name->empty()) continue;
+        const worldgeom::Placement pl = worldgeom::entityPlacement(e);
+        gfx::StaticModel sm;
+        sm.model = *name;
+        for (int k = 0; k < 3; k++) {
+            sm.origin[k] = static_cast<float>(pl.origin[k]);
+            for (int j = 0; j < 3; j++) sm.axis[k][j] = static_cast<float>(pl.axis[k][j]);
+        }
+        sm.scale = static_cast<float>(pl.scale);
+        auto it = byName.find(matdef::key(*name));
+        const modelbuild::Model* md = it == byName.end() ? nullptr : it->second;
+        AABB box;
+        std::vector<Vec3> world;
+        std::vector<std::array<Vec3, 3>> tris;  // world space
+        if (md) {
+            for (const modelbuild::Surface& s : md->surfaces) {
+                const size_t base = world.size();
+                for (const modelbuild::PackedVertex& v : s.verts) {
+                    world.push_back(pl.apply({v.xyz[0], v.xyz[1], v.xyz[2]}));
+                    box.add(world.back());
+                }
+                for (size_t t = 0; t + 2 < s.tris.size(); t += 3)
+                    tris.push_back({world[base + s.tris[t]], world[base + s.tris[t + 1]], world[base + s.tris[t + 2]]});
+            }
+            const std::string* shadows = e.find("castshadows");
+            if (!shadows || *shadows != "0") plan.occluders.insert(plan.occluders.end(), tris.begin(), tris.end());
+        }
+        if (!box.valid()) {
+            if (!md) plan.stockNames.push_back(*name);
+            box.add(pl.origin - Vec3{64, 64, 0} * pl.scale);
+            box.add(pl.origin + Vec3{64, 64, 128} * pl.scale);
+        }
+        for (int k = 0; k < 3; k++) sm.mins[k] = static_cast<float>(box.mins[k]), sm.maxs[k] = static_cast<float>(box.maxs[k]);
+        plan.models.push_back(sm);
+
+        const std::string* cmode = e.find("collision");
+        const std::string mode = cmode ? matdef::key(*cmode) : "hull";
+        if (!md || md->skinned || world.size() < 4 || mode == "none" || mode == "0") continue;
+        constexpr const char* kClip = "clip_player";  // player + AI clip; bullets use the model's own surface
+        if (mode == "box") {
+            Brush b;
+            for (int k = 0; k < 3; k++)
+                for (int sgn = -1; sgn <= 1; sgn += 2) {
+                    const Vec3 n = pl.axis[k] * sgn;
+                    double hi = -1e300;
+                    for (const Vec3& p : world) hi = std::max(hi, dot(p, n));
+                    b.faces.push_back(patch::planeFace(n, hi, kClip));
+                }
+            if (b.rebuild()) plan.clip.worldBrushes.push_back(b);
+        } else if (mode == "mesh") {
+            for (const auto& t : tris) {
+                const Vec3 n = normalize(cross(t[2] - t[0], t[1] - t[0]));
+                if (length(n) < 0.5) continue;
+                Brush b;
+                b.faces.push_back(patch::planeFace(n, dot(n, t[0]), kClip));
+                b.faces.push_back(patch::planeFace(-n, -(dot(n, t[0]) - 2), kClip));
+                const Vec3 c = (t[0] + t[1] + t[2]) * (1.0 / 3);
+                for (int k = 0; k < 3; k++) {
+                    Vec3 sn = normalize(cross(t[(k + 1) % 3] - t[k], n));
+                    if (dot(sn, c - t[k]) > 0) sn = -sn;
+                    b.faces.push_back(patch::planeFace(sn, dot(sn, t[k]), kClip));
+                }
+                if (b.rebuild()) plan.clip.worldBrushes.push_back(b);
+            }
+        } else {
+            Brush b;
+            if (worldgeom::dopBrush(world, kClip, b)) plan.clip.worldBrushes.push_back(b);
+        }
+        // Bullet collision: the model's collision surface, traced in model space.
+        clip::ClipMapData::StaticModel cs;
+        cs.model = *name;
+        for (int k = 0; k < 3; k++) {
+            cs.origin[k] = sm.origin[k];
+            for (int j = 0; j < 3; j++) cs.invScaledAxis[k][j] = static_cast<float>(pl.axis[j][k] / pl.scale);
+            cs.absBounds.midPoint[k] = static_cast<float>((box.mins[k] + box.maxs[k]) * 0.5);
+            cs.absBounds.halfSize[k] = static_cast<float>((box.maxs[k] - box.mins[k]) * 0.5);
+        }
+        plan.clip.staticModels.push_back(cs);
+    }
+    return plan;
+}
+
+// Patch texture size: the material's colorMap image size (from the stock definitions), else 512.
+patch::TexSizeFn patchTexSize(std::shared_ptr<const matdef::Library> materials) {
+    return [materials](const std::string& material, double& w, double& h) {
+        w = h = 512;
+        if (!materials) return;
+        auto it = materials->find(matdef::key(worldMaterialAssetName(material)));
+        int iw, ih;
+        if (it != materials->end() && matdef::colorMapSize(it->second, iw, ih)) w = iw, h = ih;
+    };
+}
+
+}  // namespace
+
 std::vector<uint8_t> buildZoneImage(const std::vector<ZoneAsset>& assets,
                                     const std::vector<std::string>& scriptStrings) {
     ZoneWriter w;
@@ -2914,8 +3203,39 @@ bool compileMapToFastfile(const Document& doc, const std::string& mapName,
                     unlit.insert(n.rfind("wc/", 0) == 0 ? n.substr(3) : n);
                 }
             }
+    // misc_model -> static models (geometry from zone_source models where they are custom).
+    std::vector<modelbuild::Model> sourceModels;
+    {
+        std::vector<std::string> unused;
+        sourceModels = loadZoneSourceModels(options.zoneSourceDir, unused);
+    }
+    const StaticModelPlan smPlan = planStaticModels(doc, sourceModels);
+    if (options.warnings) {
+        if (!smPlan.models.empty())
+            options.warnings->push_back("static models: " + std::to_string(smPlan.models.size()) + " misc_model(s), " +
+                                        std::to_string(smPlan.clip.staticModels.size()) + " with collision");
+        if (!smPlan.stockNames.empty()) {
+            std::set<std::string> uniq(smPlan.stockNames.begin(), smPlan.stockNames.end());
+            std::string list;
+            int n = 0;
+            for (const std::string& m : uniq)
+                if (n++ < 6) list += (list.empty() ? "" : ", ") + m;
+            options.warnings->push_back(std::to_string(smPlan.stockNames.size()) +
+                                        " static model(s) use stock models (not in zone_source): they only show if another loaded zone has them, "
+                                        "and get no collision: " + list);
+        }
+        const size_t patches = worldgeom::worldPatches(doc).size();
+        if (patches) options.warnings->push_back("patches: " + std::to_string(patches));
+        size_t badPatches = 0;
+        for (const std::string& raw : doc.ents[0].rawBlocks) {
+            patch::Patch pp;
+            std::string why;
+            if (!patch::parse(raw, pp, &why) && raw.find("mesh") != std::string::npos) badPatches++;
+        }
+        if (badPatches) options.warnings->push_back(std::to_string(badPatches) + " patch block(s) couldn't be read and were left out");
+    }
     clip::ClipMapData cm;  // effect materials are nonsolid
-    if (!clip::buildClipMapData(doc, cm, error, &unlit)) return false;
+    if (!clip::buildClipMapData(doc, cm, error, &unlit, &smPlan.clip)) return false;
     // Surface types (footstep sounds, impact effects, bullettrace "surfacetype", AI groundtype):
     // stock clipMap materials carry type << 20 in surfaceFlags (trainer: asphalt 22, concrete 5,
     // plaster 16, metal 13, wood 21); the type is the stock material's MaterialInfo.surfaceTypeBits
@@ -2942,6 +3262,7 @@ bool compileMapToFastfile(const Document& doc, const std::string& mapName,
     if (!bake && options.bakeLighting) {
         light::Settings ls = options.light;
         ls.unlitMaterials = unlit;
+        ls.occluders = smPlan.occluders;
         if (!light::bake(doc, ls, localBake, error, options.progress)) {
             error = "lighting: " + error;
             return false;
@@ -2963,7 +3284,10 @@ bool compileMapToFastfile(const Document& doc, const std::string& mapName,
             options.warnings->push_back("sky left out: " + skyErr);
     }
     gfx::GfxWorldData gw;
-    if (!gfx::buildGfxWorldData(doc, gw, error, bake, skySrc != nullptr, &unlit)) return false;
+    gfx::BuildExtras gx;
+    gx.staticModels = smPlan.models;
+    gx.texSize = patchTexSize(materials);
+    if (!gfx::buildGfxWorldData(doc, gw, error, bake, skySrc != nullptr, &unlit, &gx)) return false;
     {
         // Material sort keys (MaterialInfo.sortKey, byte 9 of the struct) put surfaces in the
         // right dpvs range: embedded materials carry their stock key, the sky its own (2),
@@ -3066,14 +3390,13 @@ bool compileMapToFastfile(const Document& doc, const std::string& mapName,
             auto idx = [&](const std::string& s) { return s.empty() ? uint16_t(0) : scriptIndex(s); };
             nodeStrings.push_back({idx(nd.targetname), idx(nd.linkname), idx(nd.noteworthy), idx(nd.target)});
         }
-    {
-        std::vector<std::string> unused;
-        std::set<std::string> custom;
-        for (const modelbuild::Model& md : loadZoneSourceModels(options.zoneSourceDir, unused)) custom.insert(matdef::key(md.name));
-        for (Entity& e : entDoc.ents)
-            if (e.classname() == "misc_model")
-                if (const std::string* mdl = e.find("model"); mdl && custom.count(matdef::key(*mdl))) e.set("classname", "script_model");
-    }
+    // misc_models are static models in GfxWorld / clipMap, not entities (stock lumps have none);
+    // ones a script can find by name stay entities, as script_models.
+    for (Entity& e : entDoc.ents)
+        if (e.classname() == "misc_model" && scriptReachable(e)) e.set("classname", "script_model");
+    entDoc.ents.erase(std::remove_if(entDoc.ents.begin() + 1, entDoc.ents.end(),
+                                     [](const Entity& e) { return e.classname() == "misc_model"; }),
+                      entDoc.ents.end());
     // brush triggers (trigger_multiple...): "?N" trigger models in the entity lump
     clip::buildTriggers(entDoc, cm, options.warnings);
     if (!cm.triggerModels.empty() && options.warnings)

@@ -33,6 +33,8 @@ struct Settings {
     // Unlit see-through materials (additive effects such as atmos_particles_dust), lower-case
     // editor names: they neither block light nor get a lightmap.
     std::set<std::string> unlitMaterials;
+    // Extra light blockers that aren't lightmapped (static models' triangles, world space).
+    std::vector<std::array<Vec3, 3>> occluders;
 };
 
 // Sun, sky and ambient from worldspawn keys (CoD Radiant names; defaults give a daylit map):

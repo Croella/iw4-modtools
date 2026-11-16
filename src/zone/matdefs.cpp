@@ -1,4 +1,5 @@
 #include "zone/matdefs.h"
+#include "zone/iw4.h"
 
 #include <cctype>
 #include <cstring>
@@ -305,6 +306,19 @@ bool load(const std::string& path, Library& lib) {
     }
     lib = std::move(out);
     return true;
+}
+
+bool colorMapSize(const Def& d, int& width, int& height) {
+    for (const Texture& t : d.textures)
+        if (t.kind() == 'c' && t.imageHeader.size() >= sizeof(iw4::GfxImage)) {
+            iw4::GfxImage im;
+            std::memcpy(&im, t.imageHeader.data(), sizeof im);
+            if (!im.width || !im.height) return false;
+            width = im.width;
+            height = im.height;
+            return true;
+        }
+    return false;
 }
 
 }  // namespace matdef

@@ -38,6 +38,8 @@ target_include_directories(imgui_lib PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_D
 add_library(iw4r_core STATIC
   src/brush.cpp
   src/brushshapes.cpp
+  src/patch.cpp
+  src/worldgeom.cpp
   src/terrain.cpp
   src/fxpreview.cpp
   src/document.cpp

@@ -62,4 +62,7 @@ std::vector<const Texture*> usedTextures(const Def& d);
 
 std::string key(const std::string& name);
 
+// The colorMap image's size (texels), from its stored GfxImage header. False if it has none.
+bool colorMapSize(const Def& d, int& width, int& height);
+
 }  // namespace matdef

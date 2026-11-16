@@ -78,6 +78,8 @@ ZoneAsset buildFxWorld(const std::string& name);
 struct SharedWorld {
     bool havePlanes = false;
     uint32_t planesAt = 0;  // VIRTUAL position of GfxWorld's plane array
+    // XModel insert slots GfxWorld's static models created (by name), for clipMap's static models.
+    std::map<std::string, uint64_t> modelSlots;
 };
 // Rendering. Writes the plane array and records it in `shared` for clipMap to back-reference.
 // skySrc: the embedded sky's stock pieces (needed when gw has sky surfaces), or nullptr.

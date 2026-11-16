@@ -1,5 +1,7 @@
 #include "renderer.h"
 #include "zone/gfxworld.h"
+#include "patch.h"
+#include "zone/matdefs.h"
 #include "model/imageio.h"
 #include <d3dcompiler.h>
 #include <algorithm>
@@ -1130,6 +1132,32 @@ void Renderer::rebuild(const Document& doc) {
                 float lr = selected ? 1.0f : 0.0f;
                 for (size_t i = 0; i < f.winding.size(); i++)
                     addLine(f.winding[i], f.winding[(i + 1) % f.winding.size()], lr, 0, 0);
+            }
+        }
+        // Patches (read-only): tessellated as compiled, lit by the preview bake on worldspawn.
+        if (showBrushes && !ent.rawBlocks.empty()) {
+            const patch::TexSizeFn texSize = [&](const std::string& m, double& w, double& h) {
+                matdef::Def def;
+                int iw, ih;
+                if (assets && assets->materialDef(m, def) && matdef::colorMapSize(def, iw, ih)) w = iw, h = ih;
+            };
+            for (const patch::Patch& p : patch::entityPatches(ent)) {
+                if (!showToolFaces && gfx::isToolMaterial(p.material)) continue;
+                const patch::Grid g = patch::tessellate(p, texSize);
+                for (const Face& f : patch::faces(g, p.material)) {
+                    auto& out = byMaterial[f.material];
+                    const light::FaceMap* lm = (e == 0 && lighting) ? lighting->find(f) : nullptr;
+                    for (size_t i = 1; i + 1 < f.winding.size(); i++)
+                        for (size_t idx : {size_t(0), i, i + 1}) {
+                            Vertex vx = vertex(f.winding[idx], f.vnormals[idx], f.uvs[2 * idx], f.uvs[2 * idx + 1], 1, 1, 1);
+                            if (lm) lighting->lmapCoord(*lm, f.winding[idx], vx.lm[0], vx.lm[1]);
+                            out.push_back(vx);
+                        }
+                }
+                // Outline: the tessellated grid's border.
+                auto edge = [&](int r0, int c0, int r1, int c1) { addLine(g.p[g.at(r0, c0)], g.p[g.at(r1, c1)], 0.3f, 0.6f, 1.0f); };
+                for (int c = 0; c + 1 < g.w; c++) edge(0, c, 0, c + 1), edge(g.h - 1, c, g.h - 1, c + 1);
+                for (int r = 0; r + 1 < g.h; r++) edge(r, 0, r + 1, 0), edge(r, g.w - 1, r + 1, g.w - 1);
             }
         }
         if (ent.brushes.empty() && e != 0) {
