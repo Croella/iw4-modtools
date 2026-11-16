@@ -209,11 +209,12 @@ void App::pollBake() {
     bakeResult = bakeOut;
     renderer.setLighting(bakeResult);
     meshRevision = 0;
-    char line[200];
-    std::snprintf(line, sizeof line, "Baked lighting in %.1fs: %zu faces, %dx%d luxel atlas at %.0f units/luxel%s", secs,
-                  bakeResult->faces.size(), bakeResult->width, bakeResult->height, bakeResult->luxelSize,
+    char line[400];
+    std::snprintf(line, sizeof line, "Baked lighting in %.1fs on %s: %zu faces, %dx%d luxel atlas at %.0f units/luxel%s", secs,
+                  bakeResult->device.c_str(), bakeResult->faces.size(), bakeResult->width, bakeResult->height, bakeResult->luxelSize,
                   bakeResult->env.hasSun ? "" : " (no sun)");
     log(line);
+    if (!bakeResult->gpuNote.empty()) log("  GPU bake not used: " + bakeResult->gpuNote);
     startFxPreview("after the bake");
 }
 
@@ -1349,6 +1350,8 @@ void App::drawMenu() {
         ImGui::SliderInt("Sky rays", &lightSettings.skySamples, 8, 256);
         ImGui::SetNextItemWidth(160);
         ImGui::SliderInt("Bounces", &lightSettings.bounces, 0, 3);
+        ImGui::Checkbox("Bake on the GPU", &lightSettings.gpu);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Traces the bake's rays with D3D11 compute shaders (falls back to the CPU if that fails)");
         ImGui::Separator();
         ImGui::TextDisabled("Sun/sky: worldspawn sundirection, suncolor, sunlight,");
         ImGui::TextDisabled("diffusefraction, sundiffusecolor, ambient, _color");

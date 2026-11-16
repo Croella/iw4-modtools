@@ -53,6 +53,7 @@ add_library(iw4r_core STATIC
   src/zone/zonebuild.cpp
   src/light/lightbake.cpp
   src/light/colorgrade.cpp
+  src/light/gpubake.cpp
   src/zone/skysource.cpp
   src/zone/matdefs.cpp
   src/zone/modelbuild.cpp
@@ -68,7 +69,7 @@ add_library(iw4r_core STATIC
   src/live/process.cpp
   src/live/liveimport.cpp)
 target_include_directories(iw4r_core PUBLIC src)
-target_link_libraries(iw4r_core PUBLIC miniz_lib)
+target_link_libraries(iw4r_core PUBLIC miniz_lib d3d11 dxgi d3dcompiler)
 
 add_executable(iw4radiant WIN32
   src/main.cpp

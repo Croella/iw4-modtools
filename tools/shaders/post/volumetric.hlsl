@@ -231,6 +231,59 @@ float4 psAoBlur(float2 uv : TEXCOORD0) : COLOR {
     return float4(ao, ao, ao, 1);
 }
 
+// ---- Contact shadows ---------------------------------------------------------------------------
+// Short screen-space ray march from each pixel towards the sun through the depth buffer: anything
+// standing in the way within csSun.w units (a zombie's feet on the floor, a crate on the ground,
+// the player model) darkens the pixel. Catches the small shadows the engine's shadow maps miss.
+// Uses the AO constants (c16 projection, c17 depth, c19 near/far/texel). Output r = the factor
+// the frame is multiplied by (blurred with psAoBlur first).
+float4 csSun : register(c39);   // xyz: view-space unit vector to the sun, w: march length (world units)
+float4 csParm : register(c40);  // x: intensity, y: thickness (units), z: jitter, w: 1 = show the shadow only
+
+float2 csUv(float3 Q) {
+    float2 ndc = float2(Q.x * aoProj.x / Q.z + aoProj.z, Q.y * aoProj.y / Q.z + aoProj.w);
+    return float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+}
+
+#define CS_STEPS 16
+float4 psContact(float2 uv : TEXCOORD0) : COLOR {
+    float z = aoViewZ(uv);
+    if (z >= 1e6 || z < aoFade.x) return float4(1, 1, 1, 1);
+    float3 P = aoViewPos(uv, z);
+    float2 tx = float2(aoFade.z, 0), ty = float2(0, aoFade.w);
+    float3 pr = aoViewPos(uv + tx, aoViewZ(uv + tx)), pl = aoViewPos(uv - tx, aoViewZ(uv - tx));
+    float3 pd = aoViewPos(uv + ty, aoViewZ(uv + ty)), pu = aoViewPos(uv - ty, aoViewZ(uv - ty));
+    float3 dx = abs(pr.z - z) < abs(z - pl.z) ? pr - P : P - pl;
+    float3 dy = abs(pd.z - z) < abs(z - pu.z) ? pd - P : P - pu;
+    float3 n = normalize(cross(dx, dy));
+    if (dot(n, P) > 0) n = -n;
+    float ndl = dot(n, csSun.xyz);
+    if (ndl <= 0.02) return float4(1, 1, 1, 1);  // faces away from the sun: already in shadow
+    float2 pix = uv / aoFade.zw;
+    float j = frac(52.9829189 * frac(dot(pix, float2(0.06711056, 0.00583715))) + csParm.z);
+    // Start a little off the surface so it doesn't shadow itself.
+    float3 O = P + n * (0.5 + 0.002 * z);
+    float occ = 0;
+    [unroll] for (int i = 0; i < CS_STEPS; i++) {
+        float t = (i + j) / CS_STEPS;
+        float3 Q = O + csSun.xyz * (csSun.w * t * t + 0.5);
+        if (Q.z < aoFade.x) break;
+        float2 q = csUv(Q);
+        if (q.x < 0 || q.x > 1 || q.y < 0 || q.y > 1) break;
+        if (dot((q - uv) / aoFade.zw, (q - uv) / aoFade.zw) < 4) continue;  // the pixel's own neighbours (depth edges)
+        float zs = aoViewZ(q);
+        if (zs < aoFade.x) continue;  // the viewmodel casts nothing
+        float dz = Q.z - zs;
+        if (dz > 0.003 * Q.z + 0.3 && dz < csParm.y) {
+            occ = 1 - t * t * 0.6;  // fades along the ray: contact is darkest
+            break;
+        }
+    }
+    float fade = saturate((aoFade.y - z) / (aoFade.y * 0.25)) * saturate(ndl * 4);
+    float f = 1 - csParm.x * occ * fade;
+    return float4(f, f, f, 1);
+}
+
 // ---- Colour grading ----------------------------------------------------------------------------
 // The whole grade (artist LUT + exposure/contrast/saturation/white balance/lift-gamma-gain) is
 // one 3D table baked by the compiler; plus a vignette.

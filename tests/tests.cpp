@@ -871,6 +871,25 @@ static void testLightingBake() {
     for (size_t i = 0; i + 2 < b.light.size(); i += 3)
         if (b.light[i] > b.light[i + 2] + 0.2f) warm = true;
     CHECK(warm);
+    // The CPU path gives the same bake (sun mask exactly, light up to sampling noise); which one
+    // ran first depends on the machine having a D3D11 GPU.
+    {
+        light::Settings sc = s;
+        sc.gpu = !s.gpu;
+        light::Bake other;
+        CHECK(light::bake(d, sc, other, err));
+        std::printf("  bake: %s / %s%s%s\n", b.device.c_str(), other.device.c_str(), b.gpuNote.empty() ? "" : " - GPU not used: ",
+                    b.gpuNote.c_str());
+        size_t sunDiff = 0;
+        for (size_t i = 0; i < b.sunVis.size() && i < other.sunVis.size(); i++) sunDiff += b.sunVis[i] != other.sunVis[i];
+        std::printf("  bake: sun mask differs at %zu of %zu samples\n", sunDiff, b.sunVis.size());
+        // Rays that graze an edge can go either way in float on the two (different FMA rounding).
+        CHECK(other.sunVis.size() == b.sunVis.size() && sunDiff * 1000 <= b.sunVis.size() && other.light.size() == b.light.size());
+        double sa = 0, sb = 0, sad = 0;
+        for (size_t i = 0; i < b.light.size() && i < other.light.size(); i++)
+            sa += b.light[i], sb += other.light[i], sad += std::fabs(b.light[i] - other.light[i]);
+        CHECK(sa > 0 && std::fabs(sa - sb) / sa < 0.02 && sad / sa < 0.1);
+    }
 
     CompileOptions o;
     o.prebaked = &b;
@@ -2470,6 +2489,17 @@ static void testPostSettings() {
     CHECK(cfg.find("\nssao 1\n") != std::string::npos && cfg.find("\nssaoradius 48\n") != std::string::npos);
     CHECK(cfg.find("\ngrade 1\n") != std::string::npos && cfg.find("\nvignette 0.4\n") != std::string::npos);
     CHECK(cfg.find("\nlut 32\n") != std::string::npos);
+    CHECK(cfg.find("\ncontact 0\n") != std::string::npos);  // off by default
+    {
+        Document c = d;
+        c.ents[0].set("volumetric_contact", "1");
+        c.ents[0].set("volumetric_contact_length", "1000");  // clamped to 512
+        c.ents[0].set("volumetric_contact_intensity", "0.5");
+        const Volumetric cv = readVolumetric(c);
+        CHECK(cv.contact && cv.contactLength == 512 && cv.contactIntensity == 0.5 && cv.contactThickness == 24);
+        const std::string cc = volumetricConfig(c);
+        CHECK(cc.find("\ncontact 1\ncontactparm 0.5 512 24 2500\ncontactnear 20\n") != std::string::npos);
+    }
     size_t rows = 0;
     for (size_t at = cfg.find("\nlutrow "); at != std::string::npos; at = cfg.find("\nlutrow ", at + 1)) rows++;
     CHECK(rows == 32 * 32);

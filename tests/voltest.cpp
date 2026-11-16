@@ -2,7 +2,7 @@
 // DLL (a redirected "<map>.ff" with a .volumetric next to it, a GfxViewParms in its image, a
 // full-screen R32F "floatz" target, a sky-over-ground frame) and checks that the frame it presents
 // gained light below the horizon under the sun, and that a "HUD" drawn after a 2D matrix upload
-// is left alone. Usage: iw4r_voltest <iw4r_mapload.dll> [fog|occ|ssao|grade|gradevol|dof|dofauto|flare|flareocc|glare|rain|snow|wxshelter|lights|lightsocc|lightspot]
+// is left alone. Usage: iw4r_voltest <iw4r_mapload.dll> [fog|occ|ssao|grade|gradevol|dof|dofauto|flare|flareocc|glare|rain|snow|wxshelter|lights|lightsocc|lightspot|contact]
 // (occ: an occluder triangle - a full_clip face - covering the view must stop the shafts;
 // ssao: a floor meeting a wall must darken along the crease only; grade: an all-red table must
 // turn the frame red; gradevol: a grade volume around the camera (red) applies, one elsewhere (blue)
@@ -12,7 +12,9 @@
 // pillar (only the nearest layer is in front of it); wxshelter: a trigger_weather around the camera
 // stops the rain; lights: a point light over the dark ground glows there, not on the near pillar or
 // the far corner; lightsocc: the same light straight behind the pillar adds nothing on it;
-// lightspot: a spotlight aimed up lights the air above it, not below).
+// lightspot: a spotlight aimed up lights the air above it, not below; contact: the ssao scene with
+// the sun behind the wall - the floor just in front of the wall darkens, the wall and the floor
+// further away don't).
 #include <windows.h>
 #include <d3d9.h>
 
@@ -55,7 +57,7 @@ static void makeView(float w, float h) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::printf("usage: iw4r_voltest <iw4r_mapload.dll> [fog|occ|ssao|grade|gradevol|dof|dofauto|flare|flareocc|glare|rain|snow|wxshelter|lights|lightsocc|lightspot]\n");
+        std::printf("usage: iw4r_voltest <iw4r_mapload.dll> [fog|occ|ssao|grade|gradevol|dof|dofauto|flare|flareocc|glare|rain|snow|wxshelter|lights|lightsocc|lightspot|contact]\n");
         return 2;
     }
     namespace fs = std::filesystem;
@@ -64,7 +66,8 @@ int main(int argc, char** argv) {
     std::ofstream(dir / "voltest.ff") << "x";
     const bool fogMode = argc > 2 && std::string(argv[2]) == "fog";
     const bool occMode = argc > 2 && std::string(argv[2]) == "occ";
-    const bool aoMode = argc > 2 && std::string(argv[2]) == "ssao";
+    const bool contactMode = argc > 2 && std::string(argv[2]) == "contact";
+    const bool aoMode = contactMode || (argc > 2 && std::string(argv[2]) == "ssao");
     const bool gradeMode = argc > 2 && std::string(argv[2]) == "grade";
     const bool gradeVolMode = argc > 2 && std::string(argv[2]) == "gradevol";
     const bool dofAutoMode = argc > 2 && std::string(argv[2]) == "dofauto";
@@ -124,6 +127,9 @@ int main(int argc, char** argv) {
                                                      "doffar 10 20\ndofblur 0 32\n";
     else if (dofMode)
         std::ofstream(dir / "voltest.volumetric") << "enabled 1\nsun 0.9 0 0.25\nshafts 0\ndof 1\ndofnear 0 0\ndoffar 100 200\ndofblur 0 32\n";
+    else if (contactMode)
+        std::ofstream(dir / "voltest.volumetric") << "enabled 1\nsun 0.9 0 0.25\nshafts 0\ncontact 1\ncontactparm 1 48 64 3000\n"
+                                                     "contactnear 20\n";
     else if (aoMode)
         std::ofstream(dir / "voltest.volumetric") << "enabled 1\nsun 0.9 0 0.25\nshafts 0\nssao 1\nssaoradius 32\nssaointensity 1.5\n"
                                                      "ssaonear 20\nssaofar 3000\n";
@@ -282,6 +288,8 @@ int main(int argc, char** argv) {
     const DWORD pil = px(W / 2, H - 10), hudPx = px(W / 2 - 95, H / 2 + 25);
     const DWORD aoCrease = px(W - 40, UINT(kCrease) - 3), aoCreaseFloor = px(W - 40, UINT(kCrease) + 2), aoHigh = px(W - 40, H / 8), aoFloor = px(W - 40, H - 30);
     const DWORD sky = px(W - 5, 5);
+    // contact: floor 20 units in front of the wall (view z 130) and 55 units (view z 95)
+    const DWORD csNear = px(W - 40, UINT((1 + kP5 * 30 / 130) * 0.5f * H)), csFar = px(W - 40, UINT((1 + kP5 * 30 / 95) * 0.5f * H));
     // contrast (max - min of the blue channel) over 16 px of a row
     auto contrast = [&](UINT x0, UINT y) {
         int lo = 255, hi = 0;
@@ -341,6 +349,14 @@ int main(int argc, char** argv) {
         std::printf("weather: %.2f%% of the far ground, %.2f%% of the near pillar covered by drops\n", wxGround * 100, wxPillar * 100);
         const bool ok = mode == "wxshelter" ? wxGround < 0.001 : wxGround > (mode == "snow" ? 0.012 : 0.03) && wxPillar < wxGround * 0.7;
         std::printf(ok ? "PASS: %s\n" : "FAIL: %s\n", mode == "wxshelter" ? "sheltered from the weather" : "weather drawn, behind the near pillar too");
+        return ok ? 0 : 1;
+    }
+    if (contactMode) {
+        std::printf("contact: floor by the wall %08lX, floor further out %08lX, high wall %08lX, near floor %08lX (drawn 808080)\n", csNear,
+                    csFar, aoHigh, aoFloor);
+        const bool ok = int(csNear & 0xFF) + 40 < 0x80 && int(csFar & 0xFF) >= 0x80 - 3 && int(aoHigh & 0xFF) >= 0x80 - 3 &&
+                        int(aoFloor & 0xFF) >= 0x80 - 3;
+        std::printf(ok ? "PASS: contact shadow in front of the wall only\n" : "FAIL: contact\n");
         return ok ? 0 : 1;
     }
     if (aoMode) {

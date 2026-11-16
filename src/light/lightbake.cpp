@@ -10,6 +10,7 @@
 #include <mutex>
 #include <thread>
 
+#include "light/gpubake.h"
 #include "zone/clipmap.h"
 #include "zone/gfxworld.h"
 
@@ -315,6 +316,123 @@ bool sunVisible(const Scene& sc, const Environment& env, const Vec3& p) {
     return sc.tris[h.tri].sky;
 }
 
+// The ray work of the bake on the GPU (gpubake.h): sun mask, direct light, sky + bounce rounds,
+// with the same sample points as the CPU passes. False (with a reason) to fall back to the CPU.
+bool gpuPasses(const std::vector<LitFace>& lit, Scene& scene, const Environment& env, const std::vector<PointLight>& lights,
+               const Settings& settings, double ls, int W, Bake& out, std::vector<float>& indirect, Progress* progress, std::string& why) {
+    gpubake::Context gpu;
+    std::string device;
+    if (!gpu.init(device, why)) return false;
+    std::vector<gpubake::Tri> tris(scene.tris.size());
+    for (size_t i = 0; i < tris.size(); i++) {
+        const Tri& t = scene.tris[i];
+        tris[i] = {{t.a.x, t.a.y, t.a.z}, {t.e1.x, t.e1.y, t.e1.z}, {t.e2.x, t.e2.y, t.e2.z}, t.face, t.sky ? 1 : 0};
+    }
+    std::vector<gpubake::Node> nodes(scene.nodes.size());
+    for (size_t i = 0; i < nodes.size(); i++) {
+        const Node& n = scene.nodes[i];
+        nodes[i] = {{n.mn[0], n.mn[1], n.mn[2]}, n.start, {n.mx[0], n.mx[1], n.mx[2]}, n.count};
+    }
+    std::vector<gpubake::Map> maps(scene.maps.size());
+    for (size_t i = 0; i < maps.size(); i++) {
+        const FaceMap& m = scene.maps[i];
+        maps[i] = {m.x, m.y, m.w, m.h, m.axisU, m.axisV, static_cast<float>(m.minU), static_cast<float>(m.minV)};
+    }
+    if (!gpu.setScene(tris, nodes, maps, W, static_cast<float>(ls), why)) return false;
+    struct TickCtx {
+        Progress* p;
+        float from, to;
+    } tc{progress, 0, 0};
+    auto tick = [](void* u, float f) -> bool {
+        auto* t = static_cast<TickCtx*>(u);
+        if (!t->p) return true;
+        if (t->p->cancel) return false;
+        t->p->fraction = t->from + (t->to - t->from) * f;
+        return true;
+    };
+    auto sample = [](const Vec3& p, const Vec3& n) {
+        return gpubake::Sample{{static_cast<float>(p.x), static_cast<float>(p.y), static_cast<float>(p.z)},
+                               {static_cast<float>(n.x), static_cast<float>(n.y), static_cast<float>(n.z)}};
+    };
+
+    // Sun mask (2x density): only samples facing the sun are traced, the rest stay 0.
+    std::vector<gpubake::Sample> sunS;
+    std::vector<size_t> sunAt;
+    for (const LitFace& lf : lit) {
+        const FaceMap& m = lf.map;
+        const Vec3& n = lf.face.normal;
+        if (!env.hasSun || dot(n, env.sunDir) <= 0) continue;
+        for (int y = 0; y < m.h * 2; y++)
+            for (int x = 0; x < m.w * 2; x++) {
+                const Vec3 p = facePoint(lf, m.minU + (x + 0.5) * ls * 0.5, m.minV + (y + 0.5) * ls * 0.5, ls * 0.05) + n * kRayOffset;
+                sunS.push_back(sample(p, n));
+                sunAt.push_back(static_cast<size_t>(m.y * 2 + y) * (W * 2) + (m.x * 2 + x));
+            }
+    }
+    const float sd[3] = {static_cast<float>(env.sunDir.x), static_cast<float>(env.sunDir.y), static_cast<float>(env.sunDir.z)};
+    std::vector<uint8_t> vis;
+    tc.from = 0.0f, tc.to = 0.1f;
+    if (!gpu.sun(sunS, sd, vis, tick, &tc, why)) return false;
+    for (size_t i = 0; i < sunAt.size(); i++) out.sunVis[sunAt[i]] = vis[i];
+
+    // Luxel samples: direct light = sun (from the mask) + the lights.
+    std::vector<gpubake::Sample> lux;
+    std::vector<size_t> luxAt;
+    std::vector<double> luxNdl;
+    for (const LitFace& lf : lit) {
+        const FaceMap& m = lf.map;
+        const Vec3& n = lf.face.normal;
+        const double ndlSun = std::max(0.0, dot(n, env.sunDir));
+        for (int y = 0; y < m.h; y++)
+            for (int x = 0; x < m.w; x++) {
+                const Vec3 p = facePoint(lf, m.minU + (x + 0.5) * ls, m.minV + (y + 0.5) * ls, ls * 0.05) + n * kRayOffset;
+                lux.push_back(sample(p, n));
+                luxAt.push_back(static_cast<size_t>(m.y + y) * W + (m.x + x));
+                luxNdl.push_back(ndlSun);
+            }
+    }
+    std::vector<gpubake::Light> gl;
+    for (const PointLight& L : lights) {
+        if (!L.bake) continue;
+        gpubake::Light g{};
+        g.pos[0] = static_cast<float>(L.origin.x), g.pos[1] = static_cast<float>(L.origin.y), g.pos[2] = static_cast<float>(L.origin.z);
+        g.radius = static_cast<float>(L.radius);
+        g.color[0] = static_cast<float>(L.color.x), g.color[1] = static_cast<float>(L.color.y), g.color[2] = static_cast<float>(L.color.z);
+        g.spot = L.spot ? 1.0f : 0.0f;
+        g.dir[0] = static_cast<float>(L.spotDir.x), g.dir[1] = static_cast<float>(L.spotDir.y), g.dir[2] = static_cast<float>(L.spotDir.z);
+        g.cosOuter = static_cast<float>(L.cosOuter);
+        g.cosInner = static_cast<float>(L.cosInner);
+        gl.push_back(g);
+    }
+    std::vector<float> lrgb;
+    tc.from = 0.1f, tc.to = 0.3f;
+    if (!gpu.lights(lux, gl, lrgb, tick, &tc, why)) return false;
+    for (size_t i = 0; i < lux.size(); i++) {
+        const size_t px = luxAt[i];
+        const size_t y = px / W, x = px % W;
+        const size_t s0 = (y * 2) * (W * 2) + x * 2;
+        const double v = (out.sunVis[s0] + out.sunVis[s0 + 1] + out.sunVis[s0 + W * 2] + out.sunVis[s0 + W * 2 + 1]) / (4.0 * 255.0);
+        for (int k = 0; k < 3; k++) scene.direct[px * 3 + k] = static_cast<float>(env.sunColor[k] * (v * luxNdl[i]) + lrgb[i * 3 + k]);
+    }
+
+    // Sky + bounce rounds, each gathering from direct + the previous round's indirect.
+    std::vector<float> source = scene.direct;
+    const float sky[3] = {static_cast<float>(env.skyColor.x), static_cast<float>(env.skyColor.y), static_cast<float>(env.skyColor.z)};
+    const int rounds = std::max(1, settings.bounces);
+    for (int round = 0; round < rounds; round++) {
+        std::vector<float> g;
+        tc.from = 0.3f + 0.7f * round / rounds, tc.to = 0.3f + 0.7f * (round + 1) / rounds;
+        if (!gpu.gather(lux, source, sky, std::max(1, settings.skySamples), static_cast<float>(settings.albedo), settings.bounces > 0,
+                        static_cast<uint32_t>(round * 104729 + 1), g, tick, &tc, why))
+            return false;
+        for (size_t i = 0; i < lux.size(); i++)
+            for (int k = 0; k < 3; k++) indirect[luxAt[i] * 3 + k] = g[i * 3 + k];
+        for (size_t i = 0; i < source.size(); i++) source[i] = scene.direct[i] + indirect[i];
+    }
+    out.device = device;
+    return true;
+}
+
 // Runs fn(i) for i in [0, n) on all cores; returns false if cancelled.
 template <class Fn>
 bool parallelFor(size_t n, Progress* progress, float from, float to, Fn fn) {
@@ -546,6 +664,12 @@ Volumetric readVolumetric(const Document& doc) {
     v.ssaoBias = std::clamp(num("ssao_bias", v.ssaoBias), 0.0, 0.95);
     v.ssaoNear = std::max(0.0, num("ssao_near", v.ssaoNear));
     v.ssaoDistance = std::max(v.ssaoNear + 1, num("ssao_distance", v.ssaoDistance));
+    v.contact = num("contact", 0) != 0 && env.hasSun;
+    v.contactIntensity = std::clamp(num("contact_intensity", v.contactIntensity), 0.0, 1.0);
+    v.contactLength = std::clamp(num("contact_length", v.contactLength), 1.0, 512.0);
+    v.contactThickness = std::max(1.0, num("contact_thickness", v.contactThickness));
+    v.contactNear = std::max(0.0, num("contact_near", v.contactNear));
+    v.contactDistance = std::max(v.contactNear + 64, num("contact_distance", v.contactDistance));
     // Colour grading: worldspawn is the base; trigger_grade volumes inherit it (or neutral when the
     // base is off) and override what they set.
     v.grade = num("grade", 0) != 0;
@@ -689,6 +813,9 @@ std::string volumetricConfig(const Document& doc) {
     out += buf;
     std::snprintf(buf, sizeof buf, "// ambient occlusion\nssao %d\nssaoradius %g\nssaointensity %g\nssaobias %g\nssaonear %g\nssaofar %g\n",
                   v.ssao ? 1 : 0, v.ssaoRadius, v.ssaoIntensity, v.ssaoBias, v.ssaoNear, v.ssaoDistance);
+    out += buf;
+    std::snprintf(buf, sizeof buf, "// contact shadows\ncontact %d\ncontactparm %g %g %g %g\ncontactnear %g\n", v.contact ? 1 : 0,
+                  v.contactIntensity, v.contactLength, v.contactThickness, v.contactDistance, v.contactNear);
     out += buf;
     std::snprintf(buf, sizeof buf,
                   "// depth of field\ndof %d\ndofnear %g %g\ndoffar %g %g\ndofblur %g %g\ndofweapon %g\ndofauto %d\ndofautospeed %g\n",
@@ -1007,6 +1134,25 @@ bool bake(const Document& doc, const Settings& settings, Bake& out, std::string&
     scene->direct.assign(static_cast<size_t>(W) * H * 3, 0.0f);
     for (const LitFace& lf : lit) scene->maps.push_back(lf.map);
 
+    // GPU first (same rays, much faster); the CPU passes below are the fallback.
+    std::vector<float> indirect(out.light.size(), 0.0f);
+    bool gpuDone = false;
+    if (settings.gpu) {
+        std::string why;
+        gpuDone = gpuPasses(lit, *scene, env, lights, settings, ls, W, out, indirect, progress, why);
+        if (!gpuDone) {
+            if (progress && progress->cancel) {
+                error = "cancelled";
+                return false;
+            }
+            out.gpuNote = why;
+            std::fill(out.sunVis.begin(), out.sunVis.end(), uint8_t(0));
+            std::fill(scene->direct.begin(), scene->direct.end(), 0.0f);
+            std::fill(indirect.begin(), indirect.end(), 0.0f);
+        }
+    }
+    if (!gpuDone) {
+    out.device = "CPU (" + std::to_string(std::max(1u, std::thread::hardware_concurrency())) + " threads)";
     // Pass 1: sun visibility at 2x density, then direct light (sun + point lights) per luxel.
     const bool sun = env.hasSun;
     auto pass1 = [&](size_t fi) {
@@ -1042,7 +1188,7 @@ bool bake(const Document& doc, const Settings& settings, Bake& out, std::string&
 
     // Pass 2+: sky dome and bounce, gathered with cosine-weighted hemisphere rays. Each bounce
     // re-gathers from (direct + previous indirect).
-    std::vector<float> source = scene->direct, indirect(out.light.size(), 0.0f);
+    std::vector<float> source = scene->direct;
     const int samples = std::max(1, settings.skySamples);
     const int rounds = std::max(1, settings.bounces);
     for (int round = 0; round < rounds; round++) {
@@ -1086,6 +1232,7 @@ bool bake(const Document& doc, const Settings& settings, Bake& out, std::string&
         }
         for (size_t i = 0; i < source.size(); i++) source[i] = scene->direct[i] + indirect[i];
     }
+    }  // CPU passes
 
     // Final non-sun light: ambient + point lights + sky/bounce. (Direct sun stays out: the game
     // adds it in real time through the sun primary light and the visibility mask.)

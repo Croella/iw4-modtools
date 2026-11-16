@@ -27,6 +27,7 @@ struct Settings {
     int bounces = 1;        // 0 = direct + sky only
     double albedo = 0.45;   // assumed surface reflectance for bounce light
     int maxAtlas = 1024;    // max luxel atlas width/height (luxelSize grows until the map fits)
+    bool gpu = true;        // trace on the GPU (D3D11 compute) when there is one; else / on failure the CPU
     // Unlit see-through materials (additive effects such as atmos_particles_dust), lower-case
     // editor names: they neither block light nor get a lightmap.
     std::set<std::string> unlitMaterials;
@@ -58,6 +59,11 @@ Environment readEnvironment(const Document& doc);
 // Ambient occlusion (SSAO, from the depth buffer): volumetric_ssao (1 = on), volumetric_ssao_radius
 // (world units), _ssao_intensity, _ssao_bias (0..1: ignores flatter creases), _ssao_near (no AO
 // closer than this: keeps it off the first-person weapon), _ssao_distance (fades out by here).
+// Contact shadows (short screen-space sun shadows: feet on the floor, props on the ground, which
+// the engine's shadow maps miss): volumetric_contact (1 = on), _contact_intensity (0..1, 0.6),
+// _contact_length (how far each pixel looks towards the sun, units, 32), _contact_thickness
+// (how deep an occluder is assumed to be, 24), _contact_distance (fades out by here, 2500),
+// _contact_near (nothing closer: the viewmodel, 20). Needs the sun.
 // Colour grading: volumetric_grade (1 = on), volumetric_grade_exposure (stops), _grade_contrast,
 // _grade_saturation, _grade_temperature (-1 cool .. 1 warm), _grade_tint (-1 green .. 1 magenta),
 // _grade_lift / _grade_gamma / _grade_gain "r g b", _grade_vignette (0..1), _grade_lut <name>
@@ -111,6 +117,8 @@ struct Volumetric {
     bool enabled = false, hasSun = true, shafts = true, fog = false;
     bool ssao = false, grade = false;
     double ssaoRadius = 64, ssaoIntensity = 1.5, ssaoBias = 0.1, ssaoNear = 20, ssaoDistance = 3000;
+    bool contact = false;
+    double contactIntensity = 0.6, contactLength = 32, contactThickness = 24, contactDistance = 2500, contactNear = 20;
     GradeParams gradeParams;
     double vignette = 0;
     std::string gradeLutName;                  // worldspawn value
@@ -196,6 +204,8 @@ struct Bake {
     Environment env;
     uint64_t docRevision = 0;
     uint64_t sceneHash = 0;  // light::sceneHash of the baked document
+    std::string device;      // what traced the rays: the GPU adapter's name, or "CPU (n threads)"
+    std::string gpuNote;     // why the GPU wasn't used, when it was asked for and the CPU did the work
     std::shared_ptr<const Scene> scene;
 
     const FaceMap* find(const Face& f) const;

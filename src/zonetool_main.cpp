@@ -9,6 +9,7 @@
 // rebuild never touches the input or any game file; it writes only <out.ff>, so it's safe to
 // point at a copy of a zone and compare the result, or drop the rebuilt file in to test loading.
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -134,6 +135,50 @@ bool verifyZone(const std::vector<uint8_t>& zoneImage) {
     return true;
 }
 
+// Bakes the map on the CPU and on the GPU and compares them: timings, and how far apart the
+// results are (sun mask exactly; light per luxel relative to the CPU's, both noisy).
+int bakeBench(const std::string& mapPath, const char* luxel) {
+    Document doc;
+    std::string err;
+    if (!loadMap(mapPath, doc, err)) {
+        std::printf("map load failed: %s\n", err.c_str());
+        return 1;
+    }
+    light::Settings s;
+    if (luxel) s.luxelSize = std::atof(luxel);
+    light::Bake cpu, gpu;
+    s.gpu = false;
+    auto t0 = std::chrono::steady_clock::now();
+    if (!light::bake(doc, s, cpu, err)) {
+        std::printf("cpu bake failed: %s\n", err.c_str());
+        return 1;
+    }
+    const double tc = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    s.gpu = true;
+    t0 = std::chrono::steady_clock::now();
+    if (!light::bake(doc, s, gpu, err)) {
+        std::printf("gpu bake failed: %s\n", err.c_str());
+        return 1;
+    }
+    const double tg = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("atlas %dx%d at %g units/luxel, %zu faces\n", cpu.width, cpu.height, cpu.luxelSize, cpu.faces.size());
+    std::printf("cpu: %.2fs on %s\n", tc, cpu.device.c_str());
+    std::printf("gpu: %.2fs on %s%s%s\n", tg, gpu.device.c_str(), gpu.gpuNote.empty() ? "" : " - GPU not used: ", gpu.gpuNote.c_str());
+    if (gpu.width != cpu.width || gpu.height != cpu.height || gpu.light.size() != cpu.light.size()) {
+        std::printf("FAIL: different atlases\n");
+        return 1;
+    }
+    size_t sunDiff = 0;
+    for (size_t i = 0; i < cpu.sunVis.size(); i++) sunDiff += cpu.sunVis[i] != gpu.sunVis[i];
+    double sc = 0, sg = 0, sad = 0;
+    for (size_t i = 0; i < cpu.light.size(); i++) sc += cpu.light[i], sg += gpu.light[i], sad += std::fabs(cpu.light[i] - gpu.light[i]);
+    const double meanRel = sc > 0 ? (sg - sc) / sc : 0, madRel = sc > 0 ? sad / sc : 0;
+    std::printf("sun mask: %zu of %zu samples differ (%.3f%%)\n", sunDiff, cpu.sunVis.size(), 100.0 * sunDiff / std::max<size_t>(1, cpu.sunVis.size()));
+    std::printf("light: total %+.2f%% vs cpu, mean abs difference %.2f%% of the mean (sampling noise)\n", 100 * meanRel, 100 * madRel);
+    std::printf("speed-up: %.1fx\n", tg > 0 ? tc / tg : 0.0);
+    return 0;
+}
+
 int verify(const std::string& path) {
     std::vector<uint8_t> file;
     if (!readFile(path, file)) {
@@ -153,6 +198,7 @@ int verify(const std::string& path) {
 // Game the live* commands read / compile targets: nullptr = default (live: whichever of iw4mp/iw4sp
 // is running; compile: MP). --mp / --sp force one.
 const char* gLiveGame = nullptr;
+bool gCpuBake = false;  // --cpubake: light bake on the CPU only
 
 int compile(const std::string& mapPath, const std::string& outPath) {
     const MapTarget target = gLiveGame && std::string(gLiveGame) == "iw4sp.exe" ? MapTarget::SP : MapTarget::MP;
@@ -177,6 +223,7 @@ int compile(const std::string& mapPath, const std::string& outPath) {
     options.zoneSourceDir = zoneSourcePath(mapPath);
     std::vector<std::string> warnings;
     options.warnings = &warnings;
+    options.light.gpu = !gCpuBake;
     bool compiled = compileMapToFastfile(doc, mapName, ff, err, target, options);
     for (const std::string& w : warnings) std::printf("warning: %s\n", w.c_str());
     if (!compiled) {
@@ -901,12 +948,14 @@ int main(int argc, char** argv) {
         std::string a = argv[i];
         if (a == "--mp") gLiveGame = "iw4mp.exe";
         else if (a == "--sp") gLiveGame = "iw4sp.exe";
+        else if (a == "--cpubake") gCpuBake = true;
         else argv[n++] = argv[i];
     }
     argc = n;
     if (argc >= 3 && std::string(argv[1]) == "info") return info(argv[2]);
     if (argc >= 4 && std::string(argv[1]) == "rebuild") return rebuild(argv[2], argv[3]);
     if (argc >= 4 && std::string(argv[1]) == "compile") return compile(argv[2], argv[3]);
+    if (argc >= 3 && std::string(argv[1]) == "bakebench") return bakeBench(argv[2], argc >= 4 ? argv[3] : nullptr);
     if (argc >= 3 && std::string(argv[1]) == "verify") return verify(argv[2]);
     if (argc >= 3 && std::string(argv[1]) == "dump") return dump(argv[2], argc >= 4 ? argv[3] : ".");
     if (argc >= 3 && std::string(argv[1]) == "import") return importMap(argv[2], argc >= 4 ? argv[3] : "");

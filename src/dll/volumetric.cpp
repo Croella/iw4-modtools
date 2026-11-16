@@ -59,6 +59,9 @@ struct Settings {
     // Ambient occlusion (off unless "ssao 1").
     bool ssao = false;
     float ssaoRadius = 64, ssaoIntensity = 1.5f, ssaoBias = 0.1f, ssaoNear = 20, ssaoFar = 3000;
+    // Contact shadows (off unless "contact 1"): short screen-space shadows towards the sun.
+    bool contact = false;
+    float contactIntensity = 0.6f, contactLength = 32, contactThickness = 24, contactDistance = 2500, contactNear = 20;
     // Colour grading: a baked RGB8 table ("lut <size>" + size*size "lutrow <b> <g> <hex rgb...>" lines).
     bool grade = false;
     float vignette = 0;
@@ -229,6 +232,11 @@ bool readSettings(const std::string& path, Settings& s) {
         else if (is("ssaobias")) s.ssaoBias = std::max(0.0f, std::min(0.95f, v[0]));
         else if (is("ssaonear")) s.ssaoNear = std::max(0.0f, v[0]);
         else if (is("ssaofar")) s.ssaoFar = std::max(1.0f, v[0]);
+        else if (is("contact")) s.contact = v[0] != 0;
+        else if (is("contactparm") && n >= 5)
+            s.contactIntensity = std::max(0.0f, std::min(1.0f, v[0])), s.contactLength = std::max(1.0f, std::min(512.0f, v[1])),
+            s.contactThickness = std::max(1.0f, v[2]), s.contactDistance = std::max(64.0f, v[3]);
+        else if (is("contactnear")) s.contactNear = std::max(0.0f, v[0]);
         else if (is("grade")) s.grade = v[0] != 0;
         else if (is("dof")) s.dof = v[0] != 0;
         else if (is("dofnear") && n >= 3) s.dofNear[0] = std::max(0.0f, v[0]), s.dofNear[1] = std::max(0.0f, v[1]);
@@ -608,7 +616,7 @@ struct Gpu {
     IDirect3DTexture9* depth = nullptr;   // INTZ texture standing in for the game's depth buffer
     IDirect3DTexture9* ao[2] = {};        // full-res AO + blur ping-pong
     IDirect3DSurface9* aoS[2] = {};
-    IDirect3DPixelShader9 *psAo = nullptr, *psAoBlur = nullptr, *psGrade = nullptr;
+    IDirect3DPixelShader9 *psAo = nullptr, *psAoBlur = nullptr, *psGrade = nullptr, *psContact = nullptr;
     IDirect3DPixelShader9 *psDofFocus = nullptr, *psDofDown = nullptr, *psDofBlur = nullptr, *psDofComp = nullptr;
     IDirect3DTexture9* focus[2] = {};  // 1x1 R32F auto-focus distance, ping-pong (this frame / last)
     IDirect3DSurface9* focusS[2] = {};
@@ -677,6 +685,7 @@ bool createShaders(IDirect3DDevice9* d) {
               SUCCEEDED(d->CreatePixelShader(reinterpret_cast<const DWORD*>(volumetric_psBlack), &g.psBlack)) &&
               SUCCEEDED(d->CreatePixelShader(reinterpret_cast<const DWORD*>(volumetric_psAo), &g.psAo)) &&
               SUCCEEDED(d->CreatePixelShader(reinterpret_cast<const DWORD*>(volumetric_psAoBlur), &g.psAoBlur)) &&
+              SUCCEEDED(d->CreatePixelShader(reinterpret_cast<const DWORD*>(volumetric_psContact), &g.psContact)) &&
               SUCCEEDED(d->CreatePixelShader(reinterpret_cast<const DWORD*>(volumetric_psGrade), &g.psGrade)) &&
               SUCCEEDED(d->CreatePixelShader(reinterpret_cast<const DWORD*>(volumetric_psDofFocus), &g.psDofFocus)) &&
               SUCCEEDED(d->CreatePixelShader(reinterpret_cast<const DWORD*>(volumetric_psDofDown), &g.psDofDown)) &&
@@ -753,7 +762,7 @@ struct Bindings {
     IDirect3DVertexShader9* vs = nullptr;
     IDirect3DPixelShader9* ps = nullptr;
     IDirect3DBaseTexture9* tex[5] = {};
-    float vsc[6 * 4] = {}, psc[39 * 4] = {};
+    float vsc[6 * 4] = {}, psc[41 * 4] = {};
 } g_saved;
 
 void saveBindings(IDirect3DDevice9* d) {
@@ -766,7 +775,7 @@ void saveBindings(IDirect3DDevice9* d) {
     d->GetPixelShader(&b.ps);
     for (DWORD i = 0; i < 5; i++) d->GetTexture(i, &b.tex[i]);
     d->GetVertexShaderConstantF(0, b.vsc, 6);
-    d->GetPixelShaderConstantF(0, b.psc, 39);
+    d->GetPixelShaderConstantF(0, b.psc, 41);
 }
 
 void restoreBindings(IDirect3DDevice9* d) {
@@ -779,7 +788,7 @@ void restoreBindings(IDirect3DDevice9* d) {
     d->SetPixelShader(b.ps);
     for (DWORD i = 0; i < 5; i++) d->SetTexture(i, b.tex[i]);
     d->SetVertexShaderConstantF(0, b.vsc, 6);
-    d->SetPixelShaderConstantF(0, b.psc, 39);
+    d->SetPixelShaderConstantF(0, b.psc, 41);
     rel(b.vb);
     rel(b.ib);
     rel(b.decl);
@@ -952,6 +961,97 @@ bool aoPass(IDirect3DDevice9* d, const Settings& s, const ViewParms& vp, IDirect
         char line[160];
         std::snprintf(line, sizeof line, "ssao: on (%s depth), radius %g, intensity %g, P0 %g P5 %g", intz ? "INTZ" : "floatz", s.ssaoRadius,
                       s.ssaoIntensity, vp.p[0], vp.p[5]);
+        log(line);
+    }
+    return true;
+}
+
+// Contact shadows: a short march towards the sun per pixel (g.ao[0]), blurred across and down
+// (reusing psAoBlur) and multiplied into `bb`.
+bool contactPass(IDirect3DDevice9* d, const Settings& s, const ViewParms& vp, IDirect3DSurface9* bb) {
+    IDirect3DBaseTexture9* depthTex = g.depth ? static_cast<IDirect3DBaseTexture9*>(g.depth) : g.floatz;
+    if (!depthTex) return false;
+    for (int i = 0; i < 2; i++) {
+        if (g.ao[i]) continue;
+        if (FAILED(d->CreateTexture(g.w, g.h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &g.ao[i], nullptr))) {
+            log("contact shadows: couldn't create their render targets; off");
+            return false;
+        }
+        g.ao[i]->GetSurfaceLevel(0, &g.aoS[i]);
+    }
+    // The sun in view space: the view basis in world space from the corner rays (view z = 1), then
+    // solve world = X*ax + Y*ay + Z*fz for (X, Y, Z).
+    const float* VP = vp.vp;
+    float r00[3], r10[3], r01[3];
+    const float c00[3] = {-1, 1, 1}, c10[3] = {1, 1, 1}, c01[3] = {-1, -1, 1};
+    if (!solveClip(VP, c00, r00) || !solveClip(VP, c10, r10) || !solveClip(VP, c01, r01)) return false;
+    float ax[3], ay[3], fz[3];
+    for (int k = 0; k < 3; k++) {
+        const float rx = r10[k] - r00[k], ry = r01[k] - r00[k];
+        ax[k] = rx * vp.p[0] * 0.5f;
+        ay[k] = -ry * vp.p[5] * 0.5f;
+        fz[k] = r00[k] + (1 + vp.p[8]) * 0.5f * rx + (1 - vp.p[9]) * 0.5f * ry;
+    }
+    const float m[3][3] = {{ax[0], ay[0], fz[0]}, {ax[1], ay[1], fz[1]}, {ax[2], ay[2], fz[2]}};
+    auto det3 = [](const float a[3][3]) {
+        return a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) +
+               a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+    };
+    const float det = det3(m);
+    if (std::fabs(det) < 1e-12f) return false;
+    float sv[3];
+    for (int k = 0; k < 3; k++) {
+        float a[3][3];
+        std::memcpy(a, m, sizeof a);
+        for (int j = 0; j < 3; j++) a[j][k] = s.sun[j];
+        sv[k] = det3(a) / det;
+    }
+    const float sl = std::sqrt(sv[0] * sv[0] + sv[1] * sv[1] + sv[2] * sv[2]);
+    if (sl < 1e-6f) return false;
+    const bool intz = g.depth != nullptr;
+    const bool only = s.debug == 6;
+    static unsigned frame = 0;
+    frame++;
+    const float cProj[4] = {vp.p[0], vp.p[5], vp.p[8], vp.p[9]};
+    const float cDepth[4] = {vp.p[10], vp.p[14], intz ? 1.0f : 2.0f, s.skyDepth};
+    const float cFade[4] = {s.contactNear, s.contactDistance, 1.0f / g.w, 1.0f / g.h};
+    const float cSun[4] = {sv[0] / sl, sv[1] / sl, sv[2] / sl, s.contactLength};
+    const float cParm[4] = {s.contactIntensity, s.contactThickness, std::fmod(frame * 0.618034f, 1.0f), only ? 1.0f : 0.0f};
+    d->SetPixelShaderConstantF(16, cProj, 1);
+    d->SetPixelShaderConstantF(17, cDepth, 1);
+    d->SetPixelShaderConstantF(19, cFade, 1);
+    d->SetPixelShaderConstantF(39, cSun, 1);
+    d->SetPixelShaderConstantF(40, cParm, 1);
+    sampler(d, 2, depthTex, false);
+    setTarget(d, g.aoS[0], g.w, g.h);
+    d->SetPixelShader(g.psContact);
+    quad(d, g.w, g.h);
+    const float bx[4] = {1.5f / g.w, 0, 0, 0}, by[4] = {0, 1.5f / g.h, 0, 0};
+    setTarget(d, g.aoS[1], g.w, g.h);
+    sampler(d, 0, g.ao[0], false);
+    d->SetPixelShaderConstantF(20, bx, 1);
+    d->SetPixelShader(g.psAoBlur);
+    quad(d, g.w, g.h);
+    setTarget(d, bb, g.w, g.h);
+    sampler(d, 0, g.ao[1], false);
+    d->SetPixelShaderConstantF(20, by, 1);
+    d->SetRenderState(D3DRS_ALPHABLENDENABLE, only ? FALSE : TRUE);  // frame * shadow
+    d->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ZERO);
+    d->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_SRCCOLOR);
+    d->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
+    d->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+    d->SetRenderState(D3DRS_COLORWRITEENABLE, 0x7);
+    quad(d, g.w, g.h);
+    d->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+    d->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    sampler(d, 0, nullptr, false);
+    sampler(d, 2, nullptr, false);
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        char line[160];
+        std::snprintf(line, sizeof line, "contact shadows: on (%s depth), length %g, intensity %g, view-space sun %.2f %.2f %.2f",
+                      intz ? "INTZ" : "floatz", s.contactLength, s.contactIntensity, sv[0] / sl, sv[1] / sl, sv[2] / sl);
         log(line);
     }
     return true;
@@ -1457,6 +1557,7 @@ void render(IDirect3DDevice9* d, const Settings& s, IDirect3DSurface9* bb) {
     }
     IDirect3DBaseTexture9* aoDepthTex = g.depth ? static_cast<IDirect3DBaseTexture9*>(g.depth) : g.floatz;
     const bool aoOn = s.ssao && aoDepthTex;
+    const bool contactOn = s.contact && aoDepthTex && s.contactIntensity > 0 && (s.debug == 0 || s.debug == 6);
     if (s.ssao && !aoDepthTex && !g.aoNoDepthLogged) {
         g.aoNoDepthLogged = true;
         log("ssao: no depth yet (the game made its depth buffer before the DLL loaded); run vid_restart once");
@@ -1477,7 +1578,7 @@ void render(IDirect3DDevice9* d, const Settings& s, IDirect3DSurface9* bb) {
     const float shelter = s.weather ? weatherShelter(s, eyeNow) : 0.0f;
     const bool wxOn = s.weather && aoDepthTex && shelter > 0.001f && s.wxIntensity > 0 && s.debug == 0;
     const bool lightsOn = s.lights && s.lightList && aoDepthTex && s.lightsIntensity > 0 && s.debug == 0;
-    if (!shaftsOn && !fogOn && !aoOn && !gradeOn && !dofOn && !flareOn && !glareOn && !wxOn && !lightsOn) {
+    if (!shaftsOn && !fogOn && !aoOn && !gradeOn && !dofOn && !flareOn && !glareOn && !wxOn && !lightsOn && !contactOn) {
         bb->Release();
         return;
     }
@@ -1552,6 +1653,13 @@ void render(IDirect3DDevice9* d, const Settings& s, IDirect3DSurface9* bb) {
     };
     if (aoOn && aoPass(d, s, vp, bb)) {
         if (s.debug == 4) {
+            finishRender(d, oldRT, oldZ, oldVp, bb);
+            return;
+        }
+        recopy();
+    }
+    if (contactOn && contactPass(d, s, vp, bb)) {
+        if (s.debug == 6) {
             finishRender(d, oldRT, oldZ, oldVp, bb);
             return;
         }

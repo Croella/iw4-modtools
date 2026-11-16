@@ -129,7 +129,7 @@ private:
     ComPtr<ID3D11VertexShader> postVs;
     ComPtr<ID3D11PixelShader> psFog, psMask, psBlur, psComposite, psOpaque, psSolid, psAo, psAoBlur, psGrade, psDofFocus, psDofDown, psDofBlur,
         psDofComp, psFlareVis, psFlare, psGlareDown, psGlareBlur, psGlareComp, psWeather,
-        psLightScatter, psLightShaft, psLightComp;
+        psLightScatter, psLightShaft, psLightComp, psContact;
     ComPtr<ID3D11Buffer> postConstants;
     ComPtr<ID3D11BlendState> blendAlphaOnly, blendScreen, blendMultiply, blendColorOnly, blendAddColor;
     ComPtr<ID3D11Texture2D> aoTex[2];
@@ -157,7 +157,7 @@ private:
     ComPtr<ID3D11Texture2D> lacc;               // half-res accumulator of the local light shafts
     ComPtr<ID3D11RenderTargetView> laccRtv;
     ComPtr<ID3D11ShaderResourceView> laccSrv;
-    unsigned lightFrame = 0;
+    unsigned lightFrame = 0, contactFrame = 0;
     float projScale[2] = {1, 1};  // projection x/y scale (for the AO's screen radius)
     ComPtr<ID3D11DepthStencilState> depthOff;
     int viewWidth = 0, viewHeight = 0;

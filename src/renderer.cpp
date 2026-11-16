@@ -106,6 +106,9 @@ cbuffer Post : register(b0) {
     float4 lSpot;     // xyz spot direction, w cos outer (< -1.5: point light)
     float4 lMisc;     // x cos inner, y shadow strength, z jitter, w 1 = shadow pass on
     float4 lScreen;   // xy light uv, z shadow reach
+    float4 csParm;    // contact shadows: x intensity, y thickness, z jitter, w length
+    float4 csFade;    // x near, y far, z 1/width, w 1/height
+    row_major float4x4 viewProjM;
 };
 Texture2D src : register(t0);
 Texture2D<float> depthTex : register(t1);
@@ -218,6 +221,47 @@ float4 psAoBlur(V i) : SV_Target {
     }
     float ao = wsum > 0 ? sum / wsum : 1;
     return float4(ao, ao, ao, 1);
+}
+// Contact shadows: same model as iw4r_mapload.dll's (volumetric.hlsl psContact), in world space.
+#define CS_STEPS 16
+float4 psContact(V i) : SV_Target {
+    bool sky;
+    float3 P = worldAt(i.uv, sky);
+    if (sky || src.SampleLevel(lin, i.uv, 0).a < 0.5) return 1;
+    float z = length(P - eye.xyz);
+    if (z < csFade.x) return 1;
+    float2 tx = float2(csFade.z, 0), ty = float2(0, csFade.w);
+    float3 pr = worldAt(i.uv + tx), pl = worldAt(i.uv - tx), pd = worldAt(i.uv + ty), pu = worldAt(i.uv - ty);
+    float3 dx = dot(pr - P, pr - P) < dot(P - pl, P - pl) ? pr - P : P - pl;
+    float3 dy = dot(pd - P, pd - P) < dot(P - pu, P - pu) ? pd - P : P - pu;
+    float3 n = normalize(cross(dx, dy));
+    if (dot(n, P - eye.xyz) > 0) n = -n;
+    float ndl = dot(n, sun.xyz);
+    if (ndl <= 0.02) return 1;
+    float j = frac(52.9829189 * frac(dot(i.pos.xy, float2(0.06711056, 0.00583715))) + csParm.z);
+    float3 O = P + n * (0.5 + 0.002 * z);
+    float occ = 0;
+    [loop] for (int t = 0; t < CS_STEPS; t++) {
+        float f = (t + j) / CS_STEPS;
+        float3 Q = O + sun.xyz * (csParm.w * f * f + 0.5);
+        float4 c = mul(viewProjM, float4(Q, 1));
+        if (c.w < csFade.x) break;
+        float2 q = float2(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);
+        if (q.x < 0 || q.x > 1 || q.y < 0 || q.y > 1) break;
+        if (dot((q - i.uv) / csFade.zw, (q - i.uv) / csFade.zw) < 4) continue;  // the pixel's own neighbours (depth edges)
+        bool qs;
+        float3 S = worldAt(q, qs);
+        if (qs) continue;
+        float ds = length(S - eye.xyz);
+        if (ds < csFade.x) continue;
+        float dq = length(Q - eye.xyz) - ds;
+        if (dq > 0.003 * ds + 0.3 && dq < csParm.y) {
+            occ = 1 - f * f * 0.6;
+            break;
+        }
+    }
+    float fade = saturate((csFade.y - z) / (csFade.y * 0.25)) * saturate(ndl * 4);
+    return 1 - csParm.x * occ * fade;
 }
 // Depth of field: same model as iw4r_mapload.dll's (volumetric.hlsl psDof*), on the distance from
 // the camera.
@@ -481,6 +525,7 @@ struct PostConstants {
     float dofDist[4], dofBlurP[4], dofStep[4], dofAutoP[4];
     float flareSun[4], flareCol[4], flareParm[4], flareMisc[4], glareParm[4], wxParm[4], wxWind[4], wxColor[4];
     float lPos[4], lCol[4], lSpot[4], lMisc[4], lScreen[4];
+    float csParm[4], csFade[4], viewProjM[16];
 };
 
 // Inverse of a row-major 4x4 (cofactors, in double).
@@ -651,7 +696,7 @@ bool Renderer::init(ID3D11Device* device, ID3D11DeviceContext* context, std::str
                     P{"psDofDown", &psDofDown}, P{"psDofBlur", &psDofBlur}, P{"psDofComp", &psDofComp},
                     P{"psFlareVis", &psFlareVis}, P{"psFlare", &psFlare}, P{"psGlareDown", &psGlareDown}, P{"psGlareBlur", &psGlareBlur},
                     P{"psGlareComp", &psGlareComp}, P{"psWeather", &psWeather},
-                    P{"psLightScatter", &psLightScatter}, P{"psLightShaft", &psLightShaft}, P{"psLightComp", &psLightComp}}) {
+                    P{"psContact", &psContact}, P{"psLightScatter", &psLightScatter}, P{"psLightShaft", &psLightShaft}, P{"psLightComp", &psLightComp}}) {
             ComPtr<ID3DBlob> pb;
             if (!compilePost(q.entry, "ps_5_0", pb)) return false;
             dev->CreatePixelShader(pb->GetBufferPointer(), pb->GetBufferSize(), nullptr, q.out->GetAddressOf());
@@ -1468,7 +1513,8 @@ void Renderer::postProcess(const float viewProj[16], const FlyCamera& cam) {
     const float shelter = v.weather ? weatherShelter(v, cam.pos) : 0.0f;
     const bool weather = v.weather && shelter > 0.001f && v.weatherIntensity > 0 && v.debug == 0;
     const bool lights = v.lights && !v.volLights.empty() && v.lightsIntensity > 0 && v.debug == 0;
-    if (!v.fog && !shafts && !v.ssao && !grading && !dof && !flare && !glare && !weather && !lights) return;
+    const bool contact = v.contact && v.contactIntensity > 0 && (v.debug == 0 || v.debug == 6);
+    if (!v.fog && !shafts && !v.ssao && !grading && !dof && !flare && !glare && !weather && !lights && !contact) return;
     for (int k = 0; k < 3; k++) {
         pc.eye[k] = static_cast<float>(cam.pos[k]);
         pc.sun[k] = sd[k];
@@ -1503,6 +1549,14 @@ void Renderer::postProcess(const float viewProj[16], const FlyCamera& cam) {
     pc.aoFade[3] = 1.0f / std::max(1, viewHeight);
     pc.aoBlur[2] = projScale[0];
     pc.aoBlur[3] = projScale[1];
+    std::memcpy(pc.viewProjM, viewProj, sizeof pc.viewProjM);
+    {
+        const float cp[4] = {static_cast<float>(v.contactIntensity), static_cast<float>(v.contactThickness),
+                             std::fmod(++contactFrame * 0.618034f, 1.0f), static_cast<float>(v.contactLength)};
+        const float cf[4] = {static_cast<float>(v.contactNear), static_cast<float>(v.contactDistance), pc.aoFade[2], pc.aoFade[3]};
+        std::memcpy(pc.csParm, cp, sizeof cp);
+        std::memcpy(pc.csFade, cf, sizeof cf);
+    }
     pc.grade[0] = static_cast<float>(lutSize);
     pc.grade[1] = vignetteNow;
     {
@@ -1600,6 +1654,21 @@ void Renderer::postProcess(const float viewProj[16], const FlyCamera& cam) {
         upload();
         pass(colorRtv.Get(), full, psAoBlur.Get(), aoSrv[1].Get(), depthSrv.Get(), v.debug == 4 ? blendColorOnly.Get() : blendMultiply.Get());
         if (v.debug == 4) {
+            ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+            ctx->RSSetViewports(1, &full);
+            return;
+        }
+        ctx->CopyResource(sceneCopy.Get(), color.Get());
+    }
+    if (contact) {  // march towards the sun -> blur across, down (depth-aware) -> multiplied in
+        pass(aoRtv[0].Get(), full, psContact.Get(), sceneCopySrv.Get(), depthSrv.Get(), nullptr);
+        pc.aoBlur[0] = 1.5f / std::max(1, viewWidth), pc.aoBlur[1] = 0;
+        upload();
+        pass(aoRtv[1].Get(), full, psAoBlur.Get(), aoSrv[0].Get(), depthSrv.Get(), nullptr);
+        pc.aoBlur[0] = 0, pc.aoBlur[1] = 1.5f / std::max(1, viewHeight);
+        upload();
+        pass(colorRtv.Get(), full, psAoBlur.Get(), aoSrv[1].Get(), depthSrv.Get(), v.debug == 6 ? blendColorOnly.Get() : blendMultiply.Get());
+        if (v.debug == 6) {
             ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
             ctx->RSSetViewports(1, &full);
             return;
