@@ -65,7 +65,9 @@ ZoneAsset buildMapEnts(const std::string& name, const std::string& entityString)
 ZoneAsset buildAddonMapEnts(const std::string& name, const std::string& entityString);
 // withSun: primary lights {0: empty, 1: sun}, matching GfxWorld's primaryLightCount 2.
 // env: the baked map's sun (direction + linear colour) for primary light 1; nullptr = default.
-ZoneAsset buildComWorld(const std::string& name, bool withSun = false, const light::Environment* env = nullptr);
+// primaries: the map's primary spotlights (primary lights 2..), written after the sun.
+ZoneAsset buildComWorld(const std::string& name, bool withSun = false, const light::Environment* env = nullptr,
+                        const std::vector<gfx::PrimaryLight>& primaries = {});
 ZoneAsset buildGameWorldMp(const std::string& name);
 // Singleplayer game world: path nodes (zone/pathnodes), no vehicle tracks or glass.
 ZoneAsset buildGameWorldSp(const std::string& name, std::shared_ptr<const pathnodes::Graph> path = nullptr,

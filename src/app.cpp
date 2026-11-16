@@ -1350,6 +1350,9 @@ void App::drawMenu() {
         ImGui::SliderInt("Sky rays", &lightSettings.skySamples, 8, 256);
         ImGui::SetNextItemWidth(160);
         ImGui::SliderInt("Bounces", &lightSettings.bounces, 0, 3);
+        ImGui::SetNextItemWidth(160);
+        ImGui::SliderInt("Lightmap pages", &lightSettings.maxPages, 1, 8);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("1024x1024-luxel pages the bake may use before it makes the luxels bigger");
         ImGui::Checkbox("Bake on the GPU", &lightSettings.gpu);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Traces the bake's rays with D3D11 compute shaders (falls back to the CPU if that fails)");
         ImGui::Separator();

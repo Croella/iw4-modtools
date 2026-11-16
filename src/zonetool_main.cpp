@@ -135,6 +135,84 @@ bool verifyZone(const std::vector<uint8_t>& zoneImage) {
     return true;
 }
 
+// Bakes the map and writes the compiled lighting data as raw files for pictures (tools/lightviz.py):
+// each lightmap page (secondary = T over B, BGRA; primary = L8 mask), each reflection probe (the
+// stock cube bytes), light grid samples on a line through the map, and info.txt (atlas, pages,
+// faces with their rect / page / primary light / tangent frame).
+int lightViz(const std::string& mapPath, const std::string& outDir, const char* luxel, const char* pages) {
+    Document doc;
+    std::string err;
+    if (!loadMap(mapPath, doc, err)) {
+        std::printf("map load failed: %s\n", err.c_str());
+        return 1;
+    }
+    light::Settings s;
+    if (luxel) s.luxelSize = std::atof(luxel);
+    if (pages) s.maxPages = std::atoi(pages);
+    light::Bake b;
+    if (!light::bake(doc, s, b, err)) {
+        std::printf("bake failed: %s\n", err.c_str());
+        return 1;
+    }
+    gfx::GfxWorldData gw;
+    if (!gfx::buildGfxWorldData(doc, gw, err, &b, true, nullptr)) {
+        std::printf("gfx world failed: %s\n", err.c_str());
+        return 1;
+    }
+    namespace fs = std::filesystem;
+    fs::create_directories(outDir);
+    auto raw = [&](const std::string& name, const std::vector<uint8_t>& data) {
+        std::ofstream(fs::path(outDir) / name, std::ios::binary).write(reinterpret_cast<const char*>(data.data()),
+                                                                        static_cast<std::streamsize>(data.size()));
+    };
+    std::ofstream info(fs::path(outDir) / "info.txt");
+    info << "atlas " << b.width << " " << b.height << " luxel " << b.luxelSize << " device " << b.device << "\n";
+    info << "sun " << b.env.sunDir.x << " " << b.env.sunDir.y << " " << b.env.sunDir.z << " hasSun " << b.env.hasSun << "\n";
+    for (size_t p = 0; p < gw.lightmapPrimaries.size(); p++) {
+        raw("page" + std::to_string(p) + "_secondary.bin", gw.lightmapSecondaries[p].pixels);
+        raw("page" + std::to_string(p) + "_primary.bin", gw.lightmapPrimaries[p].pixels);
+        info << "page " << p << " " << gw.lightmapSecondaries[p].width << " " << gw.lightmapSecondaries[p].height / 2 << "\n";
+    }
+    for (size_t i = 0; i < gw.reflectionProbes.size(); i++) {
+        raw("probe" + std::to_string(i) + ".bin", gw.reflectionProbes[i].pixels);
+        info << "probe " << i << " " << gw.probeOrigins[i][0] << " " << gw.probeOrigins[i][1] << " " << gw.probeOrigins[i][2] << " "
+             << gw.reflectionProbes[i].width << "\n";
+    }
+    for (size_t i = 0; i < b.primaries.size(); i++)
+        info << "primarylight " << i << " " << b.primaries[i].origin.x << " " << b.primaries[i].origin.y << " " << b.primaries[i].origin.z << "\n";
+    for (const Brush& br : doc.ents[0].brushes) {
+        Brush bb = br;
+        if (!bb.rebuild()) continue;
+        for (const Face& f : bb.faces) {
+            const light::FaceMap* m = b.find(f);
+            if (!m) continue;
+            const Vec3 t = gfx::texGradientOf(f), bn = cross(f.normal, t) * gfx::binormalSignOf(f);
+            info << "face " << m->x << " " << m->y << " " << m->w << " " << m->h << " page " << m->page << " primary " << m->primary
+                 << " n " << f.normal.x << " " << f.normal.y << " " << f.normal.z << " t " << t.x << " " << t.y << " " << t.z << " b " << bn.x
+                 << " " << bn.y << " " << bn.z << " axes " << m->axisU << " " << m->axisV << " min " << m->minU << " " << m->minV << " d " << f.dist
+                 << "\n";
+        }
+    }
+    // Grid samples at the points listed in the map's "info_null" entities named "viz" (else none).
+    std::vector<Vec3> pts;
+    for (const Entity& e : doc.ents) {
+        const std::string* tn = e.find("targetname");
+        Vec3 o;
+        if (tn && *tn == "viz" && e.origin(o)) pts.push_back(o);
+    }
+    const std::vector<light::GridSample> gs = light::sampleGrid(b, pts);
+    const auto& gd = light::gridDirections();
+    for (size_t i = 0; i < gs.size(); i++) {
+        info << "grid " << pts[i].x << " " << pts[i].y << " " << pts[i].z << " primary " << gs[i].primary;
+        for (size_t k = 0; k < 56; k++) info << " " << gs[i].dir[k].x << " " << gs[i].dir[k].y << " " << gs[i].dir[k].z;
+        info << "\n";
+    }
+    for (size_t k = 0; k < 56; k++) info << "griddir " << gd[k].x << " " << gd[k].y << " " << gd[k].z << "\n";
+    std::printf("wrote %s: %zu page(s), %zu probe(s), %zu primary light(s), %zu grid point(s)\n", outDir.c_str(), gw.lightmapPrimaries.size(),
+                gw.reflectionProbes.size(), b.primaries.size(), gs.size());
+    return 0;
+}
+
 // Bakes the map on the CPU and on the GPU and compares them: timings, and how far apart the
 // results are (sun mask exactly; light per luxel relative to the CPU's, both noisy).
 int bakeBench(const std::string& mapPath, const char* luxel) {
@@ -256,7 +334,7 @@ int compile(const std::string& mapPath, const std::string& outPath) {
     std::printf("  wrote %s (%zu bytes): ComWorld, FxWorld, GfxWorld, %s, clipMap (+MapEnts, %zu entities)\n",
                 outPath.c_str(), ff.size(), target == MapTarget::SP ? "GameWorldSp" : "GameWorldMp",
                 doc.ents.size());
-    std::printf("  not yet in the zone: non-world/unknown materials (by name), spot lights, brush-entity\n"
+    std::printf("  not yet in the zone: non-world/unknown materials (by name), brush-entity\n"
                 "  submodels, patches, static models\n");
     return 0;
 }
@@ -955,6 +1033,7 @@ int main(int argc, char** argv) {
     if (argc >= 3 && std::string(argv[1]) == "info") return info(argv[2]);
     if (argc >= 4 && std::string(argv[1]) == "rebuild") return rebuild(argv[2], argv[3]);
     if (argc >= 4 && std::string(argv[1]) == "compile") return compile(argv[2], argv[3]);
+    if (argc >= 4 && std::string(argv[1]) == "lightviz") return lightViz(argv[2], argv[3], argc >= 5 ? argv[4] : nullptr, argc >= 6 ? argv[5] : nullptr);
     if (argc >= 3 && std::string(argv[1]) == "bakebench") return bakeBench(argv[2], argc >= 4 ? argv[3] : nullptr);
     if (argc >= 3 && std::string(argv[1]) == "verify") return verify(argv[2]);
     if (argc >= 3 && std::string(argv[1]) == "dump") return dump(argv[2], argc >= 4 ? argv[3] : ".");

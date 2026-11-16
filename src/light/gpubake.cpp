@@ -23,7 +23,8 @@ const char kShader[] = R"(
 struct Tri { float3 a; float3 e1; float3 e2; int face; int sky; };
 struct Node { float3 mn; int start; float3 mx; int count; };
 struct Map { int x; int y; int w; int h; int axisU; int axisV; float minU; float minV; };
-struct Sample { float3 p; float3 n; };
+struct Sample { float3 p; float3 n; int skip; };
+struct VisSample { float3 p; float3 t; int isPoint; };
 struct Light { float3 pos; float radius; float3 color; float spot; float3 dir; float cosOuter; float cosInner; float3 pad; };
 StructuredBuffer<Tri> tris : register(t0);
 StructuredBuffer<Node> nodes : register(t1);
@@ -31,8 +32,12 @@ StructuredBuffer<Map> maps : register(t2);
 StructuredBuffer<Sample> samples : register(t3);
 StructuredBuffer<float4> source : register(t4);
 StructuredBuffer<Light> lightList : register(t5);
+StructuredBuffer<VisSample> visSamples : register(t6);
 RWStructuredBuffer<float4> outRgb : register(u0);
 RWStructuredBuffer<uint> outVis : register(u1);
+RWStructuredBuffer<float4> outDir : register(u2);
+RWStructuredBuffer<float4> outSkip : register(u3);
+float lum(float3 c) { return dot(c, float3(0.3, 0.59, 0.11)); }
 cbuffer C : register(b0) {
     float3 sunDir; uint first;
     float3 sky; uint chunkEnd;
@@ -86,10 +91,16 @@ bool trace(float3 o, float3 d, float tmax, bool any, out float tHit, out int tri
 void csSun(uint3 id : SV_DispatchThreadID) {
     uint i = first + id.x;
     if (i >= chunkEnd) return;
-    Sample s = samples[i];
+    VisSample s = visSamples[i];
     float t;
     int k;
-    bool hit = trace(s.p, sunDir, 1e6, false, t, k);
+    if (s.isPoint != 0) {
+        float3 d = s.t - s.p;
+        float dist = length(d);
+        outVis[i] = (dist < 1e-6 || !trace(s.p, d / dist, dist - 1.0, true, t, k)) ? 255 : 0;
+        return;
+    }
+    bool hit = trace(s.p, s.t, 1e6, false, t, k);
     outVis[i] = (!hit || tris[k].sky != 0) ? 255 : 0;
 }
 
@@ -98,7 +109,8 @@ void csLights(uint3 id : SV_DispatchThreadID) {
     uint i = first + id.x;
     if (i >= chunkEnd) return;
     Sample s = samples[i];
-    float3 sum = 0;
+    float3 sum = 0, dsum = 0, skipSum = 0;
+    float wsum = 0;
     [loop] for (uint j = 0; j < nLights; j++) {
         Light L = lightList[j];
         float3 dv = L.pos - s.p;
@@ -118,9 +130,18 @@ void csLights(uint3 id : SV_DispatchThreadID) {
         float th;
         int tk;
         if (trace(s.p, l, dist - 1.0, true, th, tk)) continue;
-        sum += L.color * (atten * ndl);
+        float3 c = L.color * (atten * ndl);
+        if ((int)j == s.skip) {
+            skipSum += c;
+            continue;
+        }
+        sum += c;
+        dsum += l * lum(c);
+        wsum += lum(c);
     }
     outRgb[i] = float4(sum, 0);
+    outDir[i] = float4(dsum, wsum);
+    outSkip[i] = float4(skipSum, 0);
 }
 
 uint pcg(uint v) {
@@ -144,7 +165,8 @@ void csGather(uint3 id : SV_DispatchThreadID) {
     float3 b = cross(n, t);
     uint st = pcg(i ^ pcg(seed));
     int side = max(1, (int)sqrt((float)rays));
-    float3 skySum = 0, bounceSum = 0;
+    float3 skySum = 0, bounceSum = 0, dsum = 0;
+    float wsum = 0, skyW = lum(sky);
     [loop] for (uint r = 0; r < rays; r++) {
         float u1 = ((r % side) + rnd(st)) / side, u2 = (((r / side) % side) + rnd(st)) / side;
         float rr = sqrt(u1), phi = 6.28318530718 * u2;
@@ -153,6 +175,8 @@ void csGather(uint3 id : SV_DispatchThreadID) {
         int tk;
         if (!trace(s.p, dir, 1e6, false, th, tk) || tris[tk].sky != 0) {
             skySum += sky;
+            dsum += dir * skyW;
+            wsum += skyW;
         } else if (bounce != 0) {
             int f = tris[tk].face;
             if (f >= 0) {
@@ -160,11 +184,15 @@ void csGather(uint3 id : SV_DispatchThreadID) {
                 Map m = maps[f];
                 int hx = clamp((int)((axisOf(hp, m.axisU) - m.minU) / ls), 0, m.w - 1) + m.x;
                 int hy = clamp((int)((axisOf(hp, m.axisV) - m.minV) / ls), 0, m.h - 1) + m.y;
-                bounceSum += source[hy * width + hx].rgb * albedo;
+                float3 bc = source[hy * width + hx].rgb * albedo;
+                bounceSum += bc;
+                dsum += dir * lum(bc);
+                wsum += lum(bc);
             }
         }
     }
     outRgb[i] = float4((skySum + bounceSum) / max(rays, 1u), 0);
+    outDir[i] = float4(dsum, wsum) / max(rays, 1u);
 }
 )";
 
@@ -313,18 +341,19 @@ struct Context::Impl {
     }
 
     void bindScene(ID3D11ShaderResourceView* samplesSrv, ID3D11ShaderResourceView* sourceSrv, ID3D11ShaderResourceView* lightSrv,
-                   ID3D11UnorderedAccessView* rgb, ID3D11UnorderedAccessView* vis) {
-        ID3D11ShaderResourceView* srv[6] = {tris.Get(), nodes.Get(), maps.Get(), samplesSrv, sourceSrv, lightSrv};
-        ctx->CSSetShaderResources(0, 6, srv);
-        ID3D11UnorderedAccessView* uav[2] = {rgb, vis};
-        ctx->CSSetUnorderedAccessViews(0, 2, uav, nullptr);
+                   ID3D11UnorderedAccessView* rgb, ID3D11UnorderedAccessView* vis, ID3D11UnorderedAccessView* dir,
+                   ID3D11ShaderResourceView* visSrv = nullptr, ID3D11UnorderedAccessView* skip = nullptr) {
+        ID3D11ShaderResourceView* srv[7] = {tris.Get(), nodes.Get(), maps.Get(), samplesSrv, sourceSrv, lightSrv, visSrv};
+        ctx->CSSetShaderResources(0, 7, srv);
+        ID3D11UnorderedAccessView* uav[4] = {rgb, vis, dir, skip};
+        ctx->CSSetUnorderedAccessViews(0, 4, uav, nullptr);
         ctx->CSSetConstantBuffers(0, 1, cb.GetAddressOf());
     }
     void unbind() {
-        ID3D11ShaderResourceView* srv[6] = {};
-        ctx->CSSetShaderResources(0, 6, srv);
-        ID3D11UnorderedAccessView* uav[2] = {};
-        ctx->CSSetUnorderedAccessViews(0, 2, uav, nullptr);
+        ID3D11ShaderResourceView* srv[7] = {};
+        ctx->CSSetShaderResources(0, 7, srv);
+        ID3D11UnorderedAccessView* uav[4] = {};
+        ctx->CSSetUnorderedAccessViews(0, 4, uav, nullptr);
     }
 };
 
@@ -390,21 +419,23 @@ bool Context::setScene(const std::vector<Tri>& tris, const std::vector<Node>& no
            d->structured(maps.empty() ? nullptr : maps.data(), sizeof(Map), static_cast<UINT>(maps.size()), d->maps, error);
 }
 
-bool Context::sun(const std::vector<Sample>& samples, const float sunDir[3], std::vector<uint8_t>& vis, Tick tick, void* user,
-                  std::string& error) {
+bool Context::sun(const std::vector<VisSample>& samples, std::vector<uint8_t>& vis, Tick tick, void* user, std::string& error) {
     vis.assign(samples.size(), 0);
     if (samples.empty()) return true;
     const UINT n = static_cast<UINT>(samples.size());
     ComPtr<ID3D11ShaderResourceView> sSrv, none, noLights;
-    ComPtr<ID3D11Buffer> out, staging, out2, staging2;
-    ComPtr<ID3D11UnorderedAccessView> uVis, uRgb;
-    if (!d->structured(samples.data(), sizeof(Sample), n, sSrv, error) || !d->structured(nullptr, 16, 1, none, error) ||
-        !d->structured(nullptr, sizeof(Light), 1, noLights, error) || !d->output(4, n, out, uVis, staging, error) ||
-        !d->output(16, 1, out2, uRgb, staging2, error))
+    ComPtr<ID3D11Buffer> out, staging, out2, staging2, out3, staging3;
+    ComPtr<ID3D11UnorderedAccessView> uVis, uRgb, uDir;
+    ComPtr<ID3D11ShaderResourceView> noSamples;
+    ComPtr<ID3D11Buffer> out4, staging4;
+    ComPtr<ID3D11UnorderedAccessView> uSkip;
+    if (!d->structured(samples.data(), sizeof(VisSample), n, sSrv, error) || !d->structured(nullptr, 16, 1, none, error) ||
+        !d->structured(nullptr, sizeof(Light), 1, noLights, error) || !d->structured(nullptr, sizeof(Sample), 1, noSamples, error) ||
+        !d->output(4, n, out, uVis, staging, error) || !d->output(16, 1, out2, uRgb, staging2, error) ||
+        !d->output(16, 1, out3, uDir, staging3, error) || !d->output(16, 1, out4, uSkip, staging4, error))
         return false;
-    d->bindScene(sSrv.Get(), none.Get(), noLights.Get(), uRgb.Get(), uVis.Get());
+    d->bindScene(noSamples.Get(), none.Get(), noLights.Get(), uRgb.Get(), uVis.Get(), uDir.Get(), sSrv.Get(), uSkip.Get());
     Consts c{};
-    std::memcpy(c.sunDir, sunDir, sizeof c.sunDir);
     c.width = static_cast<uint32_t>(d->width);
     c.ls = d->ls;
     const bool ok = d->run(d->csSun.Get(), c, n, 1, tick, user, error);
@@ -416,19 +447,23 @@ bool Context::sun(const std::vector<Sample>& samples, const float sunDir[3], std
     return true;
 }
 
-bool Context::lights(const std::vector<Sample>& samples, const std::vector<Light>& lights, std::vector<float>& rgb, Tick tick, void* user,
-                     std::string& error) {
+bool Context::lights(const std::vector<Sample>& samples, const std::vector<Light>& lights, std::vector<float>& rgb,
+                     std::vector<float>& skipRgb, std::vector<float>& dir, Tick tick, void* user, std::string& error) {
     rgb.assign(samples.size() * 3, 0.0f);
+    skipRgb.assign(samples.size() * 3, 0.0f);
+    dir.assign(samples.size() * 4, 0.0f);
     if (samples.empty() || lights.empty()) return true;
     const UINT n = static_cast<UINT>(samples.size());
-    ComPtr<ID3D11ShaderResourceView> sSrv, none, lSrv;
-    ComPtr<ID3D11Buffer> out, staging, out2, staging2;
-    ComPtr<ID3D11UnorderedAccessView> uRgb, uVis;
+    ComPtr<ID3D11ShaderResourceView> sSrv, none, lSrv, noVis;
+    ComPtr<ID3D11Buffer> out, staging, out2, staging2, out3, staging3, out4, staging4;
+    ComPtr<ID3D11UnorderedAccessView> uRgb, uVis, uDir, uSkip;
     if (!d->structured(samples.data(), sizeof(Sample), n, sSrv, error) || !d->structured(nullptr, 16, 1, none, error) ||
         !d->structured(lights.data(), sizeof(Light), static_cast<UINT>(lights.size()), lSrv, error) ||
-        !d->output(16, n, out, uRgb, staging, error) || !d->output(4, 1, out2, uVis, staging2, error))
+        !d->output(16, n, out, uRgb, staging, error) || !d->output(4, 1, out2, uVis, staging2, error) ||
+        !d->output(16, n, out3, uDir, staging3, error) || !d->output(16, n, out4, uSkip, staging4, error) ||
+        !d->structured(nullptr, sizeof(VisSample), 1, noVis, error))
         return false;
-    d->bindScene(sSrv.Get(), none.Get(), lSrv.Get(), uRgb.Get(), uVis.Get());
+    d->bindScene(sSrv.Get(), none.Get(), lSrv.Get(), uRgb.Get(), uVis.Get(), uDir.Get(), noVis.Get(), uSkip.Get());
     Consts c{};
     c.width = static_cast<uint32_t>(d->width);
     c.ls = d->ls;
@@ -441,26 +476,31 @@ bool Context::lights(const std::vector<Sample>& samples, const std::vector<Light
     if (!d->read(out.Get(), staging.Get(), raw.data(), raw.size() * 4, error)) return false;
     for (UINT i = 0; i < n; i++)
         for (int k = 0; k < 3; k++) rgb[i * 3 + k] = raw[i * 4 + k];
-    return true;
+    if (!d->read(out4.Get(), staging4.Get(), raw.data(), raw.size() * 4, error)) return false;
+    for (UINT i = 0; i < n; i++)
+        for (int k = 0; k < 3; k++) skipRgb[i * 3 + k] = raw[i * 4 + k];
+    return d->read(out3.Get(), staging3.Get(), dir.data(), dir.size() * 4, error);
 }
 
 bool Context::gather(const std::vector<Sample>& samples, const std::vector<float>& source, const float skyColor[3], int rays, float albedo,
-                     bool bounce, uint32_t seed, std::vector<float>& rgb, Tick tick, void* user, std::string& error) {
+                     bool bounce, uint32_t seed, std::vector<float>& rgb, std::vector<float>& dir, Tick tick, void* user,
+                     std::string& error) {
     rgb.assign(samples.size() * 3, 0.0f);
+    dir.assign(samples.size() * 4, 0.0f);
     if (samples.empty()) return true;
     const UINT n = static_cast<UINT>(samples.size());
     std::vector<float> src4(source.size() / 3 * 4, 0.0f);
     for (size_t i = 0; i < source.size() / 3; i++)
         for (int k = 0; k < 3; k++) src4[i * 4 + k] = source[i * 3 + k];
     ComPtr<ID3D11ShaderResourceView> sSrv, srcSrv, noLights;
-    ComPtr<ID3D11Buffer> out, staging, out2, staging2;
-    ComPtr<ID3D11UnorderedAccessView> uRgb, uVis;
+    ComPtr<ID3D11Buffer> out, staging, out2, staging2, out3, staging3;
+    ComPtr<ID3D11UnorderedAccessView> uRgb, uVis, uDir;
     if (!d->structured(samples.data(), sizeof(Sample), n, sSrv, error) ||
         !d->structured(src4.empty() ? nullptr : src4.data(), 16, static_cast<UINT>(src4.size() / 4), srcSrv, error) ||
         !d->structured(nullptr, sizeof(Light), 1, noLights, error) || !d->output(16, n, out, uRgb, staging, error) ||
-        !d->output(4, 1, out2, uVis, staging2, error))
+        !d->output(4, 1, out2, uVis, staging2, error) || !d->output(16, n, out3, uDir, staging3, error))
         return false;
-    d->bindScene(sSrv.Get(), srcSrv.Get(), noLights.Get(), uRgb.Get(), uVis.Get());
+    d->bindScene(sSrv.Get(), srcSrv.Get(), noLights.Get(), uRgb.Get(), uVis.Get(), uDir.Get());
     Consts c{};
     std::memcpy(c.sky, skyColor, sizeof c.sky);
     c.width = static_cast<uint32_t>(d->width);
@@ -476,7 +516,7 @@ bool Context::gather(const std::vector<Sample>& samples, const std::vector<float
     if (!d->read(out.Get(), staging.Get(), raw.data(), raw.size() * 4, error)) return false;
     for (UINT i = 0; i < n; i++)
         for (int k = 0; k < 3; k++) rgb[i * 3 + k] = raw[i * 4 + k];
-    return true;
+    return d->read(out3.Get(), staging3.Get(), dir.data(), dir.size() * 4, error);
 }
 
 }  // namespace light::gpubake

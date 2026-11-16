@@ -1455,20 +1455,21 @@ ZoneAsset buildClipMap(const std::string& name, const clip::ClipMapData& cm,
 }
 
 // Load_ComWorld (0x1188a0): struct 0x18; push VIRTUAL; name; primaryLights (null); pop.
-ZoneAsset buildComWorld(const std::string& name, bool withSun, const light::Environment* env) {
+ZoneAsset buildComWorld(const std::string& name, bool withSun, const light::Environment* env,
+                        const std::vector<gfx::PrimaryLight>& primaries) {
     // Sun primary light: from the map's worldspawn (via the bake) or a fixed default.
     Vec3 sunDir = normalize(Vec3{-0.4, 0.3, 0.86}), sunColor{1, 1, 1};
     if (env && env->hasSun) {
         sunDir = env->sunDir;
         sunColor = env->sunColor;
     }
-    return {IW4_COMWORLD, [name, withSun, sunDir, sunColor](ZoneWriter& w) {
+    return {IW4_COMWORLD, [name, withSun, sunDir, sunColor, primaries](ZoneWriter& w) {
                 iw4::ComWorld c{};
                 c.name = follow<const char>();
                 c.isInUse = 1;
                 // Primary light 0 is the empty slot; light 1 is the sun (lastSunPrimaryLightIndex
                 // 1 in GfxWorld). The count must match GfxWorld.primaryLightCount.
-                c.primaryLightCount = withSun ? 2 : 0;
+                c.primaryLightCount = withSun ? 2 + static_cast<unsigned>(primaries.size()) : 0;
                 c.primaryLights = withSun ? follow<iw4::ComPrimaryLight>() : nullptr;
                 w.writeStruct(c);
                 w.push(zone::BLOCK_VIRTUAL);
@@ -1483,6 +1484,24 @@ ZoneAsset buildComWorld(const std::string& name, bool withSun, const light::Envi
                     }
                     w.writeStruct(none);
                     w.writeStruct(sun);  // defName (+64) null in both
+                    // Primary spotlights (stock values: shadow-mapped, exponent 1, rotation limit 1,
+                    // the expanded cone = the outer one, light def "light_point_linear" for the falloff).
+                    for (const gfx::PrimaryLight& p : primaries) {
+                        iw4::ComPrimaryLight l{};
+                        l.type = 2;  // GFX_LIGHT_TYPE_SPOT
+                        l.canUseShadowMap = 1;
+                        l.exponent = 1;
+                        for (int k = 0; k < 3; k++) l.color[k] = p.color[k], l.dir[k] = p.dir[k], l.origin[k] = p.origin[k];
+                        l.radius = p.radius;
+                        l.cosHalfFovOuter = p.cosOuter;
+                        l.cosHalfFovInner = p.cosInner;
+                        l.cosHalfFovExpanded = p.cosOuter;
+                        l.rotationLimit = 1;
+                        l.translationLimit = 0;
+                        l.defName = follow<const char>();
+                        w.writeStruct(l);
+                    }
+                    for (size_t i = 0; i < primaries.size(); i++) w.xstring("light_point_linear");
                 }
                 w.pop();
             }};
@@ -1501,7 +1520,7 @@ ZoneAsset buildGfxWorld(const std::string& name, const std::string& baseName, co
                 using namespace zone;
                 const auto rt = follow<unsigned int>();  // RUNTIME arrays: allocated + zeroed
                 const uint32_t ns = static_cast<uint32_t>(gw.surfaces.size());
-                const uint32_t cellCount = 1, primaryLights = 2;
+                const uint32_t cellCount = 1, primaryLights = 2 + static_cast<uint32_t>(gw.primaries.size());
                 const uint32_t visCount = (ns + 63) >> 5;
                 iw4::GfxWorld g{};
                 g.name = follow<const char>();
@@ -1526,11 +1545,13 @@ ZoneAsset buildGfxWorld(const std::string& name, const std::string& baseName, co
                 g.aabbTrees = follow<iw4::GfxCellTree>();
                 g.cells = follow<iw4::GfxCell>();
                 iw4::GfxWorldDraw& d = g.draw;
-                d.reflectionProbeCount = 1;
+                const uint32_t probeCount = static_cast<uint32_t>(gw.reflectionProbes.size());
+                d.reflectionProbeCount = probeCount;
                 d.reflectionProbes = follow<iw4::GfxImage*>();
                 d.reflectionProbeOrigins = follow<iw4::GfxReflectionProbe>();
                 d.reflectionProbeTextures = follow<iw4::GfxTexture>();
-                d.lightmapCount = 1;
+                const int lmCount = static_cast<int>(gw.lightmapPrimaries.size());
+                d.lightmapCount = lmCount;
                 d.lightmaps = follow<iw4::GfxLightmapArray>();
                 d.lightmapPrimaryTextures = follow<iw4::GfxTexture>();
                 d.lightmapSecondaryTextures = follow<iw4::GfxTexture>();
@@ -1650,26 +1671,27 @@ ZoneAsset buildGfxWorld(const std::string& name, const std::string& baseName, co
                 {
                     iw4::GfxCell c{};
                     c.bounds = g.bounds;
-                    c.reflectionProbeCount = 1;
+                    c.reflectionProbeCount = static_cast<unsigned char>(probeCount);
                     c.reflectionProbes = follow<char>();
                     w.writeStruct(c);
                     w.align(kAlign1);
-                    w.u8(0);
+                    for (uint32_t i = 0; i < probeCount; i++) w.u8(static_cast<uint8_t>(i));
                 }
                 // draw (0x11bfd0)
                 w.align(kAlign4);
-                w.u64(kPtrInsert);  // reflectionProbes[0] -> image follows
-                writeImage(w, gw.reflectionProbe);
+                for (uint32_t i = 0; i < probeCount; i++) w.u64(kPtrInsert);  // reflectionProbes[i] -> images follow
+                for (const gfx::Image& im : gw.reflectionProbes) writeImage(w, im);
                 w.align(kAlign4);
-                for (int k = 0; k < 3; k++) w.write(&g.bounds.midPoint[k], 4);  // probe origin
-                runtimeArray(w, kAlign4, 8 * 1);                                  // probe textures
+                for (const auto& o : gw.probeOrigins) w.write(o.data(), 12);  // probe origins
+                runtimeArray(w, kAlign4, 8ull * probeCount);                  // probe textures
                 w.align(kAlign4);
-                w.u64(kPtrInsert);  // lightmaps[0].primary
-                w.u64(kPtrInsert);  // lightmaps[0].secondary
-                writeImage(w, gw.lightmapPrimary);
-                writeImage(w, gw.lightmapSecondary);
-                runtimeArray(w, kAlign4, 8 * 1);  // lightmapPrimaryTextures
-                runtimeArray(w, kAlign4, 8 * 1);  // lightmapSecondaryTextures
+                for (int i = 0; i < lmCount; i++) w.u64(kPtrInsert), w.u64(kPtrInsert);  // lightmaps[i].primary / .secondary
+                for (int i = 0; i < lmCount; i++) {
+                    writeImage(w, gw.lightmapPrimaries[i]);
+                    writeImage(w, gw.lightmapSecondaries[i]);
+                }
+                runtimeArray(w, kAlign4, 8ull * lmCount);  // lightmapPrimaryTextures
+                runtimeArray(w, kAlign4, 8ull * lmCount);  // lightmapSecondaryTextures
                 // lightmapOverridePrimary/Secondary (+64/+72): null. vertices, layer data, indices.
                 if (!gw.vertices.empty()) {
                     w.align(kAlign4);
@@ -1706,11 +1728,8 @@ ZoneAsset buildGfxWorld(const std::string& name, const std::string& baseName, co
                     std::vector<uint8_t> color(sizeof(iw4::GfxLightGridColors), lg.gray);
                     for (uint32_t i = 0; i < lg.colorCount; i++) w.write(color.data(), color.size());
                 } else {
-                    std::vector<uint8_t> color(sizeof(iw4::GfxLightGridColors));
-                    for (const auto& rgb : lg.colors) {
-                        for (size_t j = 0; j + 2 < color.size(); j += 3) std::memcpy(&color[j], rgb.data(), 3);
-                        w.write(color.data(), color.size());
-                    }
+                    static_assert(sizeof(iw4::GfxLightGridColors) == 168, "56 rgb");
+                    for (const auto& rgb : lg.colors) w.write(rgb.data(), rgb.size());
                 }
                 // models: the world brush model covers every static surface.
                 w.align(kAlign4);
@@ -1760,11 +1779,38 @@ ZoneAsset buildGfxWorld(const std::string& name, const std::string& baseName, co
                 runtimeArray(w, kAlign4, 0);  // primaryLightDynEntShadowVis[0]
                 runtimeArray(w, kAlign4, 0);  // primaryLightDynEntShadowVis[1]
                 runtimeArray(w, kAlign1, 0);  // nonSunPrimaryLightForModelDynEnt
-                // shadowGeom / lightRegion: one empty entry per primary light.
+                // shadowGeom / lightRegion: empty for lights 0 (none) and 1 (sun); the primary
+                // spotlights get their shadow casters and one region hull (k-DOP, no extra axes).
                 w.align(kAlign4);
-                w.zeros(sizeof(iw4::GfxShadowGeometry) * primaryLights);
+                w.zeros(sizeof(iw4::GfxShadowGeometry) * 2);
+                for (const gfx::PrimaryLight& p : gw.primaries) {
+                    iw4::GfxShadowGeometry sg{};
+                    sg.surfaceCount = static_cast<uint16_t>(p.shadowSurfs.size());
+                    sg.sortedSurfIndex = p.shadowSurfs.empty() ? nullptr : follow<unsigned short>();
+                    w.writeStruct(sg);
+                }
+                for (const gfx::PrimaryLight& p : gw.primaries) {
+                    if (p.shadowSurfs.empty()) continue;
+                    w.align(kAlign2);
+                    w.write(p.shadowSurfs.data(), 2 * p.shadowSurfs.size());
+                }
                 w.align(kAlign4);
-                w.zeros(sizeof(iw4::GfxLightRegion) * primaryLights);
+                w.zeros(sizeof(iw4::GfxLightRegion) * 2);
+                for (size_t i = 0; i < gw.primaries.size(); i++) {
+                    iw4::GfxLightRegion r{};
+                    r.hullCount = 1;
+                    r.hulls = follow<iw4::GfxLightRegionHull>();
+                    w.writeStruct(r);
+                }
+                for (const gfx::PrimaryLight& p : gw.primaries) {
+                    w.align(kAlign4);
+                    iw4::GfxLightRegionHull h{};
+                    std::memcpy(h.kdopMidPoint, p.kdopMid, sizeof h.kdopMidPoint);
+                    std::memcpy(h.kdopHalfSize, p.kdopHalf, sizeof h.kdopHalfSize);
+                    h.axisCount = 0;
+                    h.axis = nullptr;
+                    w.writeStruct(h);
+                }
                 // dpvs (0x11bb30)
                 for (int k = 0; k < 3; k++) runtimeArray(w, kAlign1, 0);   // smodelVisData
                 for (int k = 0; k < 3; k++) runtimeArray(w, kAlign1, ns);  // surfaceVisData
@@ -1781,8 +1827,8 @@ ZoneAsset buildGfxWorld(const std::string& name, const std::string& baseName, co
                         o.tris.triCount = s.triCount;
                         o.tris.baseIndex = s.baseIndex;
                         o.material = ref<iw4::Material>(matSlot[s.material]);
-                        o.laf.fields.lightmapIndex = (s.sky || s.unlit) ? 31 : 0;  // 31 = no lightmap
-                        o.laf.fields.reflectionProbeIndex = 0;
+                        o.laf.fields.lightmapIndex = (s.sky || s.unlit) ? 31 : s.lightmap;  // 31 = no lightmap
+                        o.laf.fields.reflectionProbeIndex = s.probe;
                         o.laf.fields.primaryLightIndex = s.primaryLight;
                         o.laf.fields.flags = 1;  // stock world surfaces
                         w.writeStruct(o);
@@ -3037,7 +3083,7 @@ bool compileMapToFastfile(const Document& doc, const std::string& mapName,
     ZoneAsset clipMap = buildClipMap(bsp, cm, documentToEntityString(entDoc), shared, sp);
     if (sp) clipMap.type = IW4_CLIPMAP_SP;
     std::vector<ZoneAsset> assets = {
-        buildComWorld(bsp, true, bake ? &bake->env : nullptr),
+        buildComWorld(bsp, true, bake ? &bake->env : nullptr, gw.primaries),
         buildFxWorld(bsp),
         buildGfxWorld(bsp, mapName, gw, cm, shared, skySrc, materials),
         sp ? buildGameWorldSp(bsp, pathGraph, nodeStrings) : buildGameWorldMp(bsp),

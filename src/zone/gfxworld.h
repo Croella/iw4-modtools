@@ -50,6 +50,8 @@ struct Surface {
     uint32_t baseIndex = 0;
     uint32_t material = 0;  // into GfxWorldData::materials
     uint8_t primaryLight = 0;  // laf.primaryLightIndex: 1 = lit by the sun primary light
+    uint8_t probe = 0;         // laf.reflectionProbeIndex: the nearest reflection probe
+    uint8_t lightmap = 0;      // laf.lightmapIndex (page) for lightmapped surfaces
     bool sky = false;          // drawn with the embedded sky material (no lightmap)
     bool unlit = false;        // unlit effect material (no lightmap, no sun)
     float mins[3], maxs[3];
@@ -82,10 +84,22 @@ struct LightGrid {
     uint32_t colorCount = 1;
     uint8_t gray = 128;  // the uniform color every entry uses (when unbaked)
     // Baked grid (empty = uniform gray): per entry {colorsIndex u16, primaryLightIndex u8,
-    // needsTrace u8} packed little-endian, and the colour palette (one rgb per GfxLightGridColors,
-    // replicated over its 56 samples).
+    // needsTrace u8} packed little-endian, and the colour palette: GfxLightGridColors, 56 rgb
+    // (light::gridDirections order), each byte = sqrt(light) * 127.5 (the model shaders square
+    // twice the texel).
     std::vector<uint32_t> entries;
-    std::vector<std::array<uint8_t, 3>> colors;
+    std::vector<std::array<uint8_t, 168>> colors;
+};
+
+// A primary spotlight (engine primary light 2 + index): ComPrimaryLight values, the light region
+// (one hull: a 9-axis k-DOP relative to the origin, axes x y z x+y x-y x+z x-z y+z y-z
+// unnormalized - RE'd from stock hulls) and the surfaces that cast its shadows.
+struct PrimaryLight {
+    float origin[3], dir[3];  // dir: towards the light (minus the spot direction), as stock
+    float color[3];
+    float radius, cosOuter, cosInner;
+    float kdopMid[9], kdopHalf[9];
+    std::vector<uint16_t> shadowSurfs;  // sorted surface indices
 };
 
 struct GfxWorldData {
@@ -94,8 +108,13 @@ struct GfxWorldData {
     std::vector<Surface> surfaces;
     std::vector<std::string> materials;
     float mins[3], maxs[3];
-    Image lightmapPrimary, lightmapSecondary, reflectionProbe;
+    std::vector<Image> lightmapPrimaries, lightmapSecondaries;  // one pair per lightmap page
+    // Reflection probes: baked 64x64 cubes at the map's reflection_probe entities (else one at a
+    // spawn point / the middle); unbaked maps get one tiny uniform cube.
+    std::vector<Image> reflectionProbes;
+    std::vector<std::array<float, 3>> probeOrigins;
     LightGrid lightGrid;
+    std::vector<PrimaryLight> primaries;
     // Sky: faces with a sky material become surfaces of one embedded sky material (index
     // skyMaterial into materials, -1 = no sky); skyImage is the cubemap streamed from
     // images/<skyImage>.iwi.
@@ -132,5 +151,8 @@ constexpr const char* kSkyMaterial = "wc/iw4r_sky";
 // PackedUnitVec encoding used by world vertices (exposed for tests).
 uint32_t packUnitVec(const Vec3& v);
 Vec3 unpackUnitVec(uint32_t packed);
+// A face's vertex tangent (texture u gradient in the plane) and binormal sign, as the compiler writes them.
+Vec3 texGradientOf(const Face& f);
+float binormalSignOf(const Face& f);
 
 }  // namespace gfx

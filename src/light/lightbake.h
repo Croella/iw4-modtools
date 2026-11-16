@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <map>
@@ -28,6 +29,7 @@ struct Settings {
     double albedo = 0.45;   // assumed surface reflectance for bounce light
     int maxAtlas = 1024;    // max luxel atlas width/height (luxelSize grows until the map fits)
     bool gpu = true;        // trace on the GPU (D3D11 compute) when there is one; else / on failure the CPU
+    int maxPages = 4;       // lightmap pages (maxAtlas square each) before the luxel size grows
     // Unlit see-through materials (additive effects such as atmos_particles_dust), lower-case
     // editor names: they neither block light nor get a lightmap.
     std::set<std::string> unlitMaterials;
@@ -168,6 +170,9 @@ struct PointLight {
     double cosOuter = -1, cosInner = -1;  // spot cone (cosines of the half-angles)
     bool bake = true, shafts = true;
     double shaftScale = 1, flicker = 0;
+    // "primary" "1" on a spotlight: an engine primary light - lit in real time with shadow maps
+    // (zombies and players cast real shadows), its static shadows baked into the primary lightmap.
+    bool primary = false;
 };
 std::vector<PointLight> readLights(const Document& doc);
 
@@ -191,14 +196,21 @@ struct FaceMap {
     int x = 0, y = 0, w = 0, h = 0;  // luxel rect in the atlas (1-luxel border included)
     int axisU = 0, axisV = 1;        // world axes the face is projected onto
     double minU = 0, minV = 0;       // world coordinate of the rect's corner
+    int primary = -1;                // Bake::primaries index lighting the face in real time; -1 = the sun
+    int page = 0;                    // lightmap page (y above already includes the page's first row)
 };
 
 class Scene;  // ray-tracing acceleration structure, kept for light-grid sampling
 
 struct Bake {
-    int width = 0, height = 0;  // luxel atlas size (powers of two)
+    int width = 0, height = 0;  // luxel atlas size: every lightmap page stacked vertically (powers of two each)
+    std::vector<int> pageY, pageH;  // each page's first row in the atlas and its height (sunVis: twice these)
     double luxelSize = 16;
     std::vector<float> light;     // linear rgb per luxel: everything except direct sun
+    // Where that light comes from, per luxel: the luminance-weighted sum of the unit directions
+    // towards the lights / sky / bounce surfaces (xyz, world space) and the summed weight (w).
+    // |xyz| / w = how directional the light is (1 = all from one direction). Ambient isn't in it.
+    std::vector<float> lightDir;
     std::vector<uint8_t> sunVis;  // (2*width x 2*height): direct-sun visibility, 0..255
     std::map<uint64_t, FaceMap> faces;
     Environment env;
@@ -206,11 +218,18 @@ struct Bake {
     uint64_t sceneHash = 0;  // light::sceneHash of the baked document
     std::string device;      // what traced the rays: the GPU adapter's name, or "CPU (n threads)"
     std::string gpuNote;     // why the GPU wasn't used, when it was asked for and the CPU did the work
+    std::vector<PointLight> lights;  // the baked lights (the light grid adds them for models)
+    std::vector<float> realtime;     // rgb per luxel: the light the game adds in real time (sun / spot), left out of `light`
+    // Primary spotlights, in engine order: primary light 2 + i (0 = none, 1 = the sun). Their
+    // faces (FaceMap::primary) have this light's shadow mask in sunVis and the sun baked in.
+    std::vector<PointLight> primaries;
     std::shared_ptr<const Scene> scene;
 
     const FaceMap* find(const Face& f) const;
     // Lightmap coordinate (0..1 across the atlas) of point p on a mapped face.
     void lmapCoord(const FaceMap& m, const Vec3& p, float& u, float& v) const;
+    // The same within the face's own page (what the game's vertices carry).
+    void lmapCoordPage(const FaceMap& m, const Vec3& p, float& u, float& v) const;
 };
 
 struct Progress {
@@ -222,12 +241,29 @@ struct Progress {
 bool bake(const Document& doc, const Settings& settings, Bake& out, std::string& error,
           Progress* progress = nullptr);
 
-// Light-grid samples (models): non-sun light averaged over all directions, and whether the sun
-// reaches the point. Needs a finished bake (for bounce lookups).
+// The light grid's 56 directions (GfxLightGridColors.rgb[56]), in the engine's order: the
+// surface voxels of a 4x4x4 block (z slowest, then y, then x; the inner 2x2x2 skipped), each the
+// direction from the block's centre. Models sample that block (a 3D texture) at
+// normal / max|normal|, so voxel i holds the light a surface facing gridDirections()[i] gets.
+// (RE'd: stock model pixel shaders + the engine's corner average over entries 0 3 12 15 40 43 52
+// 55; z and the rgb order checked against mp_afghan's grid - sand bounce below, sky above.)
+const std::array<Vec3, 56>& gridDirections();
+
+// Light-grid samples (models): the non-sun light a surface facing each of the 56 grid directions
+// gets (sky, bounce, the lights with shadow rays, ambient), and whether the sun reaches the point.
+// Needs a finished bake (bounce lookups, the lights).
 struct GridSample {
-    Vec3 light;
-    bool sun = false;
+    Vec3 light;  // average over the directions
+    std::array<Vec3, 56> dir;
+    int primary = 0;  // engine primary light for models here: 1 = the sun reaches it, 2+ = a spotlight, 0 = none
 };
-std::vector<GridSample> sampleGrid(const Bake& b, const std::vector<Vec3>& points, int rays = 24);
+std::vector<GridSample> sampleGrid(const Bake& b, const std::vector<Vec3>& points, int rays = 96);
+
+// A reflection probe (the cube shiny world surfaces reflect): size x size per face, full mip
+// chain, A8R8G8B8 as stock stores it - faces +X -X +Y -Y +Z -Z (D3D, world z = cube z), each
+// with its mips before the next face; texels = sqrt(radiance) (the shaders square them). Rays
+// from `origin`: a lit surface gives its full light (baked + real time) * an albedo, the sky its
+// colour plus a glow towards the sun. 2x2 rays per texel; mips are box-filtered.
+std::vector<uint8_t> bakeReflectionProbe(const Bake& b, const Vec3& origin, int size = 64);
 
 }  // namespace light

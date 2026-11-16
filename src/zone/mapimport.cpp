@@ -503,6 +503,77 @@ bool importFastfile(const std::string& ffPath, Document& doc, ImportStats& st, s
             last = tag;
         }
     }
+    if (g && std::getenv("IW4R_DUMP_LIGHTGRID")) {  // debug: average of each of the 56 light grid colours
+        const iw4::GfxLightGrid& lg = g->lightGrid;
+        std::printf("lightgrid: entries %u colors %u mins %u %u %u maxs %u %u %u\n", lg.entryCount, lg.colorCount, lg.mins[0], lg.mins[1],
+                    lg.mins[2], lg.maxs[0], lg.maxs[1], lg.maxs[2]);
+        std::printf("primary lights: %u, lastSun %u\n", g->primaryLightCount, g->lastSunPrimaryLightIndex);
+        std::map<int, int> byLight;
+        for (unsigned i = 0; i < g->surfaceCount; i++) byLight[g->dpvs.surfaces[i].laf.fields.primaryLightIndex]++;
+        for (auto [l, n] : byLight) std::printf("  surfaces lit by primary %d: %d\n", l, n);
+        for (unsigned i = 0; i < g->primaryLightCount && i < 64; i++) {
+            const unsigned sc = g->shadowGeom ? g->shadowGeom[i].surfaceCount : 0, mc = g->shadowGeom ? g->shadowGeom[i].smodelCount : 0;
+            const unsigned hulls = g->lightRegion ? g->lightRegion[i].hullCount : 0;
+            unsigned axes = 0;
+            if (g->lightRegion)
+                for (unsigned h = 0; h < hulls; h++) axes += g->lightRegion[i].hulls[h].axisCount;
+            std::printf("  light %2u: shadow surfs %u smodels %u, region hulls %u axes %u", i, sc, mc, hulls, axes);
+            if (hulls && g->lightRegion) {
+                const iw4::GfxLightRegionHull& h = g->lightRegion[i].hulls[0];
+                std::printf("\n    kdop mid");
+                for (int k = 0; k < 9; k++) std::printf(" %.1f", h.kdopMidPoint[k]);
+                std::printf("\n    kdop half");
+                for (int k = 0; k < 9; k++) std::printf(" %.1f", h.kdopHalfSize[k]);
+                for (unsigned k = 0; k < h.axisCount; k++)
+                    std::printf("\n    axis %.3f %.3f %.3f mid %.1f half %.1f", h.axis[k].dir[0], h.axis[k].dir[1], h.axis[k].dir[2],
+                                h.axis[k].midPoint, h.axis[k].halfSize);
+            }
+            std::printf("\n");
+        }
+        std::printf("lightmaps: %d\n", g->draw.lightmapCount);
+        for (int i = 0; i < g->draw.lightmapCount && g->draw.lightmaps; i++) {
+            const iw4::GfxImage* p = g->draw.lightmaps[i].primary;
+            const iw4::GfxImage* s = g->draw.lightmaps[i].secondary;
+            std::printf("  %d: primary %ux%u fmt %x, secondary %ux%u fmt %x\n", i, p ? p->width : 0, p ? p->height : 0,
+                        p && p->texture.loadDef ? p->texture.loadDef->format : 0, s ? s->width : 0, s ? s->height : 0,
+                        s && s->texture.loadDef ? s->texture.loadDef->format : 0);
+        }
+        std::map<int, int> byLmap;
+        for (unsigned i = 0; i < g->surfaceCount; i++) byLmap[g->dpvs.surfaces[i].laf.fields.lightmapIndex]++;
+        for (auto [l, n] : byLmap) std::printf("  surfaces on lightmap %d: %d\n", l, n);
+        std::printf("reflection probes: %u\n", g->draw.reflectionProbeCount);
+        for (unsigned i = 0; i < g->draw.reflectionProbeCount && i < 4; i++) {
+            const iw4::GfxImage* im = g->draw.reflectionProbes ? g->draw.reflectionProbes[i] : nullptr;
+            if (!im) continue;
+            const iw4::GfxImageLoadDef* ld = im->texture.loadDef;
+            std::printf("  probe %u at %.0f %.0f %.0f: %s %ux%u map %d sem %d cat %d", i, g->draw.reflectionProbeOrigins[i].origin[0],
+                        g->draw.reflectionProbeOrigins[i].origin[1], g->draw.reflectionProbeOrigins[i].origin[2], im->name ? im->name : "?",
+                        im->width, im->height, im->mapType, static_cast<int>(im->semantic), im->category);
+            if (ld) {
+                std::printf(" levels %d flags %x format %x bytes %d", ld->levelCount, ld->flags, ld->format, ld->resourceSize);
+                if (i == 1 && std::getenv("IW4R_DUMP_PROBE"))
+                    std::ofstream(std::getenv("IW4R_DUMP_PROBE"), std::ios::binary)
+                        .write(reinterpret_cast<const char*>(ld->data), ld->resourceSize);
+                if (i == 0 && ld->resourceSize > 0) {  // average of face 0's first 64 texels (BGRA)
+                    std::printf("\n    first texels:");
+                    for (int t = 0; t < 8 && t * 4 + 3 < ld->resourceSize; t++)
+                        std::printf(" %02x%02x%02x%02x", ld->data[t * 4 + 3], ld->data[t * 4 + 2], ld->data[t * 4 + 1], ld->data[t * 4]);
+                }
+            }
+            std::printf("\n");
+        }
+        if (const char* zp = std::getenv("IW4R_DUMP_ZONE")) {
+            std::ofstream(zp, std::ios::binary).write(reinterpret_cast<const char*>(z.data()), static_cast<std::streamsize>(z.size()));
+        }
+        if (lg.colors && lg.colorCount) {
+            for (int i = 0; i < 56; i++) {
+                double s[3] = {0, 0, 0};
+                for (unsigned c = 0; c < lg.colorCount; c++)
+                    for (int k = 0; k < 3; k++) s[k] += lg.colors[c].rgb[i][k];
+                std::printf("  %2d: %6.1f %6.1f %6.1f\n", i, s[0] / lg.colorCount, s[1] / lg.colorCount, s[2] / lg.colorCount);
+            }
+        }
+    }
     std::shared_ptr<RefMesh> mesh = g ? convertGfxWorld(*g, st) : nullptr;
     fillDocument(doc, me, cm, mesh, st, error);
     error.clear();

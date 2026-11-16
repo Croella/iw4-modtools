@@ -32,6 +32,11 @@ struct Map {  // a face's luxel rect (FaceMap)
 };
 struct Sample {
     float p[3], n[3];
+    int skip;  // light index (in the lights list) reported apart in lights(), -1 none
+};
+struct VisSample {
+    float p[3], t[3];  // t: direction towards the sun (point 0) or a light's position (point 1)
+    int point;
 };
 struct Light {
     float pos[3], radius;
@@ -56,16 +61,18 @@ public:
     // The callback is told the fraction done (0..1) after each chunk; returning false cancels.
     using Tick = bool (*)(void* user, float done);
 
-    // 255 where the ray towards the sun escapes or hits sky, else 0.
-    bool sun(const std::vector<Sample>& samples, const float sunDir[3], std::vector<uint8_t>& vis, Tick tick, void* user,
-             std::string& error);
-    // Sum of the lights (with shadow rays) at each sample, rgb.
-    bool lights(const std::vector<Sample>& samples, const std::vector<Light>& lights, std::vector<float>& rgb, Tick tick, void* user,
-                std::string& error);
+    // Shadow masks: 255 where the ray towards the sun escapes or hits sky (point 0), or nothing
+    // is between the sample and the light (point 1), else 0.
+    bool sun(const std::vector<VisSample>& samples, std::vector<uint8_t>& vis, Tick tick, void* user, std::string& error);
+    // Sum of the lights (with shadow rays) at each sample, rgb; dir = luminance-weighted sum of the
+    // directions to them (xyz) + summed weight (w), 4 floats per sample.
+    // skipRgb = the sample's `skip` light alone (rgb), which is left out of rgb and dir.
+    bool lights(const std::vector<Sample>& samples, const std::vector<Light>& lights, std::vector<float>& rgb, std::vector<float>& skipRgb,
+                std::vector<float>& dir, Tick tick, void* user, std::string& error);
     // Sky + bounce: `rays` cosine-weighted rays per sample; sky -> skyColor, a lightmapped face ->
     // source (rgb per atlas luxel) at the hit * albedo when bounce is set. Average per sample, rgb.
     bool gather(const std::vector<Sample>& samples, const std::vector<float>& source, const float skyColor[3], int rays, float albedo,
-                bool bounce, uint32_t seed, std::vector<float>& rgb, Tick tick, void* user, std::string& error);
+                bool bounce, uint32_t seed, std::vector<float>& rgb, std::vector<float>& dir, Tick tick, void* user, std::string& error);
 
 private:
     struct Impl;

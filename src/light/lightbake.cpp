@@ -19,6 +19,7 @@ namespace {
 
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kRayOffset = 0.5;  // start rays this far off the surface (world units)
+constexpr size_t kMaxPrimaryLights = 32;  // primary spotlights per map (engine primary lights 2..)
 
 std::string lower(std::string s) {
     for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -287,27 +288,69 @@ Vec3 cosineDir(const Vec3& n, const Vec3& t, const Vec3& b, int i, int count, Rn
     return normalize(t * x + b * y + n * z);
 }
 
-Vec3 pointLights(const Scene& sc, const std::vector<PointLight>& lights, const Vec3& p, const Vec3* n) {
+double lum(const Vec3& c) { return c.x * 0.3 + c.y * 0.59 + c.z * 0.11; }
+
+// One light at p, unshadowed: colour * falloff * cone * N.L (0 when out of range / behind).
+Vec3 lightReach(const PointLight& L, const Vec3& p, const Vec3* n, Vec3* toLight = nullptr, double* distOut = nullptr) {
+    Vec3 d = L.origin - p;
+    double dist = length(d);
+    if (dist >= L.radius || dist < 1e-6) return {};
+    Vec3 l = d * (1.0 / dist);
+    double ndl = n ? dot(*n, l) : 1.0;
+    if (ndl <= 0) return {};
+    double f = 1 - (dist * dist) / (L.radius * L.radius);
+    double atten = f * f;
+    if (L.spot) {  // smoothstep across the cone edge (same as the shafts)
+        const double c = -dot(l, L.spotDir);
+        const double t = std::clamp((c - L.cosOuter) / std::max(L.cosInner - L.cosOuter, 1e-6), 0.0, 1.0);
+        atten *= t * t * (3 - 2 * t);
+        if (atten <= 0) return {};
+    }
+    if (toLight) *toLight = l;
+    if (distOut) *distOut = dist;
+    return L.color * (atten * ndl);
+}
+
+// Sum of the lights at p (shadowed), except lights[skip]; dirOut / wOut (optional) gather the
+// luminance-weighted directions towards them.
+Vec3 pointLights(const Scene& sc, const std::vector<PointLight>& lights, const Vec3& p, const Vec3* n, Vec3* dirOut = nullptr,
+                 double* wOut = nullptr, int skip = -1) {
     Vec3 sum;
-    for (const PointLight& L : lights) {
-        Vec3 d = L.origin - p;
-        double dist = length(d);
-        if (!L.bake || dist >= L.radius || dist < 1e-6) continue;
-        Vec3 l = d * (1.0 / dist);
-        double ndl = n ? dot(*n, l) : 1.0;
-        if (ndl <= 0) continue;
-        double f = 1 - (dist * dist) / (L.radius * L.radius);
-        double atten = f * f;
-        if (L.spot) {  // smoothstep across the cone edge (same as the shafts)
-            const double c = -dot(l, L.spotDir);
-            const double t = std::clamp((c - L.cosOuter) / std::max(L.cosInner - L.cosOuter, 1e-6), 0.0, 1.0);
-            atten *= t * t * (3 - 2 * t);
-            if (atten <= 0) continue;
-        }
+    for (size_t i = 0; i < lights.size(); i++) {
+        const PointLight& L = lights[i];
+        if (!L.bake || static_cast<int>(i) == skip) continue;
+        Vec3 l;
+        double dist = 0;
+        const Vec3 c = lightReach(L, p, n, &l, &dist);
+        if (c.x <= 0 && c.y <= 0 && c.z <= 0) continue;
         if (sc.occluded(p, l, static_cast<float>(dist - 1.0))) continue;
-        sum += L.color * (atten * ndl);
+        sum += c;
+        if (dirOut) {
+            const double w = lum(c);
+            *dirOut += l * w;
+            *wOut += w;
+        }
     }
     return sum;
+}
+
+// One light at p with its shadow ray.
+Vec3 oneLight(const Scene& sc, const PointLight& L, const Vec3& p, const Vec3& n) {
+    Vec3 l;
+    double dist = 0;
+    const Vec3 c = lightReach(L, p, &n, &l, &dist);
+    if ((c.x <= 0 && c.y <= 0 && c.z <= 0) || sc.occluded(p, l, static_cast<float>(dist - 1.0))) return {};
+    return c;
+}
+
+// Shadow mask of a primary spotlight: p faces the light and nothing is in between (falloff and
+// cone are the engine's, in real time).
+bool spotVisible(const Scene& sc, const PointLight& L, const Vec3& p, const Vec3& n) {
+    const Vec3 d = L.origin - p;
+    const double dist = length(d);
+    if (dist < 1e-6) return true;
+    if (dot(n, d) <= 0) return false;
+    return !sc.occluded(p, d * (1.0 / dist), static_cast<float>(dist - 1.0));
 }
 
 bool sunVisible(const Scene& sc, const Environment& env, const Vec3& p) {
@@ -316,10 +359,13 @@ bool sunVisible(const Scene& sc, const Environment& env, const Vec3& p) {
     return sc.tris[h.tri].sky;
 }
 
-// The ray work of the bake on the GPU (gpubake.h): sun mask, direct light, sky + bounce rounds,
-// with the same sample points as the CPU passes. False (with a reason) to fall back to the CPU.
+// The ray work of the bake on the GPU (gpubake.h): shadow masks, direct light, sky + bounce
+// rounds, with the same sample points as the CPU passes. False (with a reason) to fall back to
+// the CPU. primaryLight[j] = index in `lights` of primary spotlight j (FaceMap::primary).
 bool gpuPasses(const std::vector<LitFace>& lit, Scene& scene, const Environment& env, const std::vector<PointLight>& lights,
-               const Settings& settings, double ls, int W, Bake& out, std::vector<float>& indirect, Progress* progress, std::string& why) {
+               const std::vector<int>& primaryLight, const Settings& settings, double ls, int W, Bake& out, std::vector<float>& indirect,
+               std::vector<float>& excl, std::vector<float>& dirDirect, std::vector<float>& dirIndirect, Progress* progress,
+               std::string& why) {
     gpubake::Context gpu;
     std::string device;
     if (!gpu.init(device, why)) return false;
@@ -350,69 +396,114 @@ bool gpuPasses(const std::vector<LitFace>& lit, Scene& scene, const Environment&
         t->p->fraction = t->from + (t->to - t->from) * f;
         return true;
     };
-    auto sample = [](const Vec3& p, const Vec3& n) {
-        return gpubake::Sample{{static_cast<float>(p.x), static_cast<float>(p.y), static_cast<float>(p.z)},
-                               {static_cast<float>(n.x), static_cast<float>(n.y), static_cast<float>(n.z)}};
+    auto f3v = [](const Vec3& v, float out[3]) {
+        out[0] = static_cast<float>(v.x), out[1] = static_cast<float>(v.y), out[2] = static_cast<float>(v.z);
     };
-
-    // Sun mask (2x density): only samples facing the sun are traced, the rest stay 0.
-    std::vector<gpubake::Sample> sunS;
-    std::vector<size_t> sunAt;
-    for (const LitFace& lf : lit) {
-        const FaceMap& m = lf.map;
-        const Vec3& n = lf.face.normal;
-        if (!env.hasSun || dot(n, env.sunDir) <= 0) continue;
-        for (int y = 0; y < m.h * 2; y++)
-            for (int x = 0; x < m.w * 2; x++) {
-                const Vec3 p = facePoint(lf, m.minU + (x + 0.5) * ls * 0.5, m.minV + (y + 0.5) * ls * 0.5, ls * 0.05) + n * kRayOffset;
-                sunS.push_back(sample(p, n));
-                sunAt.push_back(static_cast<size_t>(m.y * 2 + y) * (W * 2) + (m.x * 2 + x));
-            }
-    }
-    const float sd[3] = {static_cast<float>(env.sunDir.x), static_cast<float>(env.sunDir.y), static_cast<float>(env.sunDir.z)};
-    std::vector<uint8_t> vis;
-    tc.from = 0.0f, tc.to = 0.1f;
-    if (!gpu.sun(sunS, sd, vis, tick, &tc, why)) return false;
-    for (size_t i = 0; i < sunAt.size(); i++) out.sunVis[sunAt[i]] = vis[i];
-
-    // Luxel samples: direct light = sun (from the mask) + the lights.
-    std::vector<gpubake::Sample> lux;
-    std::vector<size_t> luxAt;
-    std::vector<double> luxNdl;
-    for (const LitFace& lf : lit) {
-        const FaceMap& m = lf.map;
-        const Vec3& n = lf.face.normal;
-        const double ndlSun = std::max(0.0, dot(n, env.sunDir));
-        for (int y = 0; y < m.h; y++)
-            for (int x = 0; x < m.w; x++) {
-                const Vec3 p = facePoint(lf, m.minU + (x + 0.5) * ls, m.minV + (y + 0.5) * ls, ls * 0.05) + n * kRayOffset;
-                lux.push_back(sample(p, n));
-                luxAt.push_back(static_cast<size_t>(m.y + y) * W + (m.x + x));
-                luxNdl.push_back(ndlSun);
-            }
-    }
+    // lights index -> index in the GPU light list (only baked lights go up).
+    std::vector<int> glIndex(lights.size(), -1);
     std::vector<gpubake::Light> gl;
-    for (const PointLight& L : lights) {
+    for (size_t i = 0; i < lights.size(); i++) {
+        const PointLight& L = lights[i];
         if (!L.bake) continue;
+        glIndex[i] = static_cast<int>(gl.size());
         gpubake::Light g{};
-        g.pos[0] = static_cast<float>(L.origin.x), g.pos[1] = static_cast<float>(L.origin.y), g.pos[2] = static_cast<float>(L.origin.z);
+        f3v(L.origin, g.pos);
         g.radius = static_cast<float>(L.radius);
-        g.color[0] = static_cast<float>(L.color.x), g.color[1] = static_cast<float>(L.color.y), g.color[2] = static_cast<float>(L.color.z);
+        f3v(L.color, g.color);
         g.spot = L.spot ? 1.0f : 0.0f;
-        g.dir[0] = static_cast<float>(L.spotDir.x), g.dir[1] = static_cast<float>(L.spotDir.y), g.dir[2] = static_cast<float>(L.spotDir.z);
+        f3v(L.spotDir, g.dir);
         g.cosOuter = static_cast<float>(L.cosOuter);
         g.cosInner = static_cast<float>(L.cosInner);
         gl.push_back(g);
     }
-    std::vector<float> lrgb;
+
+    // Shadow masks (2x density): the sun's, or the face's primary spotlight's. Plus, for spot
+    // faces, the sun at each luxel (baked into their lightmap). Untraced samples stay 0.
+    std::vector<gpubake::VisSample> visS;
+    std::vector<size_t> visAt;               // mask index, or SIZE_MAX - luxel for the spot faces' sun
+    std::vector<uint8_t> luxSun;             // per luxel (spot faces): sun visible
+    std::vector<gpubake::Sample> lux;
+    std::vector<size_t> luxAt;
+    std::vector<double> luxNdl;
+    std::vector<int> luxSpot;                // lights index of the luxel's primary spotlight, or -1
+    const float sd[3] = {static_cast<float>(env.sunDir.x), static_cast<float>(env.sunDir.y), static_cast<float>(env.sunDir.z)};
+    for (const LitFace& lf : lit) {
+        const FaceMap& m = lf.map;
+        const Vec3& n = lf.face.normal;
+        const int si = m.primary >= 0 ? primaryLight[m.primary] : -1;
+        const double ndlSun = std::max(0.0, dot(n, env.sunDir));
+        for (int y = 0; y < m.h * 2; y++)
+            for (int x = 0; x < m.w * 2; x++) {
+                if (si < 0 && (!env.hasSun || ndlSun <= 0)) continue;
+                const Vec3 p = facePoint(lf, m.minU + (x + 0.5) * ls * 0.5, m.minV + (y + 0.5) * ls * 0.5, ls * 0.05) + n * kRayOffset;
+                gpubake::VisSample v{};
+                f3v(p, v.p);
+                if (si >= 0) {
+                    if (dot(n, lights[si].origin - p) <= 0) continue;
+                    f3v(lights[si].origin, v.t);
+                    v.point = 1;
+                } else {
+                    std::memcpy(v.t, sd, sizeof sd);
+                }
+                visS.push_back(v);
+                visAt.push_back(static_cast<size_t>(m.y * 2 + y) * (W * 2) + (m.x * 2 + x));
+            }
+        for (int y = 0; y < m.h; y++)
+            for (int x = 0; x < m.w; x++) {
+                const Vec3 p = facePoint(lf, m.minU + (x + 0.5) * ls, m.minV + (y + 0.5) * ls, ls * 0.05) + n * kRayOffset;
+                gpubake::Sample s{};
+                f3v(p, s.p);
+                f3v(n, s.n);
+                s.skip = si >= 0 ? glIndex[si] : -1;
+                if (si >= 0 && env.hasSun && ndlSun > 0) {
+                    gpubake::VisSample v{};
+                    f3v(p, v.p);
+                    std::memcpy(v.t, sd, sizeof sd);
+                    visS.push_back(v);
+                    visAt.push_back(SIZE_MAX - lux.size());
+                }
+                lux.push_back(s);
+                luxAt.push_back(static_cast<size_t>(m.y + y) * W + (m.x + x));
+                luxNdl.push_back(ndlSun);
+                luxSpot.push_back(si);
+            }
+    }
+    luxSun.assign(lux.size(), 0);
+    std::vector<uint8_t> vis;
+    tc.from = 0.0f, tc.to = 0.1f;
+    if (!gpu.sun(visS, vis, tick, &tc, why)) return false;
+    const size_t maskSize = out.sunVis.size();
+    for (size_t i = 0; i < visAt.size(); i++) {
+        if (visAt[i] < maskSize) out.sunVis[visAt[i]] = vis[i];
+        else luxSun[SIZE_MAX - visAt[i]] = vis[i] ? 1 : 0;
+    }
+
+    // Direct light: sun (mask, or the luxel's own sun ray on spot faces) + the lights. The part
+    // the game adds in real time (sun, or the face's spotlight) goes to `excl`.
+    std::vector<float> lrgb, lskip, ldir;
     tc.from = 0.1f, tc.to = 0.3f;
-    if (!gpu.lights(lux, gl, lrgb, tick, &tc, why)) return false;
+    if (!gpu.lights(lux, gl, lrgb, lskip, ldir, tick, &tc, why)) return false;
     for (size_t i = 0; i < lux.size(); i++) {
         const size_t px = luxAt[i];
-        const size_t y = px / W, x = px % W;
-        const size_t s0 = (y * 2) * (W * 2) + x * 2;
-        const double v = (out.sunVis[s0] + out.sunVis[s0 + 1] + out.sunVis[s0 + W * 2] + out.sunVis[s0 + W * 2 + 1]) / (4.0 * 255.0);
-        for (int k = 0; k < 3; k++) scene.direct[px * 3 + k] = static_cast<float>(env.sunColor[k] * (v * luxNdl[i]) + lrgb[i * 3 + k]);
+        double v;
+        if (luxSpot[i] < 0) {
+            const size_t y = px / W, x = px % W;
+            const size_t s0 = (y * 2) * (W * 2) + x * 2;
+            v = (out.sunVis[s0] + out.sunVis[s0 + 1] + out.sunVis[s0 + W * 2] + out.sunVis[s0 + W * 2 + 1]) / (4.0 * 255.0);
+        } else {
+            v = luxSun[i];
+        }
+        const Vec3 sunPart = env.sunColor * (v * luxNdl[i]);
+        for (int k = 0; k < 3; k++) {
+            scene.direct[px * 3 + k] = static_cast<float>(sunPart[k] + lrgb[i * 3 + k] + lskip[i * 3 + k]);
+            excl[px * 3 + k] = static_cast<float>(luxSpot[i] < 0 ? sunPart[k] : lskip[i * 3 + k]);
+        }
+        for (int k = 0; k < 4; k++) dirDirect[px * 4 + k] = ldir[i * 4 + k];
+        if (luxSpot[i] >= 0) {  // the sun is baked on spot faces: it counts towards the direction
+            const double w = lum(sunPart);
+            for (int k = 0; k < 3; k++) dirDirect[px * 4 + k] += static_cast<float>(env.sunDir[k] * w);
+            dirDirect[px * 4 + 3] += static_cast<float>(w);
+        }
     }
 
     // Sky + bounce rounds, each gathering from direct + the previous round's indirect.
@@ -420,13 +511,15 @@ bool gpuPasses(const std::vector<LitFace>& lit, Scene& scene, const Environment&
     const float sky[3] = {static_cast<float>(env.skyColor.x), static_cast<float>(env.skyColor.y), static_cast<float>(env.skyColor.z)};
     const int rounds = std::max(1, settings.bounces);
     for (int round = 0; round < rounds; round++) {
-        std::vector<float> g;
+        std::vector<float> g, gd;
         tc.from = 0.3f + 0.7f * round / rounds, tc.to = 0.3f + 0.7f * (round + 1) / rounds;
         if (!gpu.gather(lux, source, sky, std::max(1, settings.skySamples), static_cast<float>(settings.albedo), settings.bounces > 0,
-                        static_cast<uint32_t>(round * 104729 + 1), g, tick, &tc, why))
+                        static_cast<uint32_t>(round * 104729 + 1), g, gd, tick, &tc, why))
             return false;
         for (size_t i = 0; i < lux.size(); i++)
             for (int k = 0; k < 3; k++) indirect[luxAt[i] * 3 + k] = g[i * 3 + k];
+        for (size_t i = 0; i < lux.size(); i++)
+            for (int k = 0; k < 4; k++) dirIndirect[luxAt[i] * 4 + k] = gd[i * 4 + k];
         for (size_t i = 0; i < source.size(); i++) source[i] = scene.direct[i] + indirect[i];
     }
     out.device = device;
@@ -503,6 +596,58 @@ bool pack(std::vector<LitFace>& faces, int maxDim, int& outW, int& outH) {
         if (outH <= shelfW * 2 || shelfW >= maxDim) return true;  // squarish enough
     }
     return false;
+}
+
+// Packs into one page if it fits (pack), else shelf-packs page after page of maxDim x maxDim (the
+// last one cut down to a power of two) up to maxPages; faces' y include their page's first row.
+bool packPages(std::vector<LitFace>& faces, int maxDim, int maxPages, int& outW, int& outH, std::vector<int>& pageY,
+               std::vector<int>& pageH) {
+    pageY.clear();
+    pageH.clear();
+    if (pack(faces, maxDim, outW, outH)) {
+        for (LitFace& f : faces) f.map.page = 0;
+        pageY = {0};
+        pageH = {outH};
+        return true;
+    }
+    if (maxPages <= 1) return false;
+    std::vector<size_t> order(faces.size());
+    for (size_t i = 0; i < order.size(); i++) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return faces[a].map.h != faces[b].map.h ? faces[a].map.h > faces[b].map.h : faces[a].map.w > faces[b].map.w;
+    });
+    for (const LitFace& f : faces)
+        if (f.map.w > maxDim || f.map.h > maxDim) return false;
+    int page = 0, x = 0, y = 0, shelf = 0;
+    std::vector<int> used(1, 0);
+    for (size_t i : order) {
+        FaceMap& m = faces[i].map;
+        if (x + m.w > maxDim) {
+            x = 0;
+            y += shelf;
+            shelf = 0;
+        }
+        if (y + m.h > maxDim) {
+            if (++page >= maxPages) return false;
+            x = y = shelf = 0;
+            used.push_back(0);
+        }
+        m.x = x;
+        m.y = y;
+        m.page = page;
+        x += m.w;
+        shelf = std::max(shelf, m.h);
+        used[page] = std::max(used[page], y + shelf);
+    }
+    outW = maxDim;
+    outH = 0;
+    for (size_t p = 0; p < used.size(); p++) {
+        pageY.push_back(outH);
+        pageH.push_back(p + 1 < used.size() ? maxDim : pow2(std::max(1, used[p])));
+        outH += pageH.back();
+    }
+    for (LitFace& f : faces) f.map.y += pageY[f.map.page];
+    return true;
 }
 
 }  // namespace
@@ -966,6 +1111,8 @@ std::vector<PointLight> readLights(const Document& doc) {
         L.shaftScale = std::max(0.0, L.shaftScale);
         double only = 0;
         if (readNum(e, "volumetric_only", only) && only != 0) L.bake = false;
+        double prim = 0;
+        if (readNum(e, "primary", prim) && prim != 0 && L.spot && L.bake) L.primary = true;
         out.push_back(L);
     }
     return out;
@@ -1033,6 +1180,15 @@ uint64_t sceneHash(const Document& doc) {
 const FaceMap* Bake::find(const Face& f) const {
     auto it = faces.find(faceKey(f));
     return it == faces.end() ? nullptr : &it->second;
+}
+
+void Bake::lmapCoordPage(const FaceMap& m, const Vec3& p, float& u, float& v) const {
+    const int page = std::clamp(m.page, 0, static_cast<int>(pageY.size()) - 1);
+    const int y0 = pageY.empty() ? 0 : pageY[page], h = pageH.empty() ? height : pageH[page];
+    double tx = m.x + (p[m.axisU] - m.minU) / luxelSize;
+    double ty = m.y - y0 + (p[m.axisV] - m.minV) / luxelSize;
+    u = static_cast<float>(tx / width);
+    v = static_cast<float>(ty / h);
 }
 
 void Bake::lmapCoord(const FaceMap& m, const Vec3& p, float& u, float& v) const {
@@ -1118,7 +1274,7 @@ bool bake(const Document& doc, const Settings& settings, Bake& out, std::string&
             lf.map.w = u1 - u0;
             lf.map.h = v1 - v0;
         }
-        if (pack(lit, settings.maxAtlas, out.width, out.height)) break;
+        if (packPages(lit, settings.maxAtlas, std::max(1, settings.maxPages), out.width, out.height, out.pageY, out.pageH)) break;
         if (attempt > 12) {
             error = "map too large to fit a lightmap atlas";
             return false;
@@ -1132,14 +1288,47 @@ bool bake(const Document& doc, const Settings& settings, Bake& out, std::string&
     scene->width = W;
     scene->luxelSize = ls;
     scene->direct.assign(static_cast<size_t>(W) * H * 3, 0.0f);
+    // Primary spotlights ("primary" "1"): each face picks the one that reaches it most (it's then
+    // lit by that light in real time, with the sun baked in), else stays on the sun.
+    std::vector<int> primaryLight;  // index in `lights` of primary j
+    for (size_t i = 0; i < lights.size(); i++)
+        if (lights[i].primary && lights[i].bake && primaryLight.size() < kMaxPrimaryLights) {
+            primaryLight.push_back(static_cast<int>(i));
+            out.primaries.push_back(lights[i]);
+        }
+    for (LitFace& lf : lit) {
+        lf.map.primary = -1;
+        if (primaryLight.empty()) continue;
+        const Face& f = lf.face;
+        Vec3 c;
+        for (const Vec3& p : f.winding) c += p;
+        c = c * (1.0 / f.winding.size());
+        // Score over the whole face (a grid of up to 24 x 24 points on it), so a big floor that a
+        // narrow cone lands in the middle of still goes to the spot.
+        std::vector<Vec3> pts{c + f.normal * kRayOffset};
+        for (const Vec3& p : f.winding) pts.push_back(p + (c - p) * 0.1 + f.normal * kRayOffset);
+        const FaceMap& m = lf.map;
+        const int sx = std::max(1, m.w / 24), sy = std::max(1, m.h / 24);
+        for (int y = 0; y < m.h; y += sy)
+            for (int x = 0; x < m.w; x += sx)
+                pts.push_back(facePoint(lf, m.minU + (x + 0.5) * ls, m.minV + (y + 0.5) * ls, ls * 0.05) + f.normal * kRayOffset);
+        double best = 0.01;  // the spot must put real light somewhere on the face
+        for (size_t j = 0; j < primaryLight.size(); j++) {
+            double score = 0;
+            for (const Vec3& p : pts) score = std::max(score, lum(lightReach(lights[primaryLight[j]], p, &f.normal)));
+            if (score > best) best = score, lf.map.primary = static_cast<int>(j);
+        }
+    }
     for (const LitFace& lf : lit) scene->maps.push_back(lf.map);
 
     // GPU first (same rays, much faster); the CPU passes below are the fallback.
-    std::vector<float> indirect(out.light.size(), 0.0f);
+    std::vector<float> indirect(out.light.size(), 0.0f), excl(out.light.size(), 0.0f);
+    std::vector<float> dirDirect(static_cast<size_t>(W) * H * 4, 0.0f), dirIndirect(static_cast<size_t>(W) * H * 4, 0.0f);
     bool gpuDone = false;
     if (settings.gpu) {
         std::string why;
-        gpuDone = gpuPasses(lit, *scene, env, lights, settings, ls, W, out, indirect, progress, why);
+        gpuDone = gpuPasses(lit, *scene, env, lights, primaryLight, settings, ls, W, out, indirect, excl, dirDirect, dirIndirect, progress,
+                            why);
         if (!gpuDone) {
             if (progress && progress->cancel) {
                 error = "cancelled";
@@ -1149,36 +1338,60 @@ bool bake(const Document& doc, const Settings& settings, Bake& out, std::string&
             std::fill(out.sunVis.begin(), out.sunVis.end(), uint8_t(0));
             std::fill(scene->direct.begin(), scene->direct.end(), 0.0f);
             std::fill(indirect.begin(), indirect.end(), 0.0f);
+            std::fill(excl.begin(), excl.end(), 0.0f);
+            std::fill(dirDirect.begin(), dirDirect.end(), 0.0f);
+            std::fill(dirIndirect.begin(), dirIndirect.end(), 0.0f);
         }
     }
     if (!gpuDone) {
     out.device = "CPU (" + std::to_string(std::max(1u, std::thread::hardware_concurrency())) + " threads)";
-    // Pass 1: sun visibility at 2x density, then direct light (sun + point lights) per luxel.
+    // Pass 1: shadow masks at 2x density (the sun's, or the face's primary spotlight's), then
+    // direct light (sun + lights) per luxel; the part the game adds in real time goes to excl.
     const bool sun = env.hasSun;
     auto pass1 = [&](size_t fi) {
         const LitFace& lf = lit[fi];
         const FaceMap& m = lf.map;
         const Vec3& n = lf.face.normal;
         const double ndlSun = std::max(0.0, dot(n, env.sunDir));
+        const int si = m.primary >= 0 ? primaryLight[m.primary] : -1;
         for (int y = 0; y < m.h * 2; y++)
             for (int x = 0; x < m.w * 2; x++) {
                 uint8_t vis = 0;
-                if (sun && ndlSun > 0) {
+                if (si >= 0 || (sun && ndlSun > 0)) {
                     Vec3 p = facePoint(lf, m.minU + (x + 0.5) * ls * 0.5, m.minV + (y + 0.5) * ls * 0.5, ls * 0.05) +
                              n * kRayOffset;
-                    vis = sunVisible(*scene, env, p) ? 255 : 0;
+                    vis = (si >= 0 ? spotVisible(*scene, lights[si], p, n) : sunVisible(*scene, env, p)) ? 255 : 0;
                 }
                 out.sunVis[static_cast<size_t>(m.y * 2 + y) * (W * 2) + (m.x * 2 + x)] = vis;
             }
         for (int y = 0; y < m.h; y++)
             for (int x = 0; x < m.w; x++) {
                 Vec3 p = facePoint(lf, m.minU + (x + 0.5) * ls, m.minV + (y + 0.5) * ls, ls * 0.05) + n * kRayOffset;
-                size_t s0 = static_cast<size_t>(m.y * 2 + y * 2) * (W * 2) + (m.x * 2 + x * 2);
-                double vis = (out.sunVis[s0] + out.sunVis[s0 + 1] + out.sunVis[s0 + W * 2] + out.sunVis[s0 + W * 2 + 1]) /
-                             (4.0 * 255.0);
-                Vec3 d = env.sunColor * (vis * ndlSun) + pointLights(*scene, lights, p, &n);
-                float* o = &scene->direct[(static_cast<size_t>(m.y + y) * W + (m.x + x)) * 3];
+                double vis;
+                if (si < 0) {
+                    size_t s0 = static_cast<size_t>(m.y * 2 + y * 2) * (W * 2) + (m.x * 2 + x * 2);
+                    vis = (out.sunVis[s0] + out.sunVis[s0 + 1] + out.sunVis[s0 + W * 2] + out.sunVis[s0 + W * 2 + 1]) / (4.0 * 255.0);
+                } else {
+                    vis = sun && ndlSun > 0 && sunVisible(*scene, env, p) ? 1 : 0;
+                }
+                Vec3 ldir;
+                double lw = 0;
+                const Vec3 sunPart = env.sunColor * (vis * ndlSun);
+                const Vec3 others = pointLights(*scene, lights, p, &n, &ldir, &lw, si);
+                const Vec3 spot = si >= 0 ? oneLight(*scene, lights[si], p, n) : Vec3{};
+                if (si >= 0) {  // the sun is baked on spot faces: it counts towards the direction
+                    ldir += env.sunDir * lum(sunPart);
+                    lw += lum(sunPart);
+                }
+                const Vec3 d = sunPart + others + spot, ex = si >= 0 ? spot : sunPart;
+                const size_t px = static_cast<size_t>(m.y + y) * W + (m.x + x);
+                float* o = &scene->direct[px * 3];
                 o[0] = static_cast<float>(d.x), o[1] = static_cast<float>(d.y), o[2] = static_cast<float>(d.z);
+                float* oe = &excl[px * 3];
+                oe[0] = static_cast<float>(ex.x), oe[1] = static_cast<float>(ex.y), oe[2] = static_cast<float>(ex.z);
+                float* od = &dirDirect[px * 4];
+                od[0] = static_cast<float>(ldir.x), od[1] = static_cast<float>(ldir.y), od[2] = static_cast<float>(ldir.z);
+                od[3] = static_cast<float>(lw);
             }
     };
     if (!parallelFor(lit.size(), progress, 0.0f, 0.3f, pass1)) {
@@ -1202,12 +1415,16 @@ bool bake(const Document& doc, const Settings& settings, Bake& out, std::string&
             for (int y = 0; y < m.h; y++)
                 for (int x = 0; x < m.w; x++) {
                     Vec3 p = facePoint(lf, m.minU + (x + 0.5) * ls, m.minV + (y + 0.5) * ls, ls * 0.05) + n * kRayOffset;
-                    Vec3 sky, bounce;
+                    Vec3 sky, bounce, gdir;
+                    double gw = 0;
+                    const double skyW = lum(env.skyColor);
                     for (int i = 0; i < samples; i++) {
                         Vec3 dir = cosineDir(n, t, b, i, samples, rng);
                         Hit h;
                         if (!scene->trace(p, dir, 1e6f, h) || scene->tris[h.tri].sky) {
                             sky += env.skyColor;
+                            gdir += dir * skyW;
+                            gw += skyW;
                         } else if (settings.bounces > 0) {
                             const Tri& tr = scene->tris[h.tri];
                             if (tr.face >= 0) {
@@ -1216,13 +1433,20 @@ bool bake(const Document& doc, const Settings& settings, Bake& out, std::string&
                                 int hx = std::clamp(static_cast<int>((hp[hm.axisU] - hm.minU) / ls), 0, hm.w - 1) + hm.x;
                                 int hy = std::clamp(static_cast<int>((hp[hm.axisV] - hm.minV) / ls), 0, hm.h - 1) + hm.y;
                                 const float* c = &source[(static_cast<size_t>(hy) * W + hx) * 3];
-                                bounce += Vec3{c[0], c[1], c[2]} * settings.albedo;
+                                const Vec3 bc = Vec3{c[0], c[1], c[2]} * settings.albedo;
+                                bounce += bc;
+                                gdir += dir * lum(bc);
+                                gw += lum(bc);
                             }
                         }
                     }
                     Vec3 e = (sky + bounce) * (1.0 / samples);
-                    float* o = &indirect[(static_cast<size_t>(m.y + y) * W + (m.x + x)) * 3];
+                    const size_t px = static_cast<size_t>(m.y + y) * W + (m.x + x);
+                    float* o = &indirect[px * 3];
                     o[0] = static_cast<float>(e.x), o[1] = static_cast<float>(e.y), o[2] = static_cast<float>(e.z);
+                    float* od = &dirIndirect[px * 4];
+                    od[0] = static_cast<float>(gdir.x / samples), od[1] = static_cast<float>(gdir.y / samples);
+                    od[2] = static_cast<float>(gdir.z / samples), od[3] = static_cast<float>(gw / samples);
                 }
         };
         float from = 0.3f + 0.7f * round / rounds, to = 0.3f + 0.7f * (round + 1) / rounds;
@@ -1234,29 +1458,124 @@ bool bake(const Document& doc, const Settings& settings, Bake& out, std::string&
     }
     }  // CPU passes
 
-    // Final non-sun light: ambient + point lights + sky/bounce. (Direct sun stays out: the game
-    // adds it in real time through the sun primary light and the visibility mask.)
+    // Final baked light: everything but what the game adds in real time (the sun on sun faces,
+    // the face's primary spotlight on spot faces: `excl`), plus ambient.
     for (size_t fi = 0; fi < lit.size(); fi++) {
         const LitFace& lf = lit[fi];
         const FaceMap& m = lf.map;
-        const double ndlSun = std::max(0.0, dot(lf.face.normal, env.sunDir));
         for (int y = 0; y < m.h; y++)
             for (int x = 0; x < m.w; x++) {
                 size_t i = (static_cast<size_t>(m.y + y) * W + (m.x + x)) * 3;
-                size_t s0 = static_cast<size_t>(m.y * 2 + y * 2) * (W * 2) + (m.x * 2 + x * 2);
-                double vis = (out.sunVis[s0] + out.sunVis[s0 + 1] + out.sunVis[s0 + W * 2] + out.sunVis[s0 + W * 2 + 1]) /
-                             (4.0 * 255.0);
-                Vec3 sunPart = env.sunColor * (vis * ndlSun);
                 for (int k = 0; k < 3; k++) {
-                    double v = scene->direct[i + k] - sunPart[k] + indirect[i + k] + env.ambient[k];
+                    double v = scene->direct[i + k] - excl[i + k] + indirect[i + k] + env.ambient[k];
                     out.light[i + k] = static_cast<float>(std::max(0.0, v));
                 }
             }
         out.faces[faceKey(lf.face)] = m;
     }
+    for (const PointLight& L : lights)
+        if (L.bake) out.lights.push_back(L);
+    out.realtime = excl;
+    out.lightDir.resize(dirDirect.size());
+    for (size_t i = 0; i < dirDirect.size(); i++) out.lightDir[i] = dirDirect[i] + dirIndirect[i];
     out.scene = scene;
     if (progress) progress->fraction = 1.0f;
     return true;
+}
+
+std::vector<uint8_t> bakeReflectionProbe(const Bake& b, const Vec3& origin, int size) {
+    size = std::max(1, size);
+    int levels = 1;
+    while ((size >> (levels - 1)) > 1) levels++;
+    size_t perFace = 0;
+    for (int l = 0; l < levels; l++) perFace += static_cast<size_t>(size >> l) * (size >> l);
+    std::vector<uint8_t> out(perFace * 6 * 4, 0);
+    if (!b.scene) return out;
+    const Scene& sc = *b.scene;
+    const Environment& env = b.env;
+    const double albedo = 0.4;
+    // Radiance along a ray from the probe.
+    auto radiance = [&](const Vec3& dir) -> Vec3 {
+        Hit h;
+        if (!sc.trace(origin, dir, 1e6f, h) || sc.tris[h.tri].sky) {
+            Vec3 s = env.skyColor;
+            if (env.hasSun) {
+                const double c = std::max(0.0, dot(dir, env.sunDir));
+                s += env.sunColor * (std::pow(c, 400.0) * 6 + std::pow(c, 12.0) * 0.25);
+            }
+            return s;
+        }
+        const int f = sc.tris[h.tri].face;
+        if (f < 0 || f >= static_cast<int>(sc.maps.size())) return env.ambient * albedo;
+        const FaceMap& m = sc.maps[f];
+        const Vec3 hp = origin + dir * h.t;
+        const int x = std::clamp(static_cast<int>((hp[m.axisU] - m.minU) / b.luxelSize), 0, m.w - 1) + m.x;
+        const int y = std::clamp(static_cast<int>((hp[m.axisV] - m.minV) / b.luxelSize), 0, m.h - 1) + m.y;
+        const size_t i = (static_cast<size_t>(y) * b.width + x) * 3;
+        Vec3 e{b.light[i], b.light[i + 1], b.light[i + 2]};
+        if (b.realtime.size() == b.light.size()) e += Vec3{b.realtime[i], b.realtime[i + 1], b.realtime[i + 2]};
+        return e * albedo;
+    };
+    // Mip 0 in linear radiance, per face; then the box-filtered chain; then sqrt into BGRA.
+    std::vector<std::vector<Vec3>> faces(6, std::vector<Vec3>(static_cast<size_t>(size) * size));
+    parallelFor(6 * static_cast<size_t>(size), nullptr, 0, 1, [&](size_t job) {
+        const int f = static_cast<int>(job / size), ty = static_cast<int>(job % size);
+        for (int tx = 0; tx < size; tx++) {
+            Vec3 acc;
+            for (int sy = 0; sy < 2; sy++)
+                for (int sx = 0; sx < 2; sx++) {
+                    const double sc0 = 2.0 * (tx + 0.25 + 0.5 * sx) / size - 1, tc = 2.0 * (ty + 0.25 + 0.5 * sy) / size - 1;
+                    double x = 0, y = 0, z = 0;
+                    switch (f) {  // D3D cube faces: +X, -X, +Y, -Y, +Z, -Z (as the custom sky)
+                        case 0: x = 1, y = -tc, z = -sc0; break;
+                        case 1: x = -1, y = -tc, z = sc0; break;
+                        case 2: x = sc0, y = 1, z = tc; break;
+                        case 3: x = sc0, y = -1, z = -tc; break;
+                        case 4: x = sc0, y = -tc, z = 1; break;
+                        default: x = -sc0, y = -tc, z = -1; break;
+                    }
+                    acc += radiance(normalize(Vec3{x, y, z}));
+                }
+            faces[f][static_cast<size_t>(ty) * size + tx] = acc * 0.25;
+        }
+    });
+    size_t at = 0;
+    for (int f = 0; f < 6; f++) {
+        std::vector<Vec3> mip = faces[f];
+        int s = size;
+        for (int l = 0; l < levels; l++) {
+            for (size_t t = 0; t < mip.size(); t++, at++)
+                for (int k = 0; k < 3; k++)
+                    out[at * 4 + (2 - k)] = static_cast<uint8_t>(std::lround(std::clamp(std::sqrt(std::max(0.0, mip[t][k])), 0.0, 1.0) * 255));
+            for (size_t t = 0; t < mip.size(); t++) out[(at - mip.size() + t) * 4 + 3] = 255;
+            if (s == 1) break;
+            const int h = s / 2;
+            std::vector<Vec3> next(static_cast<size_t>(h) * h);
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < h; x++)
+                    next[static_cast<size_t>(y) * h + x] = (mip[(2 * y) * s + 2 * x] + mip[(2 * y) * s + 2 * x + 1] + mip[(2 * y + 1) * s + 2 * x] +
+                                                            mip[(2 * y + 1) * s + 2 * x + 1]) *
+                                                           0.25;
+            mip = std::move(next);
+            s = h;
+        }
+    }
+    return out;
+}
+
+const std::array<Vec3, 56>& gridDirections() {
+    static const std::array<Vec3, 56> dirs = [] {
+        std::array<Vec3, 56> d{};
+        size_t n = 0;
+        for (int z = 0; z < 4; z++)
+            for (int y = 0; y < 4; y++)
+                for (int x = 0; x < 4; x++) {
+                    const bool inner = x >= 1 && x <= 2 && y >= 1 && y <= 2 && z >= 1 && z <= 2;
+                    if (!inner) d[n++] = normalize(Vec3{x - 1.5, y - 1.5, z - 1.5});
+                }
+        return d;
+    }();
+    return dirs;
 }
 
 std::vector<GridSample> sampleGrid(const Bake& b, const std::vector<Vec3>& points, int rays) {
@@ -1264,25 +1583,75 @@ std::vector<GridSample> sampleGrid(const Bake& b, const std::vector<Vec3>& point
     if (!b.scene) return out;
     const Scene& sc = *b.scene;
     const Environment& env = b.env;
-    // The light entities aren't kept in the bake, so the grid gets sky + bounce + ambient (point
-    // lights reach models through the bounce they put on nearby surfaces).
-    rays = std::max(4, rays);
+    const std::array<Vec3, 56>& gd = gridDirections();
+    rays = std::max(8, rays);
     parallelFor(points.size(), nullptr, 0, 1, [&](size_t i) {
         const Vec3& p = points[i];
         Rng rng(i * 2654435761ull + 17);
-        Vec3 sum;
+        // Radiance arriving from each ray direction (uniform over the sphere), then the
+        // cosine-weighted sum per grid direction: E(n) = 4/N * sum L * max(0, n.w), so a uniform
+        // surround of L gives L, as on a lightmapped surface.
+        std::array<Vec3, 56> e{};
         for (int r = 0; r < rays; r++) {
             double z = 1 - 2 * ((r + rng.next()) / rays), phi = 2 * kPi * rng.next();
             double s = std::sqrt(std::max(0.0, 1 - z * z));
             Vec3 dir{s * std::cos(phi), s * std::sin(phi), z};
             Hit h;
+            Vec3 L;
             if (!sc.trace(p, dir, 1e6f, h) || sc.tris[h.tri].sky)
-                sum += env.skyColor;
+                L = env.skyColor;
             else if (sc.tris[h.tri].face >= 0)
-                sum += sc.directAt(sc.tris[h.tri].face, p + dir * h.t) * 0.45;
+                L = sc.directAt(sc.tris[h.tri].face, p + dir * h.t) * 0.45;
+            else
+                continue;
+            for (size_t k = 0; k < 56; k++) {
+                const double c = dot(gd[k], dir);
+                if (c > 0) e[k] += L * c;
+            }
         }
-        out[i].light = sum * (1.0 / rays) + env.ambient;
-        out[i].sun = env.hasSun && sunVisible(sc, env, p);
+        for (Vec3& v : e) v = v * (4.0 / rays) + env.ambient;
+        // Which primary light lights models here in real time: the spotlight reaching the point
+        // most (it's then left out of the grid and the sun put in), else the sun if it gets here.
+        const bool sunHere = env.hasSun && sunVisible(sc, env, p);
+        int spot = -1;
+        double best = 1e-4;
+        for (size_t j = 0; j < b.primaries.size(); j++) {
+            const PointLight& L = b.primaries[j];
+            Vec3 l;
+            double dist = 0;
+            const double s = lum(lightReach(L, p, nullptr, &l, &dist));
+            if (s > best && !sc.occluded(p, l, static_cast<float>(dist - 1.0))) best = s, spot = static_cast<int>(j);
+        }
+        out[i].primary = spot >= 0 ? 2 + spot : sunHere ? 1 : 0;
+        if (spot >= 0 && sunHere)
+            for (size_t k = 0; k < 56; k++) {
+                const double c = dot(gd[k], env.sunDir);
+                if (c > 0) e[k] += env.sunColor * c;
+            }
+        // The lights, each with one shadow ray, on every direction facing it.
+        for (const PointLight& L : b.lights) {
+            if (spot >= 0 && L.primary && length(L.origin - b.primaries[spot].origin) < 1e-6) continue;
+            const Vec3 d = L.origin - p;
+            const double dist = length(d);
+            if (dist >= L.radius || dist < 1e-6) continue;
+            const Vec3 l = d * (1.0 / dist);
+            const double f = 1 - (dist * dist) / (L.radius * L.radius);
+            double atten = f * f;
+            if (L.spot) {
+                const double c = -dot(l, L.spotDir);
+                const double t = std::clamp((c - L.cosOuter) / std::max(L.cosInner - L.cosOuter, 1e-6), 0.0, 1.0);
+                atten *= t * t * (3 - 2 * t);
+            }
+            if (atten <= 0 || sc.occluded(p, l, static_cast<float>(dist - 1.0))) continue;
+            for (size_t k = 0; k < 56; k++) {
+                const double c = dot(gd[k], l);
+                if (c > 0) e[k] += L.color * (atten * c);
+            }
+        }
+        Vec3 avg;
+        for (const Vec3& v : e) avg += v;
+        out[i].dir = e;
+        out[i].light = avg * (1.0 / 56);
     });
     return out;
 }

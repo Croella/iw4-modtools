@@ -871,6 +871,102 @@ static void testLightingBake() {
     for (size_t i = 0; i + 2 < b.light.size(); i += 3)
         if (b.light[i] > b.light[i + 2] + 0.2f) warm = true;
     CHECK(warm);
+    // Directional lightmap: decode the compiled secondary with the stock normal-mapped shader's
+    // formula. Flat (n = 0) gives back the baked light; on the floor under the orange light (at
+    // 0 -180 64), a normal tilted towards the light gets more than one tilted away.
+    {
+        CHECK(b.lightDir.size() == b.light.size() / 3 * 4);
+        gfx::GfxWorldData gw;
+        CHECK(gfx::buildGfxWorldData(d, gw, err, &b, true, nullptr));
+        const int W = b.width, H = b.height;
+        CHECK(gw.lightmapSecondaries.size() == 1);
+        const std::vector<uint8_t>& sec = gw.lightmapSecondaries[0].pixels;
+        CHECK(sec.size() == static_cast<size_t>(W) * H * 2 * 4);
+        auto decode = [&](size_t px, double nx, double ny, int k) {
+            const uint8_t* top = &sec[px * 4];
+            const uint8_t* bot = &sec[(px + static_cast<size_t>(W) * H) * 4];
+            const double dx = top[3] / 255.0 * 4.08 - 2.08, dy = bot[3] / 255.0 * 4.0645 - 2.0645;
+            const double inv = 1 / std::sqrt(1 + dx * dx + dy * dy), invN = 1 / std::sqrt(1 + nx * nx + ny * ny);
+            const double c = std::clamp((dx * nx + dy * ny + 1) * inv * invN, 0.0, 1.0);
+            const double v = top[2 - k] / 255.0 * invN + bot[2 - k] / 255.0 * c;
+            return v * v;
+        };
+        double worst = 0;
+        size_t directed = 0, checked = 0;
+        for (size_t px = 0; px < static_cast<size_t>(W) * H; px++) {
+            if (sec[px * 4 + 3] != 130 || sec[(px + static_cast<size_t>(W) * H) * 4 + 3] != 130) directed++;
+            for (int k = 0; k < 3; k++) {
+                const double e = b.light[px * 3 + k];
+                if (e > 3.5) continue;  // past what the format holds
+                worst = std::max(worst, std::fabs(decode(px, 0, 0, k) - e) / std::max(e, 0.05));
+                checked++;
+            }
+        }
+        std::printf("  directional lightmap: %zu of %zu luxels directed, worst flat error %.3f\n", directed, static_cast<size_t>(W) * H,
+                    worst);
+        CHECK(directed > 0 && checked > 0 && worst < 0.08);
+        // Floor luxel 60 units from the light's foot (toward -y); the floor's tangent frame from its
+        // vertices: the light is up and towards +y.
+        Face floorTop;
+        bool found = false;
+        for (const Brush& br : d.ents[0].brushes) {
+            Brush bb = br;
+            if (!bb.rebuild()) continue;
+            for (const Face& f : bb.faces)
+                if (f.normal.z > 0.99 && std::fabs(f.dist) < 1e-6 && bb.bounds.maxs.x - bb.bounds.mins.x > 400) floorTop = f, found = true;
+        }
+        CHECK(found);
+        if (found) {
+            const light::FaceMap* m = b.find(floorTop);
+            CHECK(m != nullptr);
+            if (m) {
+                float u, v;
+                b.lmapCoord(*m, {0, -240 + 4, 0}, u, v);
+                const size_t px = static_cast<size_t>(v * H) * W + static_cast<size_t>(u * W);
+                // Tangent frame as the compiler writes it.
+                const gfx::Vertex* fv = nullptr;
+                for (const gfx::Vertex& vx : gw.vertices)
+                    if (std::fabs(vx.xyz[2]) < 1e-3 && gfx::unpackUnitVec(vx.normal).z > 0.9) fv = &vx;
+                CHECK(fv != nullptr);
+                if (fv) {
+                    const Vec3 t = gfx::unpackUnitVec(fv->tangent), bn = cross(Vec3{0, 0, 1}, t) * fv->binormalSign;
+                    const Vec3 toLight = normalize(Vec3{0, 1, 0});
+                    const double tx = dot(toLight, t), ty = dot(toLight, bn);
+                    const double towards = decode(px, tx * 0.7, ty * 0.7, 0), away = decode(px, -tx * 0.7, -ty * 0.7, 0);
+                    std::printf("  floor near the light: red %.3f flat, %.3f tilted towards it, %.3f away\n", decode(px, 0, 0, 0), towards,
+                                away);
+                    CHECK(towards > away * 1.15);
+                }
+            }
+        }
+    }
+    // Light grid: 56 directions (corners first/last), lamp side brighter and redder, sky above.
+    {
+        const auto& gd = light::gridDirections();
+        CHECK(gd[0].x < 0 && gd[0].y < 0 && gd[0].z < 0 && gd[55].x > 0 && gd[55].y > 0 && gd[55].z > 0 && gd[3].x > 0 && gd[12].y > 0);
+        auto nearest = [&](const Vec3& want) {
+            size_t best = 0;
+            for (size_t k = 1; k < 56; k++)
+                if (dot(gd[k], want) > dot(gd[best], want)) best = k;
+            return best;
+        };
+        // Beside the lamp (at 0 -180 64), 70 units towards +y; and high in the open middle.
+        const std::vector<light::GridSample> gs = light::sampleGrid(b, {{0, -110, 64}, {150, 150, 200}});
+        const size_t toLamp = nearest({0, -1, 0}), away = nearest({0, 1, 0}), up = nearest({0, 0, 1}), down = nearest({0, 0, -1});
+        std::printf("  light grid: by the lamp red %.3f facing it / %.3f away (blue %.3f); open: up %.3f down %.3f\n", gs[0].dir[toLamp].x,
+                    gs[0].dir[away].x, gs[0].dir[toLamp].z, gs[1].dir[up].x, gs[1].dir[down].x);
+        CHECK(gs[0].dir[toLamp].x > gs[0].dir[away].x * 1.5 && gs[0].dir[toLamp].x > gs[0].dir[toLamp].z * 1.3);
+        CHECK(gs[1].dir[up].z > gs[1].dir[down].z);
+        // The compiled palette holds sqrt(light) * 127.5.
+        gfx::GfxWorldData gw;
+        CHECK(gfx::buildGfxWorldData(d, gw, err, &b, true, nullptr));
+        CHECK(!gw.lightGrid.colors.empty());
+        bool varied = false;
+        for (const auto& c : gw.lightGrid.colors)
+            for (size_t k = 3; k < 168; k++)
+                if (c[k] != c[k % 3]) varied = true;
+        CHECK(varied);  // not one colour copied 56 times
+    }
     // The CPU path gives the same bake (sun mask exactly, light up to sampling noise); which one
     // ran first depends on the machine having a D3D11 GPU.
     {
@@ -927,6 +1023,176 @@ static void testLightingBake() {
     if (cw && cw->primaryLightCount == 2)
         CHECK(std::fabs(cw->primaryLights[1].dir[2] - static_cast<float>(env.sunDir.z)) < 1e-4f);
     std::printf("lighting: atlas %dx%d luxels @ %.0f units, %zu faces\n", b.width, b.height, b.luxelSize, b.faces.size());
+    CHECK(b.gpuNote.find("compile") == std::string::npos);  // a GPU that's there must run the kernels
+
+    // Lightmap pages: a 128-luxel page limit at 8 units/luxel needs several pages (the luxel size
+    // stays); the zone gets one primary/secondary pair per page and surfaces on each.
+    {
+        light::Settings ps = s;
+        ps.maxAtlas = 128;
+        ps.luxelSize = 8;
+        light::Bake mb;
+        CHECK(light::bake(d, ps, mb, err));
+        std::printf("  pages: %zu at %.0f units/luxel, atlas %dx%d\n", mb.pageY.size(), mb.luxelSize, mb.width, mb.height);
+        CHECK(mb.pageY.size() >= 2 && mb.luxelSize == 8 && mb.width == 128);
+        CompileOptions mo;
+        mo.prebaked = &mb;
+        std::vector<uint8_t> mff;
+        CHECK(compileMapToFastfile(d, "mp_pages", mff, err, MapTarget::MP, mo));
+        Fastfile mz;
+        CHECK(readFastfile(mff, mz, err));
+        zone::SimulatedZone msim;
+        CHECK(zone::simulateLoad(mz.zone, msim, err));
+        auto* mg = static_cast<const iw4::GfxWorld*>(msim.find(IW4_GFXWORLD));
+        CHECK(mg != nullptr);
+        if (mg) {
+            const iw4::GfxWorldDraw& dr = mg->draw;
+            CHECK(dr.lightmapCount == static_cast<int>(mb.pageY.size()));
+            for (int p = 0; p < dr.lightmapCount; p++)
+                CHECK(dr.lightmaps[p].primary->width == 256 && dr.lightmaps[p].primary->height == mb.pageH[p] * 2 &&
+                      dr.lightmaps[p].secondary->height == mb.pageH[p] * 2);
+            std::vector<bool> used(dr.lightmapCount, false);
+            for (unsigned i = 0; i < mg->surfaceCount; i++) {
+                const unsigned li = mg->dpvs.surfaces[i].laf.fields.lightmapIndex;
+                if (li < used.size()) used[li] = true;
+            }
+            bool all = true;
+            for (bool u : used) all = all && u;
+            CHECK(all);
+            bool inRange = true;
+            for (unsigned i = 0; i < dr.vertexCount; i++) {
+                const float* lc = dr.vd.vertices[i].lmapCoord;
+                if (lc[0] < 0 || lc[0] > 1 || lc[1] < 0 || lc[1] > 1) inRange = false;
+            }
+            CHECK(inRange);
+            // A luxel in the middle of a page-1 face decodes (flat) to its baked light.
+            for (const auto& [key, m] : mb.faces) {
+                if (m.page != 1 || m.w < 3 || m.h < 3) continue;
+                const int x = m.x + m.w / 2, y = m.y + m.h / 2, py = y - mb.pageY[1];
+                const uint8_t* sec = dr.lightmaps[1].secondary->texture.loadDef->data;
+                const uint8_t* top = sec + (static_cast<size_t>(py) * mb.width + x) * 4;
+                const uint8_t* bot = sec + (static_cast<size_t>(py + mb.pageH[1]) * mb.width + x) * 4;
+                const double dx = top[3] / 255.0 * 4.08 - 2.08, dy = bot[3] / 255.0 * 4.0645 - 2.0645;
+                const double c0 = 1 / std::sqrt(1 + dx * dx + dy * dy), v = top[2] / 255.0 + bot[2] / 255.0 * c0;
+                const double e = mb.light[(static_cast<size_t>(y) * mb.width + x) * 3];
+                std::printf("  page 1 luxel: decoded red %.3f, baked %.3f\n", v * v, e);
+                CHECK(e < 3.5 && std::fabs(v * v - e) <= 0.08 * std::max(e, 0.05));
+                break;
+            }
+        }
+    }
+
+    // Reflection probes: two reflection_probe entities -> two baked 64x64 cubes (stock format),
+    // surfaces split between them, the open roof (+Z face) brighter than the floor (-Z face).
+    {
+        Document dr2 = d;
+        for (double x : {-150.0, 150.0}) {
+            Sel P = dr2.addPointEntity("reflection_probe", {x, 0, 64});
+            (void)P;
+        }
+        CompileOptions ro;
+        ro.prebaked = &b;
+        std::vector<uint8_t> rff;
+        CHECK(compileMapToFastfile(dr2, "mp_probe", rff, err, MapTarget::MP, ro));
+        Fastfile rz;
+        CHECK(readFastfile(rff, rz, err));
+        zone::SimulatedZone rsim;
+        CHECK(zone::simulateLoad(rz.zone, rsim, err));
+        auto* rg = static_cast<const iw4::GfxWorld*>(rsim.find(IW4_GFXWORLD));
+        CHECK(rg != nullptr);
+        if (rg) {
+            const iw4::GfxWorldDraw& dr = rg->draw;
+            CHECK(dr.reflectionProbeCount == 2 && rg->cells[0].reflectionProbeCount == 2);
+            CHECK(dr.reflectionProbeOrigins[1].origin[0] == 150);
+            const iw4::GfxImage* im = dr.reflectionProbes[0];
+            CHECK(im->width == 64 && im->mapType == 5 && im->texture.loadDef->resourceSize == 131064);
+            auto faceAvg = [&](int face) {  // mip 0 of a face, BGRA -> mean of r+g+b
+                const uint8_t* px = im->texture.loadDef->data + static_cast<size_t>(face) * 5461 * 4;
+                double s = 0;
+                for (int t = 0; t < 64 * 64; t++) s += px[t * 4] + px[t * 4 + 1] + px[t * 4 + 2];
+                return s / (64 * 64 * 3);
+            };
+            std::printf("  probe 0: up %.1f, down %.1f, +x %.1f\n", faceAvg(4), faceAvg(5), faceAvg(0));
+            CHECK(faceAvg(4) > faceAvg(5));
+            bool used[2] = {false, false};
+            for (unsigned i = 0; i < rg->surfaceCount; i++) {
+                const unsigned pi = rg->dpvs.surfaces[i].laf.fields.reflectionProbeIndex;
+                if (pi < 2) used[pi] = true;
+            }
+            CHECK(used[0] && used[1]);
+        }
+    }
+
+    // Primary spotlight ("primary" "1"): a lamp under the roof aimed down past the pillar's side.
+    // Faces it reaches switch to it (its shadow mask in sunVis, the spot left out of the baked
+    // light, the sun baked in); the zone carries it as primary light 2 with shadow casters and a
+    // region, and the grid cells it reaches point models at it.
+    {
+        Document dp = d;
+        Sel S = dp.addPointEntity("light", {96, 0, 240});
+        dp.ents[S.ent].set("radius", "400");
+        dp.ents[S.ent].set("intensity", "2");
+        dp.ents[S.ent].set("fov_outer", "40");
+        dp.ents[S.ent].set("angles", "70 180 0");  // down and towards -x: past the pillar
+        dp.ents[S.ent].set("primary", "1");
+        light::Bake pb;
+        CHECK(light::bake(dp, s, pb, err));
+        CHECK(pb.primaries.size() == 1);
+        int spotFaces = 0, sunFaces = 0;
+        for (const auto& [key, m] : pb.faces) (m.primary == 0 ? spotFaces : sunFaces)++;
+        std::printf("  primary spot: %d face(s) on the spot, %d on the sun\n", spotFaces, sunFaces);
+        CHECK(spotFaces > 0 && sunFaces > 0);
+        // Floor on the far (-x) side of the pillar: in the spot's cone, in the pillar's shadow from it.
+        Face floorTop;
+        for (const Brush& br : dp.ents[0].brushes) {
+            Brush bb = br;
+            if (!bb.rebuild()) continue;
+            for (const Face& f : bb.faces)
+                if (f.normal.z > 0.99 && std::fabs(f.dist) < 1e-6 && bb.bounds.maxs.x - bb.bounds.mins.x > 400) floorTop = f;
+        }
+        const light::FaceMap* fm = pb.find(floorTop);
+        CHECK(fm && fm->primary == 0);
+        if (fm) {
+            auto mask = [&](double x, double y) {
+                float u, v;
+                pb.lmapCoord(*fm, {x, y, 0}, u, v);
+                return pb.sunVis[static_cast<size_t>(v * pb.height * 2) * (pb.width * 2) + static_cast<size_t>(u * pb.width * 2)];
+            };
+            const int shadowed = mask(-80, 0), lit = mask(-30, 180);
+            std::printf("  spot mask on the floor: behind the pillar %d, beside it %d\n", shadowed, lit);
+            CHECK(shadowed == 0 && lit == 255);
+        }
+        CompileOptions po;
+        po.prebaked = &pb;
+        std::vector<uint8_t> pff;
+        CHECK(compileMapToFastfile(dp, "mp_spot", pff, err, MapTarget::MP, po));
+        Fastfile pz;
+        CHECK(readFastfile(pff, pz, err));
+        zone::SimulatedZone psim;
+        CHECK(zone::simulateLoad(pz.zone, psim, err));
+        if (!err.empty()) std::printf("  simulateLoad (spot): %s\n", err.c_str());
+        auto* pg = static_cast<const iw4::GfxWorld*>(psim.find(IW4_GFXWORLD));
+        auto* pc = static_cast<const iw4::ComWorld*>(psim.find(IW4_COMWORLD));
+        CHECK(pg && pc);
+        if (pg && pc) {
+            CHECK(pg->primaryLightCount == 3 && pc->primaryLightCount == 3);
+            const iw4::ComPrimaryLight& L = pc->primaryLights[2];
+            CHECK(L.type == 2 && L.canUseShadowMap == 1 && L.radius == 400 && L.dir[2] > 0.9f && L.origin[2] == 240);
+            CHECK(L.defName && std::string(L.defName) == "light_point_linear");
+            int spotSurfs = 0;
+            for (unsigned i = 0; i < pg->surfaceCount; i++) spotSurfs += pg->dpvs.surfaces[i].laf.fields.primaryLightIndex == 2;
+            CHECK(spotSurfs > 0);
+            CHECK(pg->shadowGeom[2].surfaceCount > 0 && pg->shadowGeom[0].surfaceCount == 0);
+            CHECK(pg->lightRegion[2].hullCount == 1 && pg->lightRegion[1].hullCount == 0);
+            const iw4::GfxLightRegionHull& h = pg->lightRegion[2].hulls[0];
+            CHECK(h.kdopMidPoint[2] - h.kdopHalfSize[2] < -300 && h.kdopMidPoint[2] + h.kdopHalfSize[2] > 0);  // reaches down
+            bool spotCell = false;
+            for (unsigned i = 0; i < pg->lightGrid.entryCount; i++)
+                if (pg->lightGrid.entries[i].primaryLightIndex == 2) spotCell = true;
+            CHECK(spotCell);
+            std::printf("  zone: %d spot surface(s), %u shadow caster(s)\n", spotSurfs, pg->shadowGeom[2].surfaceCount);
+        }
+    }
 }
 
 // Sky: the stock sky shader set is copied from trainer.ff, and sky faces become GfxWorld sky
