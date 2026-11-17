@@ -1,0 +1,23 @@
+- [Project direction](project-direction.md) — x64 iw4mp target, own compiler, editor first, C++20/D3D11/ImGui
+- [IW4 symbols and data](reference-iw4-symbols.md) — where PDBs (Xbox 360!), IDA databases, and game files live
+- [x64 zone format](x64-zone-format.md) -- 64-bit zones, unsigned header prefix, and open questions for the compiler
+- [Signed zone format](signed-zone-format.md) -- IWffs100 MP maps decoded (interleaved SHA-256 auth blocks); editor reads them
+- [Client integration](client-integration.md) -- Serenity accepts unsigned IWffu100 zones + builds assets in memory; the map load path
+- [x64 struct layouts](x64-struct-layouts.md) -- validated map-asset layouts (clipMap_t/GfxWorld/MapEnts/...) + src/game/iw4_structs.h
+- [Zone linker](zone-linker.md) -- map compiler + reversed loader stream model; full map zone passes loader sim; SP map import into editor works; in-game test next
+- [Live process dump](live-process-dump.md) -- editor reads running iw4mp.exe or iw4sp.exe via ReadProcessMemory to import a map's models/materials; RE'd pool addresses
+- [Compile & Run](compile-and-run.md) -- F5/F7 ask MP or SP; save, compile, deploy .ff, launch iw4mp/iw4sp plain, inject loader DLL
+- [devmap loader DLL](devmap-loader-dll.md) -- iw4r_mapload.dll: redirects *.ff opens to the deploy folder so compiled maps devmap
+- [Lighting](lighting.md) -- IW4 lightmap/sun encoding + embedded sky (copied from trainer.ff); src/light baker (GPU + CPU fallback; directional lightmaps, 56-dir grid, primary spots, probes, pages) drives compile + editor preview (F9)
+- [World materials](world-materials.md) -- world materials embedded from a stock-definition library (matdefs); falloff/dust effects use our own compiled shaders
+- [Weapons](weapons.md) -- custom weapons from zone_source/weapons (IW4 weapon files, RE'd x64 layout), AK-74u loads in SP; layout validated live
+- [zone_source pipeline](zone-source.md) -- custom models (M1 verified), M2 skinned models + xanims built (demo_tail in modeltest), awaiting in-game test; next M3 weapons
+- [Volumetric lighting](volumetric-lighting.md) -- shafts + height fog in iw4r_mapload.dll (INTZ depth, camera from VS constants, drawn before the HUD, player-clip occluders) + editor preview
+- [Custom sky](custom-sky.md) -- zone_source/skies/<sky>.png panorama -> inline cube sky; stock sky iwi = cubemap; night sky generator
+- [Zombies / SP AI](zombies-ai.md) -- path node compiler (stock PathData RE'd), actor_zombie aitype, maps\_zombies boarded windows; zm_test sample WORKS in-game
+- [Effects](effects.md) -- .efx -> FxEffectDef compiler (verified vs stock saw_flshview_c), BO1 materials/images auto-import, fx_origin -> generated script; awaiting in-game test
+- [Brush triggers](brush-triggers.md) -- trigger_multiple etc. -> MapEnts '?N' trigger models (stock format)
+- [World geometry](world-geometry.md) -- patches, brush models *N, static models (misc_model), XModel collision; stock formats RE'd; awaiting in-game test
+- [Map folder layout](map-folder-layout.md) -- maps/<map>/<map>.map + .gsc + zone_source/ + .ff; zm_test + geotest kept; no shared maps/zone_source
+- [SSAO, grading, DOF, flare, weather, light shafts, contact shadows](ssao-colorgrade.md) -- volumetric_ssao*/_contact*/_grade*/_dof*/_flare*/_glare*/_weather*/_lights* (+ spotlights) + trigger_grade/trigger_weather -> .volumetric -> DLL + editor passes; awaiting in-game test
+- [Memory in git](memory-in-git.md) -- this memory dir is a junction to <repo>/memory, committed with the repo
