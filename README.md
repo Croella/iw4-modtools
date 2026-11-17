@@ -3,7 +3,7 @@
 ## Build
 
 Requires Visual Studio 2026 with the C++ desktop workload, and CMake 3.24 or newer. ImGui and
-miniz are downloaded at configure time.
+miniz are included in third_party/.
 
 ```sh
 cmake -S . -B build -G "Visual Studio 18 2026" -A x64

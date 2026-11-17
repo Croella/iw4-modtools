@@ -5,25 +5,16 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-include(FetchContent)
-FetchContent_Declare(imgui
-  GIT_REPOSITORY https://github.com/ocornut/imgui.git
-  GIT_TAG 1ab953d75a760d5102eb2d5c4c6c4e65df6b29f3) # docking branch
-# SOURCE_SUBDIR points nowhere so miniz's own CMake project is not configured.
-FetchContent_Declare(miniz
-  GIT_REPOSITORY https://github.com/richgel999/miniz.git
-  GIT_TAG 3.1.2
-  SOURCE_SUBDIR _unused)
-FetchContent_MakeAvailable(imgui miniz)
+# ImGui (docking branch) and miniz are vendored in third_party/ (versions in third_party/README.txt).
+set(imgui_SOURCE_DIR ${CMAKE_SOURCE_DIR}/third_party/imgui)
+set(miniz_SOURCE_DIR ${CMAKE_SOURCE_DIR}/third_party/miniz)
 
-# miniz.h includes a header its CMake project normally generates.
-file(WRITE ${CMAKE_BINARY_DIR}/miniz_gen/miniz_export.h "#pragma once\n#define MINIZ_EXPORT\n")
 add_library(miniz_lib STATIC
   ${miniz_SOURCE_DIR}/miniz.c
   ${miniz_SOURCE_DIR}/miniz_tdef.c
   ${miniz_SOURCE_DIR}/miniz_tinfl.c
   ${miniz_SOURCE_DIR}/miniz_zip.c)
-target_include_directories(miniz_lib PUBLIC ${miniz_SOURCE_DIR} ${CMAKE_BINARY_DIR}/miniz_gen)
+target_include_directories(miniz_lib PUBLIC ${miniz_SOURCE_DIR})
 
 add_library(imgui_lib STATIC
   ${imgui_SOURCE_DIR}/imgui.cpp
