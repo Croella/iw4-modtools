@@ -62,6 +62,12 @@ bool parse(const std::string& text, const std::string& name, Weapon& out, std::v
            std::string& error);
 
 const std::vector<Field>& fields();
+// What a weapon-file key refers to (for editors and reference checks): gunModel/worldModel[N],
+// handModel and every other XModel field -> Model, the 37 *Anim keys -> Anim, sound/fx/material
+// fields by their kind. Keys are case-insensitive.
+enum class RefKind { None, Model, Anim, Sound, Fx, Material };
+RefKind refKind(const std::string& key);
+const char* animKey(int slot);  // "idleAnim", ... (slot < kAnimCount)
 
 // Offsets of the pointer fields the writer (and zonesim) handle, in loader order.
 namespace off {

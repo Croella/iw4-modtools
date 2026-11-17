@@ -40,6 +40,7 @@ add_library(iw4r_core STATIC
   src/brushshapes.cpp
   src/patch.cpp
   src/worldgeom.cpp
+  src/assetmanager.cpp
   src/terrain.cpp
   src/fxpreview.cpp
   src/document.cpp
@@ -76,10 +77,23 @@ target_link_libraries(iw4r_core PUBLIC miniz_lib d3d11 dxgi d3dcompiler)
 add_executable(iw4radiant WIN32
   src/main.cpp
   src/app.cpp
-  src/assets.cpp
-  src/renderer.cpp
   src/uitest.cpp)
-target_link_libraries(iw4radiant PRIVATE iw4r_core imgui_lib d3d11 dxgi d3dcompiler comdlg32 shell32 ole32)
+target_link_libraries(iw4radiant PRIVATE iw4r_ui)
+
+# UI shared by Mod Tools and Radiant: renderer, material/texture database, the Asset Manager window.
+add_library(iw4r_ui STATIC
+  src/assetpanel.cpp
+  src/modelpreview.cpp
+  src/assets.cpp
+  src/renderer.cpp)
+target_link_libraries(iw4r_ui PUBLIC iw4r_core imgui_lib d3d11 dxgi d3dcompiler comdlg32 shell32 ole32)
+
+# IW4 Mod Tools: the main program (maps, Asset Manager), launches Radiant.
+add_executable(iw4modtools WIN32
+  src/modtools/main.cpp
+  src/modtools/modtools.cpp)
+target_link_libraries(iw4modtools PRIVATE iw4r_ui)
+add_dependencies(iw4modtools iw4radiant)  # launched from Mod Tools, so built with it
 
 add_executable(iw4r_zone src/zonetool_main.cpp)
 target_link_libraries(iw4r_zone PRIVATE iw4r_core)
@@ -101,6 +115,8 @@ add_test(NAME core COMMAND iw4r_tests)
 if(MSVC)
   target_compile_options(iw4r_core PRIVATE /W4 /utf-8)
   target_compile_options(iw4radiant PRIVATE /W4 /utf-8)
+  target_compile_options(iw4r_ui PRIVATE /W4 /utf-8)
+  target_compile_options(iw4modtools PRIVATE /W4 /utf-8)
   target_compile_options(iw4r_tests PRIVATE /W4 /utf-8)
   target_compile_definitions(iw4r_core PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 endif()

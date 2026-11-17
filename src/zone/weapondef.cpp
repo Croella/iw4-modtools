@@ -470,6 +470,29 @@ const std::vector<Field>& fields() {
     return f;
 }
 
+const char* animKey(int slot) { return slot >= 0 && slot < kAnimCount ? kAnimKeys[slot] : ""; }
+
+RefKind refKind(const std::string& key) {
+    const std::string k = lower(key);
+    auto indexed = [&](const char* base) {
+        const size_t n = std::strlen(base);
+        return k == base || (k.size() == n + 1 && k.compare(0, n, base) == 0 && std::isdigit(static_cast<unsigned char>(k[n])));
+    };
+    if (indexed("gunmodel") || indexed("worldmodel")) return RefKind::Model;
+    if (k == "bouncesound") return RefKind::Sound;
+    for (int a = 0; a < kAnimCount; a++)
+        if (iequals(key, kAnimKeys[a])) return RefKind::Anim;
+    for (const Field& f : fields())
+        if (iequals(key, f.key)) switch (f.kind) {
+                case Kind::Model: return RefKind::Model;
+                case Kind::Sound: return RefKind::Sound;
+                case Kind::Fx: return RefKind::Fx;
+                case Kind::Material: return RefKind::Material;
+                default: return RefKind::None;
+            }
+    return RefKind::None;
+}
+
 bool parse(const std::string& text, const std::string& name, Weapon& out, std::vector<std::string>& warnings,
            std::string& error) {
     out = Weapon{};

@@ -354,6 +354,7 @@ void App::log(const std::string& text) {
 }
 
 bool App::confirmDiscard() {
+    if (!assetPanel.saveOrDiscard()) return false;  // unsaved weapon edits in the Asset Manager
     if (!doc.dirty) return true;
     int r = MessageBoxA(hwnd, "Save changes to the current map?", "iw4-radiant", MB_YESNOCANCEL | MB_ICONWARNING);
     if (r == IDCANCEL) return false;
@@ -374,87 +375,55 @@ void App::newMap() {
 // library, so script_model / misc_model entities using them draw in the 3D view.
 void App::loadZoneSourcePreview() {
     if (doc.path.empty()) return;
-    const std::string dir = zoneSourcePath(doc.path);
-    if (!std::filesystem::is_directory(std::filesystem::path(dir) / "xmodels")) return;
-    std::vector<std::string> warnings;
-    // Same build options as the compiler (weapon hideTags drop attachment geometry, ...), so the
-    // preview and the Models browser show what the game will.
-    std::vector<std::string> weaponWarnings;
-    ZoneSourceWeapons zw = loadZoneSourceWeapons(dir, weaponWarnings);
-    std::vector<modelbuild::Model> models = loadZoneSourceModels(dir, warnings, &zw.hints);
-    for (const std::string& w : warnings) log("  zone_source: " + w);
-    browserModels.clear();
-    renderer.clearThumbnails();
-    for (const modelbuild::Model& md : models) {
-        auto lm = std::make_shared<live::LiveModel>();
-        lm->name = md.name;
-        BrowserModel bm;
-        bm.name = md.name;
-        bm.bones = md.bones.size();
-        bm.surfaces = md.surfaces.size();
-        for (const modelbuild::Surface& s : md.surfaces) {
-            bm.tris += s.tris.size() / 3;
-            bm.verts += s.verts.size();
-            const std::string& tex = md.materials[s.material].texture;
-            const std::string t = tex.empty() ? md.materials[s.material].name : std::filesystem::path(tex).filename().string();
-            if (std::find(bm.textures.begin(), bm.textures.end(), t) == bm.textures.end()) bm.textures.push_back(t);
-        }
-        bm.size = Vec3{md.maxs[0] - md.mins[0], md.maxs[1] - md.mins[1], md.maxs[2] - md.mins[2]};
-        browserModels.push_back(std::move(bm));
-        for (const modelbuild::Surface& s : md.surfaces) {
-            live::LiveModelSurf ls;
-            const modelbuild::Material& mm = md.materials[s.material];
-            ls.material = "mc/" + md.name + "_" + mm.name;
-            // Same search as the compiler (planModelMaterials): zone_source/images, then next to the
-            // models in zone_source/xmodels; exported name, stem.png/.tga, and without t5_/t6_/t7_.
-            std::string stem = std::filesystem::path(mm.texture).stem().string();
-            if (stem.empty()) stem = mm.name;
-            std::string bare = stem;
-            for (const char* pre : {"t5_", "t6_", "t7_", "T5_", "T6_", "T7_"})
-                if (bare.rfind(pre, 0) == 0) bare = bare.substr(3);
-            bool found = false;
-            for (const char* sub : {"images", "xmodels"}) {
-                std::vector<std::string> cands;
-                if (!mm.texture.empty()) cands.push_back(std::filesystem::path(mm.texture).filename().string());
-                for (const std::string& st : {stem, bare})
-                    for (const char* ext : {".png", ".tga", ".PNG", ".TGA"}) cands.push_back(st + ext);
-                for (const std::string& cand : cands) {
-                    std::filesystem::path p = std::filesystem::path(dir) / sub / cand;
-                    std::error_code ec;
-                    if (!cand.empty() && std::filesystem::is_regular_file(p, ec)) {
-                        renderer.setTextureFile(ls.material, p.string());
-                        found = true;
-                        break;
-                    }
-                }
-                if (found) break;
-            }
-            for (const modelbuild::PackedVertex& v : s.verts) {
-                ls.pos.insert(ls.pos.end(), v.xyz, v.xyz + 3);
-                Vec3 n = gfx::unpackUnitVec(v.normal);
-                ls.nrm.push_back(static_cast<float>(n.x));
-                ls.nrm.push_back(static_cast<float>(n.y));
-                ls.nrm.push_back(static_cast<float>(n.z));
-                auto half = [](uint16_t h) {
-                    uint32_t sign = (h >> 15) & 1, e = (h >> 10) & 0x1F, m = h & 0x3FF, bits;
-                    if (e == 0) bits = sign << 31;
-                    else bits = (sign << 31) | ((e - 15 + 127) << 23) | (m << 13);
-                    float f;
-                    std::memcpy(&f, &bits, 4);
-                    return f;
-                };
-                ls.uv.push_back(half(static_cast<uint16_t>(v.texCoord & 0xFFFF)));
-                ls.uv.push_back(half(static_cast<uint16_t>(v.texCoord >> 16)));
-                lm->bounds.add(Vec3{v.xyz[0], v.xyz[1], v.xyz[2]});
-            }
-            // The game's winding is clockwise from the front; the preview draws both sides anyway.
-            ls.idx = s.tris;
-            lm->surfs.push_back(std::move(ls));
-        }
-        liveModels[live::modelKey(md.name)] = lm;
-    }
+    modelpreview::load(zoneSourcePath(doc.path), renderer, liveModels, &browserModels, [this](const std::string& t) { log(t); });
     meshRevision = 0;
-    if (!models.empty()) log("Loaded " + std::to_string(models.size()) + " zone_source model(s) for preview from " + dir);
+}
+
+ID3D11ShaderResourceView* App::modelThumbnail(const std::string& model, int size, float yawDeg) {
+    auto lm = liveModels.find(live::modelKey(model));
+    return lm == liveModels.end() ? nullptr : renderer.modelThumbnail(model, *lm->second, size, yawDeg);
+}
+
+ID3D11ShaderResourceView* App::imageTexture(const std::string& path) {
+    const std::string key = "file:" + path;
+    if (imageTextures.insert(key).second) renderer.setTextureFile(key, path);
+    return renderer.texture(key);
+}
+
+int App::selectedEntityCount() {
+    int n = 0;
+    for (const Sel& s : doc.sel)
+        if (s.brush < 0 && s.ent > 0) n++;
+    return n;
+}
+
+void App::useModelOnSelection(const std::string& model) {
+    doc.pushUndo();
+    for (const Sel& s : doc.sel)
+        if (s.brush < 0 && s.ent > 0) doc.ents[s.ent].set("model", model);
+    doc.touch();
+}
+
+int App::entitiesUsingModel(const std::string& model) {
+    int n = 0;
+    for (const Entity& e : doc.ents)
+        if (const std::string* m = e.find("model"); m && _stricmp(m->c_str(), model.c_str()) == 0) n++;
+    return n;
+}
+
+void App::renameEntityModels(const std::string& from, const std::string& to) {
+    if (!entitiesUsingModel(from)) return;
+    doc.pushUndo();
+    for (Entity& e : doc.ents)
+        if (const std::string* m = e.find("model"); m && _stricmp(m->c_str(), from.c_str()) == 0) e.set("model", to);
+    doc.touch();
+    log("  map entities using " + from + " now use " + to + " (save the map)");
+}
+
+void App::openAssetManager(const std::string& select) {
+    showAssets = true;
+    assetPanel.setRoot(doc.path.empty() ? "" : zoneSourcePath(doc.path));
+    assetPanel.select(select);
 }
 
 bool App::openMap(const std::string& path) {
@@ -1174,6 +1143,7 @@ void App::handleShortcuts() {
     if (ImGui::IsKeyPressed(ImGuiKey_F7, false)) requestCompile(PendingCompile::ToFile);
     if (ImGui::IsKeyPressed(ImGuiKey_F5, false)) requestCompile(PendingCompile::AndRun);
     if (ImGui::IsKeyPressed(ImGuiKey_F9, false)) startBake();
+    if (ImGui::IsKeyPressed(ImGuiKey_F4, false)) showAssets = !showAssets;
     if (ImGui::IsKeyPressed(ImGuiKey_F6, false)) {
         renderer.cullBackFaces = !renderer.cullBackFaces;
         meshRevision = 0;
@@ -1221,6 +1191,11 @@ void App::frame() {
     drawTerrainPanel();
     drawTextures();
     drawModelBrowser();
+    assetPanel.setRoot(doc.path.empty() ? "" : zoneSourcePath(doc.path),
+                       "Save the map first: assets live in zone_source/ next to the .map "
+                       "(maps/<map>/zone_source: weapons/, xmodels/, xanims/, images/, fx/, skies/, scripts/).");
+    assetPanel.poll();
+    if (showAssets) assetPanel.draw("Asset Manager", &showAssets);
     drawConsole();
     if (showSettings) drawSettings();
     drawCompileTargetPopup();
@@ -1277,6 +1252,12 @@ void App::drawMenu() {
         if (ImGui::MenuItem("Reload zone_source Models", nullptr, false, !doc.path.empty())) loadZoneSourcePreview();
         if (ImGui::MenuItem("Dump Fast File...")) dumpDialog();
         ImGui::Separator();
+        if (ImGui::MenuItem("Open Mod Tools")) {
+            // Mod Tools (iw4modtools.exe beside this exe) is the main program; Radiant is the map editor.
+            const std::string exe = (std::filesystem::path(exeDir()) / "iw4modtools.exe").string();
+            if (reinterpret_cast<INT_PTR>(ShellExecuteA(hwnd, "open", exe.c_str(), nullptr, exeDir().c_str(), SW_SHOWNORMAL)) <= 32)
+                log("Couldn't start " + exe);
+        }
         if (ImGui::MenuItem("Exit")) PostMessageA(hwnd, WM_CLOSE, 0, 0);
         ImGui::EndMenu();
     }
@@ -1308,6 +1289,8 @@ void App::drawMenu() {
         if (ImGui::MenuItem("Tool Brushes (caulk, clip...)", nullptr, &renderer.showToolFaces)) meshRevision = 0;
         if (ImGui::MenuItem("Back-Face Culling (as in game)", "F6", &renderer.cullBackFaces)) meshRevision = 0;
         if (ImGui::MenuItem("Frame All", "Home")) frameAll();
+        ImGui::Separator();
+        ImGui::MenuItem("Asset Manager", "F4", &showAssets);
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Lighting")) {
@@ -2116,6 +2099,11 @@ void App::drawToolbar() {
                               "are merged into their parents). Originals are kept as .orig.");
         ImGui::EndDisabled();
         ImGui::SameLine();
+        if (ImGui::Button("Assets")) showAssets = !showAssets;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Asset Manager (F4): the map's zone_source weapons, models, anims, images, effects...\n"
+                              "details, what uses what, problems, weapon editing, import / rename / delete.");
+        ImGui::SameLine();
         ImGui::TextDisabled("|");
         ImGui::SameLine();
         if (penActive) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
@@ -2621,6 +2609,12 @@ void App::addShape(int shapeIndex) {
 }
 
 // A script_model using `model` at `at` (selected, undoable).
+void App::placeModelAtCamera(const std::string& model) {
+    Vec3 hit;
+    Vec3 p = cameraRayHit(camera.forward(), hit) ? hit : camera.pos + camera.forward() * 256.0;
+    placeModel(model, {snapTo(p.x, gridSize), snapTo(p.y, gridSize), snapTo(p.z, gridSize)});
+}
+
 void App::placeModel(const std::string& model, const Vec3& at) {
     doc.pushUndo();
     Sel s = doc.addPointEntity("script_model", at);

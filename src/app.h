@@ -3,12 +3,16 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <future>
+#include <set>
 #include <memory>
 #include <thread>
 #include <mutex>
 #include <string>
 #include <vector>
 #include "assets.h"
+#include "assetpanel.h"
+#include "modelpreview.h"
 #include "document.h"
 #include "brushshapes.h"
 #include "terrain.h"
@@ -24,7 +28,7 @@ struct GridView {
     double zoom = 0.5;  // pixels per world unit
 };
 
-class App {
+class App : public AssetHost {
 public:
     void init(ID3D11Device* device, ID3D11DeviceContext* context, const std::string& gamePath);
     void shutdown();
@@ -39,7 +43,8 @@ public:
     void frameAll();  // camera + grid views fit the whole map
     void buildDemo();
     void selectAll();
-    void bakeLightingNow();  // bakes and waits (command line --bake)
+    void bakeLightingNow();
+    void openAssetManager(const std::string& select);  // --assets: shows it, selects that asset (any kind)  // bakes and waits (command line --bake)
 
     HWND hwnd = nullptr;
     Renderer renderer;
@@ -64,7 +69,18 @@ private:
         Vec3 origin;
     };
 
-    void log(const std::string& text);
+    void log(const std::string& text) override;
+    // AssetHost (the shared Asset Manager window, assetpanel.h)
+    HWND window() override { return hwnd; }
+    ID3D11ShaderResourceView* modelThumbnail(const std::string& model, int size, float yawDeg) override;
+    ID3D11ShaderResourceView* imageTexture(const std::string& path) override;
+    void reloadPreview() override { loadZoneSourcePreview(); }
+    bool isEditor() const override { return true; }
+    void placeModel(const std::string& model) override { placeModelAtCamera(model); }
+    int selectedEntityCount() override;
+    void useModelOnSelection(const std::string& model) override;
+    int entitiesUsingModel(const std::string& model) override;
+    void renameEntityModels(const std::string& from, const std::string& to) override;
     void drawMenu();
     void drawDockspace();
     void drawGrid(GridView& view, int index);
@@ -102,6 +118,12 @@ private:
     void finishPen();
     bool deleteTgaAfterConvert = false;
     void placeModel(const std::string& model, const Vec3& at);
+    void placeModelAtCamera(const std::string& model);  // where the camera looks (grid-snapped)
+
+    // Asset Manager (View > Asset Manager, F4): the shared window (assetpanel.h) on this map's zone_source.
+    AssetPanel assetPanel{*this};
+    bool showAssets = false;
+    std::set<std::string> imageTextures;  // image files registered with the renderer (imageTexture)
     bool cameraRayHit(const Vec3& dir, Vec3& hit);  // nearest brush along a camera ray
     void drawConsole();
     void drawSettings();
@@ -153,12 +175,7 @@ private:
     std::string deployDir;  // where "Compile & Run" copies mp_<name>.ff (the game's custom-zone folder)
     live::LiveModelLibrary liveModels;  // XModels read from the running game, drawn on their entities
     // zone_source models for the Models browser (filled by loadZoneSourcePreview).
-    struct BrowserModel {
-        std::string name;
-        size_t tris = 0, verts = 0, bones = 0, surfaces = 0;
-        Vec3 size;
-        std::vector<std::string> textures;
-    };
+    using BrowserModel = modelpreview::ModelInfo;
     std::vector<BrowserModel> browserModels;
     std::string currentModel;
     char modelFilter[64] = "";

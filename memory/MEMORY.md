@@ -21,3 +21,4 @@
 - [Map folder layout](map-folder-layout.md) -- maps/<map>/<map>.map + .gsc + zone_source/ + .ff; zm_test + geotest kept; no shared maps/zone_source
 - [SSAO, grading, DOF, flare, weather, light shafts, contact shadows](ssao-colorgrade.md) -- volumetric_ssao*/_contact*/_grade*/_dof*/_flare*/_glare*/_weather*/_lights* (+ spotlights) + trigger_grade/trigger_weather -> .volumetric -> DLL + editor passes; awaiting in-game test
 - [Memory in git](memory-in-git.md) -- this memory dir is a junction to <repo>/memory, committed with the repo
+- [Asset manager + Mod Tools](asset-manager.md) -- iw4modtools.exe is the MAIN program (maps + Asset Manager, launches Radiant); shared AssetPanel; Radiant is secondary

@@ -15,6 +15,7 @@
 #include "zone/mapimport.h"
 #include "zone/zonebuild.h"
 #include "patch.h"
+#include "assetmanager.h"
 #include "worldgeom.h"
 #include "zone/zonedump.h"
 #include "zone/zonesim.h"
@@ -2328,6 +2329,137 @@ static std::vector<uint8_t> tinyPng() {
 
 // zone_source/xmodels/*.xmodel_export -> XModel in the map zone, loader-checked: one bone, one
 // rigid surface, a custom material on the stock mc_l_sm_b0c0 template with the texture embedded.
+// Asset manager: indexing a zone_source, analysis (textures, anim skeleton match, weapon
+// references, problems), weapon file round trip, and the file operations (import with LODs and
+// textures, rename with reference updates, duplicate, new weapon).
+static void testAssetManager() {
+    namespace fs = std::filesystem;
+    const fs::path src = "maps/zm_test/zone_source";
+    if (!fs::exists(src / "weapons" / "ak74uwu")) {
+        std::printf("asset manager: skipped (no maps/zm_test)\n");
+        return;
+    }
+    const fs::path root = fs::temp_directory_path() / "iw4r_assetman" / "zone_source";
+    const fs::path drop = fs::temp_directory_path() / "iw4r_assetman" / "drop";
+    std::error_code ec;
+    fs::remove_all(root.parent_path(), ec);
+    for (const char* d : {"weapons", "xmodels", "xanims", "images"}) fs::create_directories(root / d);
+    fs::create_directories(drop);
+    fs::copy_file(src / "weapons" / "ak74uwu", root / "weapons" / "ak74uwu");
+    fs::copy_file(src / "xmodels" / "demo_tail.xmodel_export", root / "xmodels" / "demo_tail.xmodel_export");
+    fs::copy_file(src / "xanims" / "demo_tail_loop.xanim_export", root / "xanims" / "demo_tail_loop.xanim_export");
+    auto write = [](const fs::path& p, const std::string& s) { std::ofstream(p, std::ios::binary) << s; };
+    write(root / "xmodels" / "crate.xmodel_export", cubeXModelExport("crate", "c:/art/crate_col.tga"));
+    imageio::Rgba img;
+    img.width = img.height = 4;
+    img.pixels.assign(64, 255);
+    std::string err;
+    CHECK(imageio::savePng((root / "images" / "crate_col.png").string(), img, err));
+    CHECK(imageio::savePng((root / "images" / "stray.png").string(), img, err));
+
+    // Weapon file: parse + format is lossless.
+    {
+        std::ifstream in(root / "weapons" / "ak74uwu", std::ios::binary);
+        const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        assetman::WeaponFile w;
+        CHECK(w.parse(text, err) && w.kv.size() > 500);
+        std::string t = text;
+        while (!t.empty() && (t.back() == '\n' || t.back() == '\r')) t.pop_back();
+        CHECK(w.format() == t);
+        CHECK(w.get("GUNMODEL") && *w.get("gunModel") == "viewmodel_ak74u");
+        w.set("idleAnim", "demo_tail_loop");
+        CHECK(*w.get("idleanim") == "demo_tail_loop");
+        assetman::Asset wa;
+        wa.kind = assetman::Kind::Weapon;
+        wa.name = "ak74uwu";
+        wa.path = root / "weapons" / "ak74uwu";
+        CHECK(assetman::saveWeapon(wa, w, err));
+    }
+    CHECK(weapondef::refKind("gunModel3") == weapondef::RefKind::Model && weapondef::refKind("handModel") == weapondef::RefKind::Model);
+    CHECK(weapondef::refKind("ReloadAnim") == weapondef::RefKind::Anim && weapondef::refKind("viewFlashEffect") == weapondef::RefKind::Fx);
+    CHECK(weapondef::refKind("fireSound") == weapondef::RefKind::Sound && weapondef::refKind("damage") == weapondef::RefKind::None);
+
+    assetman::Index idx;
+    idx.scan(root.string());
+    CHECK(idx.count(assetman::Kind::Weapon) == 1 && idx.count(assetman::Kind::XModel) == 2 && idx.count(assetman::Kind::XAnim) == 1 &&
+          idx.count(assetman::Kind::Image) == 2);
+    assetman::Analysis an = assetman::analyse(idx);
+    auto uses = [&an](assetman::Kind k, const char* n) {
+        auto it = an.usedBy.find(std::make_pair(k, std::string(n)));
+        return it == an.usedBy.end() ? size_t(0) : it->second.size();
+    };
+    CHECK(an.models.count("crate") && an.models["crate"].ok && an.models["crate"].tris == 12);
+    CHECK(an.models["crate"].materials.size() == 1 && an.models["crate"].materials[0].image.filename() == "crate_col.png");
+    CHECK(an.anims["demo_tail_loop"].ok && an.anims["demo_tail_loop"].looping && an.anims["demo_tail_loop"].model == "demo_tail");
+    CHECK(uses(assetman::Kind::Image, "crate_col.png") == 1);
+    CHECK(uses(assetman::Kind::XAnim, "demo_tail_loop") == 1);  // the weapon idleAnim
+    const assetman::WeaponInfo& wi = an.weapons["ak74uwu"];
+    CHECK(wi.ok);
+    bool gunByName = false, idleResolved = false;
+    for (const assetman::WeaponRef& r : wi.refs) {
+        if (r.key == "gunModel") gunByName = r.resolved.empty();
+        if (r.key == "idleAnim") idleResolved = r.resolved == "demo_tail_loop";
+    }
+    CHECK(gunByName && idleResolved);
+    bool strayInfo = false, missingAnim = false;
+    for (const assetman::Issue& i : an.issues) {
+        if (i.kind == assetman::Kind::Image && i.asset == "stray.png") strayInfo = true;
+        if (i.kind == assetman::Kind::Weapon && i.text.find("reloadAnim") != std::string::npos) missingAnim = true;
+    }
+    CHECK(strayInfo && missingAnim);
+
+    // Rename the anim: the weapon idleAnim follows.
+    std::vector<fs::path> changed;
+    CHECK(assetman::renameAsset(idx, *idx.find(assetman::Kind::XAnim, "demo_tail_loop"), "tail_sway_loop", true, changed, err));
+    CHECK(changed.size() == 1 && fs::exists(root / "xanims" / "tail_sway_loop.xanim_export"));
+    {
+        std::ifstream in(root / "weapons" / "ak74uwu", std::ios::binary);
+        const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        assetman::WeaponFile w;
+        CHECK(w.parse(text, err) && *w.get("idleAnim") == "tail_sway_loop");
+    }
+    CHECK(!assetman::renameAsset(idx, *idx.find(assetman::Kind::XModel, "crate"), "Bad Name", true, changed, err));
+    idx.scan(root.string());
+    CHECK(!assetman::renameAsset(idx, *idx.find(assetman::Kind::XModel, "crate"), "demo_tail", true, changed, err));  // taken
+
+    // Import a model with a LOD sibling and its texture beside it.
+    write(drop / "barrel_LOD0.xmodel_export", cubeXModelExport("barrel", "d:/x/barrel_c.tga"));
+    write(drop / "barrel_LOD1.xmodel_export", cubeXModelExport("barrel", "d:/x/barrel_c.tga"));
+    CHECK(imageio::savePng((drop / "barrel_c.png").string(), img, err));
+    std::vector<fs::path> copied;
+    CHECK(assetman::importFile(root.string(), drop / "barrel_LOD0.xmodel_export", copied, err));
+    CHECK(copied.size() == 3 && fs::exists(root / "images" / "barrel_c.png") && fs::exists(root / "xmodels" / "barrel_LOD1.xmodel_export"));
+    copied.clear();
+    CHECK(!assetman::importFile(root.string(), drop / "barrel_LOD0.xmodel_export", copied, err));  // no overwrite
+    idx.scan(root.string());
+    const assetman::Asset* barrel = idx.find(assetman::Kind::XModel, "barrel");
+    CHECK(barrel && barrel->lods.size() == 1);
+    // Rename keeps the LOD suffixes.
+    CHECK(barrel && assetman::renameAsset(idx, *barrel, "oil_drum", false, changed, err));
+    CHECK(fs::exists(root / "xmodels" / "oil_drum_LOD0.xmodel_export") && fs::exists(root / "xmodels" / "oil_drum_LOD1.xmodel_export"));
+
+    // New weapon + duplicate: valid weapon files the compiler reads without unknown keys.
+    CHECK(assetman::newWeapon(root.string(), "my_rifle", "crate", "oil_drum", err));
+    CHECK(!assetman::newWeapon(root.string(), "my_rifle", "", "", err));
+    idx.scan(root.string());
+    CHECK(assetman::duplicateWeapon(idx, *idx.find(assetman::Kind::Weapon, "my_rifle"), "my_rifle2", err));
+    {
+        std::ifstream in(root / "weapons" / "my_rifle2", std::ios::binary);
+        const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        weapondef::Weapon w;
+        std::vector<std::string> warnings;
+        CHECK(weapondef::parse(text, "my_rifle2", w, warnings, err));
+        bool unknown = false;
+        for (const std::string& s : warnings) unknown |= s.find("unknown key") != std::string::npos;
+        CHECK(!unknown);
+        CHECK(w.gunModels[0] == "crate" && w.worldModels[0] == "oil_drum");
+    }
+    idx.scan(root.string());
+    an = assetman::analyse(idx);
+    CHECK(uses(assetman::Kind::XModel, "crate") == 2);  // my_rifle, my_rifle2 gunModel
+    fs::remove_all(root.parent_path(), ec);
+}
+
 static void testZoneSourceModel() {
     namespace fs = std::filesystem;
     const std::string trainer = std::string(kGame) + "/zone/english/trainer.ff";
@@ -3227,6 +3359,7 @@ int main() {
     testFxPreview();
     testSkeletonConvert();
     testZoneSourceModel();
+    testAssetManager();
     testPatches();
     testWorldGeometry();
     testGeometryBake();

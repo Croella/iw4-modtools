@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <string>
@@ -232,6 +233,17 @@ struct ZoneSourceWeapons {
     std::map<std::string, modelbuild::BuildOptions> hints;
 };
 ZoneSourceWeapons loadZoneSourceWeapons(const std::string& zoneSourceDir, std::vector<std::string>& warnings);
+
+// zone_source naming rules shared with editors (zonebuild.cpp).
+namespace zsrc {
+std::string lower(std::string x);
+bool isExtraLod(const std::string& lowerStem);  // <stem>_lod1.._lod9
+// Files of zone_source/<sub> with extension ext (lowercase, nullptr = any); extra LODs skipped.
+std::vector<std::filesystem::path> list(const std::string& zoneSourceDir, const char* sub, const char* ext);
+std::string assetName(const std::filesystem::path& f);  // stem, lowercase, without _lod0
+// A weapon file's model/anim reference -> the zone_source asset it compiles to ("" if none).
+std::string resolve(const std::string& ref, const std::vector<std::string>& names);
+}  // namespace zsrc
 
 // The custom map script that goes with a .map: same folder and name, ".gsc" extension.
 std::string mapScriptPath(const std::string& mapPath);

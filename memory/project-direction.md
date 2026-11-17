@@ -14,3 +14,5 @@ iw4-radiant is a Radiant-style map editor for IW4 (MW2). Decisions made 2026-11-
 **Why:** the community route (cod4map, iw3xport, ZoneBuilder) needs CoD4, Mod Tools and IW4x, and may not produce zones the x64 build loads.
 
 **How to apply:** check new work against the x64 target. Treat community IW4 docs as 2009/32-bit references and verify them against this build. See [[reference-iw4-symbols]].
+
+2026-11-16: the user wants Radiant to be a secondary tool; iw4modtools.exe is the main program (see [[asset-manager]]).
