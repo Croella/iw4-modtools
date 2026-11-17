@@ -1,9 +1,4 @@
-# iw4-radiant
-
-A Radiant-style map editor for IW4 (Modern Warfare 2), targeting the x64 `iw4mp` build.
-
-It edits maps and reads textures and materials from your install. **It can't compile a map
-to run in-game yet.** See [Status](#status).
+# iw4-modtools
 
 ## Build
 
